@@ -1,0 +1,30 @@
+# Elise Security Audit Block List
+# Syntax:
+#   keyword:<keyword>       - Blocks domains containing keyword
+#   regexp:<regular_expr>   - Blocks domains matching regex
+#   cidr:<ip_cidr>          - Blocks target IPs in CIDR
+#   port:<port_range>       - Blocks target ports
+#   <plain_domain>          - Suffix match (e.g. torrent.com blocks tracker.torrent.com)
+
+# BitTorrent & P2P Tracker domains
+keyword:torrent
+keyword:tracker
+keyword:peer
+keyword:bittorrent
+keyword:announce
+thepiratebay.org
+rarbg.to
+1337x.to
+yts.mx
+rutracker.org
+
+# SMTP / Spam Ports
+port:25
+port:465
+port:587
+
+# Internal / Cloud Metadata Protection
+cidr:169.254.169.254/32
+cidr:10.0.0.0/8
+cidr:172.16.0.0/12
+cidr:192.168.0.0/16

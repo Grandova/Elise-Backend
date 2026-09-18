@@ -1,0 +1,66 @@
+# ==============================================================================
+# Elise High-Performance DNS Engine Configuration (dns.yml)
+# Supports hot-reload: file modifications take effect immediately without restart.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Default Resolution Strategy
+# Options: prefer_ipv4, prefer_ipv6, ipv4_only, ipv6_only
+# ------------------------------------------------------------------------------
+strategy: prefer_ipv4
+
+# In-memory DNS cache TTL (seconds)
+cache_ttl: 300
+
+# ------------------------------------------------------------------------------
+# Upstream DNS Servers
+# Protocols supported:
+#   udp://host:port
+#   tcp://host:port
+#   tls://host:port (DoT - DNS over TLS)
+#   https://host/dns-query (DoH - DNS over HTTPS)
+# ------------------------------------------------------------------------------
+servers:
+  # Domestic / Fast Resolvers
+  - tag: domestic
+    address: udp://223.5.5.5:53
+  - tag: domestic-dot
+    address: tls://dns.alidns.com:853
+
+  # Secure International Resolvers
+  - tag: google-doh
+    address: https://dns.google/dns-query
+  - tag: cloudflare-doh
+    address: https://1.1.1.1/dns-query
+  - tag: cloudflare-dot
+    address: tls://1.1.1.1:853
+  - tag: quad9-tcp
+    address: tcp://9.9.9.9:53
+
+# ------------------------------------------------------------------------------
+# DNS Dispatch Rules
+# Evaluated sequentially. First matched rule determines the resolver.
+# ------------------------------------------------------------------------------
+rules:
+  # Direct Chinese domains to fast domestic DNS
+  - domains:
+      - "*.cn"
+      - "*.baidu.com"
+      - "*.qq.com"
+      - "*.alipay.com"
+      - "*.taobao.com"
+    server: domestic
+
+  # Direct international & sensitive domains to encrypted DoH/DoT
+  - domains:
+      - "*.google.com"
+      - "*.youtube.com"
+      - "*.twitter.com"
+      - "*.github.com"
+      - "*.openai.com"
+    server: cloudflare-doh
+
+  # Fallback default server for all other queries
+  - domains:
+      - "*"
+    server: google-doh

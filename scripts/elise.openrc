@@ -1,0 +1,23 @@
+#!/sbin/openrc-run
+
+name="elise"
+description="Elise High-Performance Node Backend Daemon"
+command="/usr/local/bin/elise"
+command_args="run -c /etc/elise/elise.conf"
+command_background="yes"
+pidfile="/run/${RC_SVCNAME}.pid"
+directory="/etc/elise"
+stopsig="INT"
+retry="INT/45/KILL/5"
+output_log="/var/log/elise/elise.log"
+error_log="/var/log/elise/elise.err"
+
+depend() {
+	need net
+	after firewall
+}
+
+start_pre() {
+	checkpath --directory --mode 0750 /var/log/elise
+	ulimit -n 1048576
+}

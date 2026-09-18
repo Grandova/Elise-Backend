@@ -1,0 +1,10 @@
+# Elise Security Audit White List
+# Domains or IPs listed here will completely bypass all audit inspections.
+
+apple.com
+icloud.com
+microsoft.com
+windowsupdate.com
+googleapis.com
+cloudflare.com
+github.com
