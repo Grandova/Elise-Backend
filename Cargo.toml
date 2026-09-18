@@ -1,6 +1,6 @@
 [package]
 name = "elise"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 authors = ["Elise Core Team"]
 description = "High-Performance Multi-Protocol Node Backend for Xboard & Modern Panels"

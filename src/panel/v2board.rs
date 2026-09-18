@@ -118,11 +118,7 @@ impl V2BoardClient {
             });
 
         let public_key = tls_val
-            .and_then(|t| {
-                t.get("private_key")
-                    .or_else(|| t.get("public_key"))
-                    .and_then(|v| v.as_str())
-            })
+            .and_then(|t| t.get("public_key").and_then(|v| v.as_str()))
             .or_else(|| data.get("public_key").and_then(|v| v.as_str()))
             .map(String::from);
 

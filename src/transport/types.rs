@@ -188,6 +188,7 @@ pub struct EchClientConfig {
 #[derive(Debug, Clone, Default)]
 pub struct TlsServerConfig {
     pub server_name: Option<String>,
+    pub allow_self_signed: bool,
     pub server_names: Vec<String>,
     pub reject_unknown_sni: bool,
     pub certificates: Vec<TlsCertificateEntry>,
@@ -880,7 +881,15 @@ impl StreamSettings {
                             .get("server_keys")
                             .or_else(|| ech_val.get("key"))
                             .and_then(|v| v.as_str())
-                            .and_then(|s| decode_base64_flexible(s).ok());
+                            .map(|s| {
+                                if s.contains("-----BEGIN ECH KEYS-----") {
+                                    Ok(s.as_bytes().to_vec())
+                                } else {
+                                    decode_base64_flexible(s)
+                                        .map_err(|e| format!("Invalid ECH server key: {e}"))
+                                }
+                            })
+                            .transpose()?;
                         if enabled || server_keys.is_some() {
                             ech_server = Some(EchServerConfig {
                                 enabled,
@@ -956,6 +965,12 @@ impl StreamSettings {
 
                 TransportSecurityConfig::Tls(TlsServerConfig {
                     server_name,
+                    allow_self_signed: node_info
+                        .tls_settings
+                        .as_ref()
+                        .and_then(|ts| ts.get("allow_insecure"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false),
                     server_names,
                     reject_unknown_sni,
                     certificates,

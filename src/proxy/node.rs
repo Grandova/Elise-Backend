@@ -194,7 +194,7 @@ impl NodeRunner {
         }
 
         // Fetch initial node configuration
-        let node_info = match self.panel_client.get_node_info(self.node_id).await {
+        let mut node_info = match self.panel_client.get_node_info(self.node_id).await {
             Ok(info) => info,
             Err(e) => {
                 error!(
@@ -213,6 +213,14 @@ impl NodeRunner {
         } else {
             std::path::PathBuf::from("./nodes")
         };
+
+        if let Err(e) = self
+            .node_config
+            .prepare_node_info(&nodes_dir, &mut node_info)
+        {
+            error!(node_id = self.node_id, error = %e, "Invalid node security configuration");
+            return;
+        }
 
         if let Err(e) = self.node_config.save_node_conf(&nodes_dir, &node_info) {
             warn!(
@@ -561,10 +569,19 @@ impl NodeRunner {
                 _ = ticker.tick() => {
                     let update = async {
                         if let Some(synced) = self.sync_users(&active.inbound).await { users = synced; }
-                        let next = match self.panel_client.get_node_info(self.node_id).await {
+                        let mut next = match self.panel_client.get_node_info(self.node_id).await {
                             Ok(next) => next,
                             Err(e) => { warn!(node_id = self.node_id, error = %e, "Node sync failed; keeping active configuration"); return; }
                         };
+                        let nodes_dir = if std::path::Path::new("/etc/elise").exists() {
+                            std::path::PathBuf::from("/etc/elise/nodes")
+                        } else {
+                            std::path::PathBuf::from("./nodes")
+                        };
+                        if let Err(e) = self.node_config.prepare_node_info(&nodes_dir, &mut next) {
+                            warn!(node_id = self.node_id, error = %e, "Invalid node security update; keeping active configuration");
+                            return;
+                        }
                         if serde_json::to_value(&next).ok() == serde_json::to_value(&info).ok() && !active.task.is_finished() { return; }
                         let next_ctx = match self.inbound_context(&next) {
                             Ok(ctx) => ctx,
@@ -579,6 +596,9 @@ impl NodeRunner {
                                 retired.spawn(async move { old.stop().await; });
                                 self.apply_node_routes(&next);
                                 info = next;
+                                if let Err(e) = self.node_config.save_node_conf(&nodes_dir, &info) {
+                                    warn!(node_id = self.node_id, error = %e, "Failed to update node AUTO settings");
+                                }
                                 info!(node_id = self.node_id, port = info.server_port, "Node configuration reloaded");
                             }
                             Err(e) => {
@@ -837,6 +857,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tls_inbounds_respect_panel_certificate_policy() {
+        let runner = runner("http://127.0.0.1:1".into());
+        for protocol in ["vless", "vmess", "trojan", "http", "anytls", "naive"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let mut info = NodeInfo {
+                node_type: protocol.into(),
+                server_port: port,
+                tls: Some(1),
+                listen_ip: Some("127.0.0.1".into()),
+                tls_settings: Some(
+                    serde_json::json!({"server_name":"localhost","allow_insecure":false}),
+                ),
+                ..Default::default()
+            };
+            let error = runner
+                .launch_inbound(&info, &[])
+                .await
+                .err()
+                .expect("missing certificate must fail");
+            assert!(
+                error.to_string().contains("TLS has no certificate"),
+                "{protocol}: {error}"
+            );
+            info.tls_settings.as_mut().unwrap()["allow_insecure"] = serde_json::json!(true);
+            let mut active = runner
+                .launch_inbound(&info, &[])
+                .await
+                .unwrap_or_else(|e| panic!("{protocol}: {e}"));
+            active.stop().await;
+            info.tls_settings.as_mut().unwrap()["cert_file"] =
+                serde_json::json!("/elise-missing-certificate.pem");
+            info.tls_settings.as_mut().unwrap()["key_file"] =
+                serde_json::json!("/elise-missing-private-key.pem");
+            assert!(
+                runner.launch_inbound(&info, &[]).await.is_err(),
+                "{protocol} must not fall back from a broken certificate"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn mieru_pattern_overrides_reach_inbound() {
         use base64::prelude::*;
         use prost::Message;
@@ -903,6 +966,7 @@ mod tests {
             node_type: "trojan".into(),
             server_port: port,
             listen_ip: Some("127.0.0.1".into()),
+            tls_settings: Some(serde_json::json!({"allow_insecure":true})),
             ..Default::default()
         };
         let ctx = runner.inbound_context(&info).unwrap();

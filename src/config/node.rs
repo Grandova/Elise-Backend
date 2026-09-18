@@ -124,6 +124,205 @@ impl NodeConfig {
         }
     }
 
+    pub fn prepare_node_info(&self, nodes_dir: &Path, info: &mut NodeInfo) -> std::io::Result<()> {
+        use base64::prelude::*;
+        use serde_json::json;
+        use std::io::{Error, ErrorKind};
+
+        if info.tls.is_none()
+            && matches!(
+                info.node_type.as_str(),
+                "trojan" | "anytls" | "hysteria" | "hysteria2" | "tuic" | "naive"
+            )
+        {
+            info.tls = Some(1);
+        }
+        if let Some(cert) = &self.cert_file {
+            info.cert_config.get_or_insert(json!({}))["cert_file"] = json!(cert);
+        }
+        if let Some(key) = &self.key_file {
+            info.cert_config.get_or_insert(json!({}))["key_file"] = json!(key);
+        }
+        if !matches!(info.tls, Some(1 | 2)) {
+            return Ok(());
+        }
+        let server_name = info.server_name.clone().or_else(|| info.host.clone());
+        let ts = info.tls_settings.get_or_insert(json!({}));
+        let ts = ts
+            .as_object_mut()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidData, "tls_settings must be an object"))?;
+        if info.tls == Some(2) {
+            let panel_public = ts
+                .get("public_key")
+                .and_then(|v| v.as_str())
+                .or(info.public_key.as_deref())
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            let mut private = ts
+                .get("private_key")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .or(info.server_key.as_deref())
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            if private.is_empty() {
+                private = Self::load_or_create_key(
+                    &nodes_dir.join(format!("node_{}.reality.key", self.node_id)),
+                    || {
+                        if !panel_public.is_empty() {
+                            return Err(Error::new(ErrorKind::InvalidData, "Panel supplied a REALITY public key without its private key; provide the matching private key in the panel"));
+                        }
+                        Ok(crate::security::generate_reality_keypair().private_key)
+                    },
+                )?;
+            }
+            let bytes = BASE64_URL_SAFE_NO_PAD
+                .decode(private.trim_end_matches('='))
+                .or_else(|_| BASE64_STANDARD.decode(&private))
+                .map_err(|_| {
+                    Error::new(ErrorKind::InvalidData, "Invalid REALITY private key base64")
+                })?;
+            let secret: [u8; 32] = bytes.try_into().map_err(|_| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    "REALITY private key must be 32 bytes",
+                )
+            })?;
+            let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(secret));
+            let public_text = BASE64_URL_SAFE_NO_PAD.encode(public.as_bytes());
+            if !panel_public.is_empty() && panel_public.trim_end_matches('=') != public_text {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "REALITY public key does not match the private key",
+                ));
+            }
+            ts.insert("private_key".into(), json!(private));
+            ts.insert("public_key".into(), json!(public_text));
+        } else if let Some(ech) = ts
+            .get("ech")
+            .filter(|e| e.get("enabled").and_then(|v| v.as_bool()) == Some(true))
+            .cloned()
+        {
+            let name = ts
+                .get("server_name")
+                .and_then(|v| v.as_str())
+                .or(server_name.as_deref())
+                .unwrap_or("")
+                .to_owned();
+            let mut key = ech
+                .get("server_keys")
+                .or_else(|| ech.get("key"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_owned();
+            if key.is_empty() {
+                if let Some(path) = ech
+                    .get("key_path")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    key = fs::read_to_string(path)?;
+                }
+            }
+            let config = if let Some(path) = ech
+                .get("config_path")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                fs::read_to_string(path)?
+            } else {
+                ech.get("config")
+                    .or_else(|| ech.get("config_list"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_owned()
+            };
+            if key.is_empty() {
+                key = Self::load_or_create_key(
+                    &nodes_dir.join(format!("node_{}.ech.key", self.node_id)),
+                    || {
+                        if !config.trim().is_empty() {
+                            return Err(Error::new(ErrorKind::InvalidData, "Panel supplied ECH config without its server key; provide the matching ECH key in the panel"));
+                        }
+                        if rustls::pki_types::DnsName::try_from(name.as_str()).is_err() {
+                            return Err(Error::new(
+                                ErrorKind::InvalidData,
+                                "ECH key generation requires a valid panel server_name",
+                            ));
+                        }
+                        Ok(crate::security::EchKeyPair::generate(&name, 0).to_pem_ech_keys())
+                    },
+                )?;
+            }
+            let pair = crate::security::EchKeyPair::from_pem_or_bytes(key.as_bytes(), &name)
+                .map_err(Error::other)?;
+            let derived =
+                x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(pair.private_key));
+            if derived.to_bytes() != pair.public_key {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "ECH public key does not match the private key",
+                ));
+            }
+            if !config.trim().is_empty() {
+                let b64 = config
+                    .lines()
+                    .filter(|l| !l.trim().starts_with("-----"))
+                    .map(str::trim)
+                    .collect::<String>();
+                let bytes = BASE64_STANDARD.decode(b64).map_err(|_| {
+                    Error::new(ErrorKind::InvalidData, "Invalid ECH client config base64")
+                })?;
+                if bytes != pair.ech_config_list {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "ECH client config does not match the server key",
+                    ));
+                }
+            }
+            let value = ts.get_mut("ech").unwrap();
+            value["server_keys"] = json!(pair.to_pem_ech_keys());
+            value["config"] = json!(BASE64_STANDARD.encode(pair.ech_config_list));
+        }
+        Ok(())
+    }
+
+    fn load_or_create_key(
+        path: &Path,
+        generate: impl FnOnce() -> std::io::Result<String>,
+    ) -> std::io::Result<String> {
+        use std::io::Write;
+        fs::create_dir_all(path.parent().unwrap())?;
+        let mut options = fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let lock = options.open(path.with_extension("lock"))?;
+        lock.try_lock().map_err(std::io::Error::other)?;
+        match fs::read_to_string(path) {
+            Ok(key) => return Ok(key),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        let key = generate()?;
+        let temporary = path.with_extension("tmp");
+        let mut file = options.truncate(true).open(&temporary)?;
+        file.write_all(key.as_bytes())?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        fs::File::open(path.parent().unwrap())?.sync_all()?;
+        tracing::warn!(path = %path.display(), "Generated persistent node key; copy the public configuration from node AUTO settings to the panel before connecting clients");
+        Ok(key)
+    }
+
     pub fn save_node_conf<P: AsRef<Path>>(
         &self,
         nodes_dir: P,
@@ -177,6 +376,35 @@ impl NodeConfig {
             }
         }
 
+        let mut settings = serde_json::to_value(node_info).map_err(std::io::Error::other)?;
+        if let Some(tls) = settings
+            .get_mut("tls_settings")
+            .and_then(|v| v.as_object_mut())
+        {
+            tls.remove("private_key");
+            tls.remove("key");
+            if let Some(ech) = tls.get_mut("ech").and_then(|v| v.as_object_mut()) {
+                ech.remove("key");
+                ech.remove("server_keys");
+            }
+        }
+        for (key, value) in settings.as_object().unwrap() {
+            if value.is_null()
+                || matches!(
+                    key.as_str(),
+                    "id" | "node_type"
+                        | "server_port"
+                        | "traffic_pattern"
+                        | "server_key"
+                        | "decryption"
+                        | "encryption_settings"
+                        | "cert_config"
+                )
+            {
+                continue;
+            }
+            pattern.push_str(&format!("{key} = {value}\n"));
+        }
         let content = format!(
             r#"# ==============================================================================
 # Elise 节点独立配置文件 (Node ID: {})
@@ -200,7 +428,18 @@ server_port = {}
             user_part.trim()
         );
 
-        fs::write(file_path, content)
+        use std::io::Write;
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            options.mode(0o600);
+            if file_path.exists() {
+                fs::set_permissions(&file_path, fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        options.open(file_path)?.write_all(content.as_bytes())
     }
 }
 
@@ -209,6 +448,168 @@ mod tests {
     use super::*;
     use base64::prelude::*;
     use prost::Message;
+
+    #[test]
+    fn reality_keys_are_stable_panel_keys_win_and_mismatches_fail() {
+        let dir = std::env::temp_dir().join(format!("elise-key-config-{}", uuid::Uuid::new_v4()));
+        let cfg = NodeConfig {
+            node_id: 7,
+            ..Default::default()
+        };
+        let original = NodeInfo {
+            node_type: "vless".into(),
+            tls: Some(2),
+            tls_settings: Some(
+                serde_json::json!({"server_name":"www.example.com","server_port":443}),
+            ),
+            ..Default::default()
+        };
+        let mut first = original.clone();
+        cfg.prepare_node_info(&dir, &mut first).unwrap();
+        let mut restarted = original.clone();
+        cfg.prepare_node_info(&dir, &mut restarted).unwrap();
+        assert_eq!(first.tls_settings, restarted.tls_settings);
+        assert!(crate::transport::types::StreamSettings::from_node_info(&first).is_ok());
+        cfg.save_node_conf(&dir, &first).unwrap();
+        let saved = fs::read_to_string(dir.join("node_7.conf")).unwrap();
+        assert!(!saved.contains("private_key"));
+        assert!(saved.contains(
+            first.tls_settings.as_ref().unwrap()["public_key"]
+                .as_str()
+                .unwrap()
+        ));
+        let panel = crate::security::generate_reality_keypair();
+        restarted.tls_settings.as_mut().unwrap()["private_key"] =
+            serde_json::json!(panel.private_key);
+        restarted.tls_settings.as_mut().unwrap()["public_key"] =
+            serde_json::json!(panel.public_key);
+        cfg.prepare_node_info(&dir, &mut restarted).unwrap();
+        assert_ne!(first.tls_settings, restarted.tls_settings);
+        restarted.tls_settings.as_mut().unwrap()["public_key"] = serde_json::json!("wrong");
+        assert!(cfg
+            .prepare_node_info(&dir, &mut restarted)
+            .unwrap_err()
+            .to_string()
+            .contains("does not match"));
+        let mut public_only = original.clone();
+        public_only.tls_settings.as_mut().unwrap()["public_key"] =
+            serde_json::json!(panel.public_key);
+        let other = NodeConfig {
+            node_id: 8,
+            ..Default::default()
+        };
+        assert!(other.prepare_node_info(&dir, &mut public_only).is_err());
+        assert!(!dir.join("node_8.reality.key").exists());
+        fs::write(dir.join("node_7.reality.key"), "corrupt").unwrap();
+        assert!(cfg.prepare_node_info(&dir, &mut original.clone()).is_err());
+        assert_eq!(
+            fs::read_to_string(dir.join("node_7.reality.key")).unwrap(),
+            "corrupt"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ech_keys_are_stable_and_pem_panel_keys_reach_tls() {
+        let dir = std::env::temp_dir().join(format!("elise-ech-config-{}", uuid::Uuid::new_v4()));
+        let cfg = NodeConfig {
+            node_id: 9,
+            ..Default::default()
+        };
+        let original = NodeInfo {
+            node_type: "trojan".into(),
+            tls_settings: Some(
+                serde_json::json!({"server_name":"outer.example.com","ech":{"enabled":true}}),
+            ),
+            ..Default::default()
+        };
+        let mut first = original.clone();
+        cfg.prepare_node_info(&dir, &mut first).unwrap();
+        let mut restarted = original.clone();
+        cfg.prepare_node_info(&dir, &mut restarted).unwrap();
+        assert_eq!(first.tls_settings, restarted.tls_settings);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(dir.join("node_9.ech.key"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+        let panel = crate::security::EchKeyPair::generate("outer.example.com", 23);
+        let mut from_panel = original.clone();
+        let ech = &mut from_panel.tls_settings.as_mut().unwrap()["ech"];
+        ech["key"] = serde_json::json!(panel.to_pem_ech_keys());
+        ech["config"] = serde_json::json!(panel.to_pem_ech_configs());
+        cfg.prepare_node_info(&dir, &mut from_panel).unwrap();
+        let settings =
+            crate::transport::types::StreamSettings::from_node_info(&from_panel).unwrap();
+        let crate::transport::types::TransportSecurityConfig::Tls(tls) = settings.security else {
+            panic!("expected TLS")
+        };
+        let parsed = crate::security::EchKeyPair::from_pem_or_bytes(
+            tls.ech.unwrap().server_keys.as_ref().unwrap(),
+            "outer.example.com",
+        )
+        .unwrap();
+        assert_eq!(parsed, panel);
+        cfg.save_node_conf(&dir, &from_panel).unwrap();
+        let saved = fs::read_to_string(dir.join("node_9.conf")).unwrap();
+        assert!(!saved.contains("ECH KEYS"));
+        assert!(!saved.contains("server_keys"));
+        assert!(saved.contains("config"));
+        from_panel.tls_settings.as_mut().unwrap()["ech"]["config"] = serde_json::json!("AAAA");
+        assert!(cfg.prepare_node_info(&dir, &mut from_panel).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn all_protocol_auto_settings_preserve_user_and_do_not_include_server_secrets() {
+        let dir = std::env::temp_dir().join(format!("elise-auto-config-{}", uuid::Uuid::new_v4()));
+        let mut cfg = NodeConfig {
+            node_id: 10,
+            ..Default::default()
+        };
+        cfg.parse_content("[USER]\n# existing settings\nlisten_addr = 127.0.0.1");
+        for kind in [
+            "shadowsocks",
+            "vmess",
+            "vless",
+            "trojan",
+            "hysteria",
+            "hysteria2",
+            "tuic",
+            "anytls",
+            "naive",
+            "http",
+            "socks",
+            "shadowsocksr",
+            "mieru",
+        ] {
+            let mut info = NodeInfo {
+                node_type: kind.into(),
+                server_port: 12345,
+                network: Some("tcp".into()),
+                server_name: Some("node.example.com".into()),
+                server_key: Some("server-secret".into()),
+                ..Default::default()
+            };
+            cfg.prepare_node_info(&dir, &mut info).unwrap();
+            cfg.save_node_conf(&dir, &info).unwrap();
+            let saved = fs::read_to_string(dir.join("node_10.conf")).unwrap();
+            assert!(saved.contains(&format!("server_type = {kind}")));
+            assert!(saved.contains("network = \"tcp\""));
+            assert!(!saved.contains("server-secret"));
+            let loaded = NodeConfig::load_for_node(&dir, 10);
+            assert_eq!(loaded.listen_addr.as_deref(), Some("127.0.0.1"));
+            assert!(!loaded.custom_settings.contains_key("network"));
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn mieru_config_refresh_preserves_local_overrides() {

@@ -143,6 +143,38 @@ impl PPanelClient {
             .and_then(|v| v.as_str())
             .map(String::from);
 
+        let tls_settings = if tls == Some(2) {
+            let address = proto
+                .get("reality_server_addr")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let port = proto
+                .get("reality_server_port")
+                .and_then(|v| v.as_u64())
+                .filter(|p| *p != 0)
+                .unwrap_or(443);
+            let mut settings = json!({
+                "server_name": server_name,
+                "private_key": proto.get("reality_private_key"),
+                "public_key": public_key,
+                "short_id": proto.get("reality_short_id"),
+            });
+            if !address.is_empty() {
+                settings["dest"] = json!(format!("{address}:{port}"));
+            }
+            Some(settings)
+        } else if tls == Some(1) {
+            Some(json!({
+                "server_name": server_name,
+                "allow_insecure": proto.get("allow_insecure"),
+                "ech": {
+                    "enabled": proto.get("ech_enable").and_then(|v| v.as_bool()).unwrap_or(false),
+                }
+            }))
+        } else {
+            None
+        };
+
         let up_mbps = proto
             .get("up_mbps")
             .and_then(|v| v.as_u64())
@@ -189,6 +221,24 @@ impl PPanelClient {
                 .map(String::from),
             short_ids,
             public_key,
+            tls_settings,
+            network_settings: Some(json!({
+                "host": proto.get("host"),
+                "path": proto.get("path"),
+                "service_name": proto.get("service_name"),
+            })),
+            ports: proto
+                .get("hop_ports")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            hop_interval: proto
+                .get("hop_interval")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as u32),
+            udp_relay_mode: proto
+                .get("udp_relay_mode")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             routes,
             custom_outbounds,
             obfs_password: proto

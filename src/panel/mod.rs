@@ -249,6 +249,58 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[tokio::test]
+    async fn panel_reality_keys_reach_shared_transport_without_manual_config() {
+        for panel in ["xboard", "v2board", "xiaov2board", "ppanel"] {
+            let pair = crate::security::generate_reality_keypair();
+            let expected = pair.public_key.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = create_panel_client(
+                panel,
+                &format!("http://{}", listener.local_addr().unwrap()),
+                "fixture",
+            );
+            let data = if panel == "ppanel" {
+                serde_json::json!({"protocols":[{
+                    "enable":true,"type":"vless","port":12345,"security":"reality","transport":"tcp",
+                    "sni":"www.example.com","reality_server_addr":"www.example.com","reality_server_port":443,
+                    "reality_private_key":pair.private_key,"reality_public_key":pair.public_key,"reality_short_id":"01"
+                }]})
+            } else {
+                serde_json::json!({
+                    "server_type":"vless","type":"vless","server_port":12345,"tls":2,"network":"tcp",
+                    "tls_settings":{"server_name":"www.example.com","server_port":443,
+                    "private_key":pair.private_key,"public_key":pair.public_key,"short_id":"01"}
+                })
+            };
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                let body = serde_json::json!({"data":data}).to_string();
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            });
+            let mut info = client.get_node_info(1).await.unwrap();
+            let dir =
+                std::env::temp_dir().join(format!("elise-panel-keys-{}", uuid::Uuid::new_v4()));
+            let cfg = crate::config::NodeConfig {
+                node_id: 1,
+                ..Default::default()
+            };
+            cfg.prepare_node_info(&dir, &mut info).unwrap();
+            assert!(!dir.join("node_1.reality.key").exists(), "{panel}");
+            let stream = crate::transport::types::StreamSettings::from_node_info(&info).unwrap();
+            assert_eq!(
+                stream.client_reality_profile.unwrap().public_key.as_deref(),
+                Some(expected.as_str()),
+                "{panel}"
+            );
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn all_panel_plan_limits_use_mbps_and_reject_invalid_values() {
         for panel in ["xboard", "v2board", "xiaov2board", "ppanel", "sspanel"] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

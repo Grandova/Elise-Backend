@@ -329,6 +329,19 @@ pprof_addr = off
 
 # 2. 三层配置优先级与节点独立配置体系
 
+### 最少配置与面板自动下发
+
+XBoard 节点只需在主配置填写 `panel_url`、`panel_key` 和 `node_id`；其他面板还需选择对应 `type`。协议、端口、传输和用户信息由面板 API 下发，节点 `[AUTO]` 会显示已接入的参数，面板配置成功更新后同步刷新，`[USER]` 保留。
+
+Reality 优先使用面板私钥并校验公钥是否匹配。没有下发任何密钥时，Elise 自动生成并持久保存 `nodes/node_<id>.reality.key`；重启不会重新生成。ECH 启用时优先读取面板的 PEM/Base64 密钥或 `key_path`，否则生成 `nodes/node_<id>.ech.key`，并校验下发的客户端配置。私钥不会输出到 `[AUTO]` 或日志。
+
+**自动生成不等于自动下发到客户端。** 现有节点 API 未提供写回公钥的接口；后端生成的新 Reality 公钥或 ECH config 会出现在节点 `[AUTO]` 的 `tls_settings` 中，需要一次性填回面板。面板已有公钥但没有对应私钥时会明确报错，不能用另一套随机密钥替代。面板已提供完整密钥时无需这个步骤。
+
+VLESS、VMess、Trojan、HTTP、AnyTLS、Naive 的 TLS 从面板 `tls_settings.allow_insecure` 读取客户端信任策略。只有 `auto_tls=true` 且面板明确 `allow_insecure=true`、又未提供证书时，后端才自动自签；默认/false 时必须提供证书。无效证书不会回退到全局自签证书。此开关不会禁用 TLS，也不会改变已下发客户端的实际校验行为。
+
+普通 TLS 仍需要可信证书，或客户端明确配置的证书信任方式。当前 `auto_tls` 生成的是自签名证书，并非 ACME 公共证书；不能承诺任意面板、域名和 TLS 配置都仅填三项即可通过客户端证书校验。面板不提供的协议功能和密钥回写接口也不能由后端凭空补全。
+
+
 <a id="section-2-1"></a>
 
 ### 2.1 架构原理
@@ -734,7 +747,7 @@ type = "direct"
 | 自定义文件证书 | TLS 配置接收证书/私钥路径或 PEM；文件需对 Elise 进程可读 |
 | HTTP ACME | 未实现内置申请和续期；使用外部 ACME 工具签发后交给文件证书加载路径 |
 | DNS ACME | 同上；填写 `dns_provider` / `DNS_*` 不能自动完成签发 |
-| 自动自签 | `auto_tls=true` 在相应 TLS 路径无证书时生成自签证书；不具备公共 CA 信任 |
+| 自动自签 | `auto_tls=true` 且面板 `allow_insecure=true` 时，无证书的 TLS 入口可自动自签；不具备公共 CA 信任 |
 
 例如面板下发的证书配置对象可包含：
 

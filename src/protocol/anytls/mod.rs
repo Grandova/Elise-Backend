@@ -85,28 +85,36 @@ impl Inbound for AnytlsInbound {
 
     async fn start(
         &self,
-        ctx: InboundContext,
-        node_info: NodeInfo,
+        mut ctx: InboundContext,
+        mut node_info: NodeInfo,
         mut shutdown_rx: broadcast::Receiver<()>,
     ) -> std::io::Result<()> {
-        // [Requirement ⑪]: Standard AnyTLS requires TLS; never silently downgrade to plaintext!
-        if ctx.tls_manager.get_acceptor().is_none() {
+        if node_info.tls.is_some_and(|mode| mode != 1) {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "AnyTLS inbound requires valid TLS configuration; plaintext AnyTLS is forbidden in standard mode",
+                std::io::ErrorKind::Unsupported,
+                "AnyTLS requires TLS",
             ));
         }
-
-        // [Requirement ⑤]: Parse panel padding_scheme if provided
-        match AnyTlsNodeConfig::from_node_info(&node_info) {
-            Ok(cfg) => {
-                *self.padding_scheme.write() = cfg.protocol.padding_scheme;
-                info!("AnyTLS configuration loaded successfully from node info");
-            }
-            Err(e) => {
-                warn!("Using default AnyTLS padding scheme: {e}");
-            }
-        }
+        node_info.tls = Some(1);
+        let settings = crate::transport::StreamSettings::from_node_info(&node_info)
+            .map_err(std::io::Error::other)?;
+        let crate::transport::TransportSecurityConfig::Tls(tls_cfg) = settings.security else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "AnyTLS requires TLS",
+            ));
+        };
+        ctx.tls_manager = Arc::new(
+            crate::security::TLSManager::from_config(
+                &tls_cfg,
+                ctx.global_config.auto_tls,
+                &ctx.global_config.fake_sni,
+            )
+            .map_err(std::io::Error::other)?,
+        );
+        let cfg = AnyTlsNodeConfig::from_node_info(&node_info).map_err(std::io::Error::other)?;
+        *self.padding_scheme.write() = cfg.protocol.padding_scheme;
+        info!("AnyTLS configuration loaded successfully from node info");
 
         let bind_addr = format!("{}:{}", ctx.listen_addr, ctx.port);
         let listener = bind_tcp_listener(&bind_addr, ctx.global_config.mptcp).await?;

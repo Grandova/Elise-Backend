@@ -68,6 +68,12 @@ impl Inbound for NaiveInbound {
     ) -> std::io::Result<()> {
         let bind_addr = format!("{}:{}", ctx.listen_addr, ctx.port);
         let listener = bind_tcp_listener(&bind_addr, ctx.global_config.mptcp).await?;
+        if node_info.tls.is_some_and(|mode| mode > 1) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "This inbound supports plain TCP or TLS, not REALITY",
+            ));
+        }
         let is_tls = node_info.tls.unwrap_or(0) == 1;
         info!(
             "NaiveProxy inbound listening on {} (mode: {})",
@@ -76,28 +82,22 @@ impl Inbound for NaiveInbound {
         );
 
         let tls_manager = if is_tls {
-            match crate::transport::StreamSettings::from_node_info(&node_info) {
-                Ok(settings) => match settings.security {
-                    crate::transport::TransportSecurityConfig::Tls(ref tls_cfg) => {
-                        match crate::security::TLSManager::from_config(
-                            tls_cfg,
-                            ctx.global_config.auto_tls,
-                            &ctx.global_config.fake_sni,
-                        ) {
-                            Ok(mgr) => Some(Arc::new(mgr)),
-                            Err(e) => {
-                                warn!("Failed to initialize TLS from node_info: {e}, falling back to ctx.tls_manager");
-                                Some(ctx.tls_manager.clone())
-                            }
-                        }
-                    }
-                    _ => Some(ctx.tls_manager.clone()),
-                },
-                Err(e) => {
-                    warn!("Failed to parse StreamSettings: {e}, falling back to ctx.tls_manager");
-                    Some(ctx.tls_manager.clone())
-                }
-            }
+            let settings = crate::transport::StreamSettings::from_node_info(&node_info)
+                .map_err(std::io::Error::other)?;
+            let crate::transport::TransportSecurityConfig::Tls(tls_cfg) = settings.security else {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Expected TLS configuration",
+                ));
+            };
+            Some(Arc::new(
+                crate::security::TLSManager::from_config(
+                    &tls_cfg,
+                    ctx.global_config.auto_tls,
+                    &ctx.global_config.fake_sni,
+                )
+                .map_err(std::io::Error::other)?,
+            ))
         } else {
             None
         };
@@ -165,11 +165,7 @@ async fn handle_connection(
 
     if is_tls {
         // TLS Mode
-        let acceptor = match tls_manager
-            .as_ref()
-            .and_then(|m| m.get_acceptor())
-            .or_else(|| ctx.tls_manager.get_acceptor())
-        {
+        let acceptor = match tls_manager.as_ref().and_then(|m| m.get_acceptor()) {
             Some(a) => a,
             None => {
                 warn!(

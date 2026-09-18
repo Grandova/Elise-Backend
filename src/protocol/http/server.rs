@@ -24,6 +24,12 @@ pub async fn run_http_server(
     users: Arc<RwLock<HashMap<String, User>>>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) -> std::io::Result<()> {
+    if node_info.tls.is_some_and(|mode| mode > 1) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "This inbound supports plain TCP or TLS, not REALITY",
+        ));
+    }
     let is_tls = node_info.tls.unwrap_or(0) == 1;
 
     // Defense: ECH must never be enabled on Plain HTTP Proxy
@@ -56,30 +62,22 @@ pub async fn run_http_server(
     );
 
     let tls_manager = if is_tls {
-        match crate::transport::StreamSettings::from_node_info(&node_info) {
-            Ok(settings) => match settings.security {
-                crate::transport::TransportSecurityConfig::Tls(ref tls_cfg) => {
-                    match crate::security::TLSManager::from_config(
-                        tls_cfg,
-                        ctx.global_config.auto_tls,
-                        &ctx.global_config.fake_sni,
-                    ) {
-                        Ok(mgr) => Some(Arc::new(mgr)),
-                        Err(e) => {
-                            warn!(
-                                "Failed to initialize TLS from node_info: {e}, falling back to ctx.tls_manager"
-                            );
-                            Some(ctx.tls_manager.clone())
-                        }
-                    }
-                }
-                _ => Some(ctx.tls_manager.clone()),
-            },
-            Err(e) => {
-                warn!("Failed to parse StreamSettings: {e}, falling back to ctx.tls_manager");
-                Some(ctx.tls_manager.clone())
-            }
-        }
+        let settings = crate::transport::StreamSettings::from_node_info(&node_info)
+            .map_err(std::io::Error::other)?;
+        let crate::transport::TransportSecurityConfig::Tls(tls_cfg) = settings.security else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Expected TLS configuration",
+            ));
+        };
+        Some(Arc::new(
+            crate::security::TLSManager::from_config(
+                &tls_cfg,
+                ctx.global_config.auto_tls,
+                &ctx.global_config.fake_sni,
+            )
+            .map_err(std::io::Error::other)?,
+        ))
     } else {
         None
     };

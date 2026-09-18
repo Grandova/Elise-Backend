@@ -200,7 +200,7 @@ pub fn build_server_config(
 
     // If no certificates were provided
     if loaded_certs.is_empty() {
-        if auto_tls {
+        if auto_tls && config.allow_self_signed {
             let sni = config.server_name.as_deref().unwrap_or(default_sni);
             tracing::info!(
                 "TLSManager: No certificates provided; generating 10-year self-signed ECDSA P-256 certificate for SNI '{}'",
@@ -222,8 +222,8 @@ pub fn build_server_config(
             loaded_certs.push((vec![cert_der], key_der));
         } else {
             return Err(
-                "TLS is enabled but no certificates were provided and auto_tls is false. \
-                 Refusing to start with missing certificates."
+                "TLS has no certificate: self-signed generation requires auto_tls=true and panel allow_insecure=true. \
+                 Supply a trusted certificate when the client verifies certificates."
                     .to_string(),
             );
         }
@@ -442,6 +442,7 @@ mod tests {
         let cfg = TlsServerConfig {
             server_name: Some("example.com".to_string()),
             server_names: vec!["example.com".to_string()],
+            allow_self_signed: true,
             reject_unknown_sni: false,
             certificates: vec![TlsCertificateEntry {
                 cert_pem: Some(cert_pem),
@@ -463,6 +464,7 @@ mod tests {
         let cfg = TlsServerConfig {
             server_name: Some("example.com".to_string()),
             server_names: vec![],
+            allow_self_signed: true,
             reject_unknown_sni: false,
             certificates: vec![],
             ech: Some(EchServerConfig {
@@ -488,6 +490,7 @@ mod tests {
         let cfg = TlsServerConfig {
             server_name: Some("secret.internal".to_string()),
             server_names: vec!["secret.internal".to_string()],
+            allow_self_signed: true,
             reject_unknown_sni: false,
             certificates: vec![],
             ech: Some(EchServerConfig {
@@ -515,6 +518,7 @@ mod tests {
         let cfg = TlsServerConfig {
             server_name: Some("node1.example.com".to_string()),
             server_names: vec!["node1.example.com".to_string()],
+            allow_self_signed: true,
             reject_unknown_sni: true,
             certificates: vec![TlsCertificateEntry {
                 cert_pem: Some(cert.pem()),
@@ -536,6 +540,7 @@ mod tests {
         let cfg = TlsServerConfig {
             server_name: Some("example.com".to_string()),
             server_names: vec![],
+            allow_self_signed: true,
             reject_unknown_sni: false,
             certificates: vec![],
             ech: None,
@@ -545,8 +550,6 @@ mod tests {
 
         let res = build_server_config(&cfg, false, "example.com");
         assert!(res.is_err());
-        assert!(res
-            .unwrap_err()
-            .contains("no certificates were provided and auto_tls is false"));
+        assert!(res.unwrap_err().contains("TLS has no certificate"));
     }
 }
