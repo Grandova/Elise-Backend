@@ -504,7 +504,8 @@ pub fn decrypt_vmess_header(
     enc_header_payload: &[u8],
 ) -> io::Result<VmessRequestHeader> {
     // 1. Decrypt header length (18 bytes = 2 bytes length + 16 bytes tag)
-    let header_len = decrypt_vmess_header_length(cmd_key, auth_id, connection_nonce, enc_len_block)?;
+    let header_len =
+        decrypt_vmess_header_length(cmd_key, auth_id, connection_nonce, enc_len_block)?;
     if enc_header_payload.len() < header_len + 16 {
         return Err(Error::new(
             ErrorKind::UnexpectedEof,
@@ -873,7 +874,10 @@ impl VmessChunkDecrypter {
                 }
                 Ok(total_len)
             }
-            ChunkLengthCodec::Masked { shake, global_padding } => {
+            ChunkLengthCodec::Masked {
+                shake,
+                global_padding,
+            } => {
                 if raw_len_bytes.len() < 2 {
                     return Err(Error::new(
                         ErrorKind::UnexpectedEof,
@@ -903,7 +907,10 @@ impl VmessChunkDecrypter {
         }
     }
 
-    pub fn decrypt_chunk_payload(&mut self, payload_with_tag_and_padding: &mut [u8]) -> io::Result<usize> {
+    pub fn decrypt_chunk_payload(
+        &mut self,
+        payload_with_tag_and_padding: &mut [u8],
+    ) -> io::Result<usize> {
         let padding_len = self.current_padding_len;
         if payload_with_tag_and_padding.len() < 16 + padding_len {
             return Err(Error::new(
@@ -919,7 +926,8 @@ impl VmessChunkDecrypter {
         nonce[1] = count_be[1];
         self.payload_count = self.payload_count.wrapping_add(1);
 
-        let (effective_slice, _padding_slice) = payload_with_tag_and_padding.split_at_mut(effective_len);
+        let (effective_slice, _padding_slice) =
+            payload_with_tag_and_padding.split_at_mut(effective_len);
         let (payload_slice, tag_slice) = effective_slice.split_at_mut(data_len);
 
         match &self.payload_cipher {
@@ -1030,11 +1038,17 @@ impl VmessChunkEncrypter {
     }
 
     pub fn encrypt_chunk(&mut self, payload: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        if payload.len() > u16::MAX as usize - 16 {
+            return Err(Error::new(ErrorKind::InvalidInput, "VMess chunk too large"));
+        }
         let encrypted_size = (payload.len() + 16) as u16;
 
         let padding_len = match &mut self.len_codec {
             ChunkLengthCodec::Authenticated { .. } => 0usize,
-            ChunkLengthCodec::Masked { shake, global_padding } => {
+            ChunkLengthCodec::Masked {
+                shake,
+                global_padding,
+            } => {
                 if *global_padding {
                     (shake.next_u16() % 64) as usize
                 } else {
@@ -1043,7 +1057,9 @@ impl VmessChunkEncrypter {
             }
         };
 
-        let chunk_total_len = encrypted_size + (padding_len as u16);
+        let chunk_total_len = encrypted_size
+            .checked_add(padding_len as u16)
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "VMess padded chunk too large"))?;
 
         match &mut self.len_codec {
             ChunkLengthCodec::Authenticated {
@@ -1268,6 +1284,40 @@ mod tests {
     }
 
     #[test]
+    fn test_vmess_chunk_size_boundary() {
+        let mut enc = VmessChunkEncrypter::new(
+            &[7; 16],
+            &[9; 16],
+            SECURITY_AES_128_GCM,
+            OPTION_CHUNK_MASKING,
+        )
+        .unwrap();
+        let mut out = Vec::new();
+        assert_eq!(
+            enc.encrypt_chunk(&vec![0; 65520], &mut out)
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+        assert!(out.is_empty());
+        enc.encrypt_chunk(&vec![0; 65519], &mut out).unwrap();
+        assert_eq!(out.len(), 65537);
+        let mut enc = VmessChunkEncrypter::new(
+            &[7; 16],
+            &[9; 16],
+            SECURITY_AES_128_GCM,
+            OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING,
+        )
+        .unwrap();
+        assert_eq!(
+            enc.encrypt_chunk(&vec![0; 65519], &mut Vec::new())
+                .unwrap_err()
+                .kind(),
+            ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
     fn test_vmess_chunk_authenticated_roundtrip_chacha() {
         let req_key = [5u8; 16];
         let req_nonce = [3u8; 16];
@@ -1310,20 +1360,10 @@ mod tests {
 
         // Standard Xray/v2fly option: ChunkStream (0x01) | ChunkMasking (0x04) | GlobalPadding (0x08) = 0x0D
         let opt = OPTION_CHUNK_STREAM | OPTION_CHUNK_MASKING | OPTION_GLOBAL_PADDING;
-        let mut enc = VmessChunkEncrypter::new(
-            &req_key,
-            &req_nonce,
-            SECURITY_AES_128_GCM,
-            opt,
-        )
-        .unwrap();
-        let mut dec = VmessChunkDecrypter::new(
-            &req_key,
-            &req_nonce,
-            SECURITY_AES_128_GCM,
-            opt,
-        )
-        .unwrap();
+        let mut enc =
+            VmessChunkEncrypter::new(&req_key, &req_nonce, SECURITY_AES_128_GCM, opt).unwrap();
+        let mut dec =
+            VmessChunkDecrypter::new(&req_key, &req_nonce, SECURITY_AES_128_GCM, opt).unwrap();
 
         // 1. First data chunk (e.g. HTTP GET request)
         let chunk1_data = b"GET /download/64mb HTTP/1.1\r\nHost: example.com\r\n\r\n";

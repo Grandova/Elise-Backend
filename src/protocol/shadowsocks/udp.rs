@@ -1,7 +1,7 @@
 use super::ss2022::{self, Method, UserIndex};
-use crate::protocol::InboundContext;
 use crate::conn::proxy_protocol::{parse_proxy_protocol_datagram, ProxyProtocolMode};
 use crate::conn::udp::UdpSession;
+use crate::protocol::InboundContext;
 use parking_lot::RwLock;
 use shadowsocks::relay::socks5::Address;
 use std::collections::{BTreeSet, HashMap};

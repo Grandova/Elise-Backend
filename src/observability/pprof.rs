@@ -36,7 +36,10 @@ impl PprofServer {
             let listener = match TcpListener::bind(&target_addr).await {
                 Ok(l) => {
                     if let Ok(local_addr) = l.local_addr() {
-                        info!("pprof debug server started successfully on http://{}", local_addr);
+                        info!(
+                            "pprof debug server started successfully on http://{}",
+                            local_addr
+                        );
                     }
                     l
                 }
@@ -109,7 +112,11 @@ impl PprofServer {
     }
 }
 
-fn handle_route(path: &str, start_time: &Instant, _peer: SocketAddr) -> (&'static str, &'static str, String) {
+fn handle_route(
+    path: &str,
+    start_time: &Instant,
+    _peer: SocketAddr,
+) -> (&'static str, &'static str, String) {
     let clean_path = path.split('?').next().unwrap_or(path);
 
     match clean_path {
@@ -157,7 +164,11 @@ a:hover {{ text-decoration: underline; }}
             ("200 OK", "text/plain; charset=utf-8", cmdline)
         }
         "/debug/pprof/heap" | "/debug/pprof/allocs" => {
-            let mut info = format!("heap profile: 1: {} [1: {}] @ heapprofile\n", crate::VERSION, std::process::id());
+            let mut info = format!(
+                "heap profile: 1: {} [1: {}] @ heapprofile\n",
+                crate::VERSION,
+                std::process::id()
+            );
             info.push_str("# Elise Rust Native Heap Diagnostics\n");
             info.push_str(&format!("runtime_os = {}\n", std::env::consts::OS));
             info.push_str(&format!("runtime_arch = {}\n", std::env::consts::ARCH));
@@ -166,15 +177,22 @@ a:hover {{ text-decoration: underline; }}
         }
         "/debug/pprof/goroutine" | "/debug/pprof/tasks" => {
             let mut tasks = format!("goroutine profile: total 1\n");
-            tasks.push_str(&format!("1 @ tokio-runtime [running]\n# Elise Active Async Core v{}\n", crate::VERSION));
+            tasks.push_str(&format!(
+                "1 @ tokio-runtime [running]\n# Elise Active Async Core v{}\n",
+                crate::VERSION
+            ));
             ("200 OK", "text/plain; charset=utf-8", tasks)
         }
-        "/debug/pprof/threadcreate" => {
-            ("200 OK", "text/plain; charset=utf-8", "threadcreate profile: total 1\n".to_string())
-        }
-        "/debug/pprof/profile" => {
-            ("200 OK", "text/plain; charset=utf-8", "CPU profile: Elise Native Engine running at peak performance.\n".to_string())
-        }
+        "/debug/pprof/threadcreate" => (
+            "200 OK",
+            "text/plain; charset=utf-8",
+            "threadcreate profile: total 1\n".to_string(),
+        ),
+        "/debug/pprof/profile" => (
+            "200 OK",
+            "text/plain; charset=utf-8",
+            "CPU profile: Elise Native Engine running at peak performance.\n".to_string(),
+        ),
         "/debug/stats" | "/metrics" => {
             let uptime = start_time.elapsed().as_secs();
             let stats = format!(
@@ -188,8 +206,10 @@ a:hover {{ text-decoration: underline; }}
             );
             ("200 OK", "application/json", stats)
         }
-        _ => {
-            ("404 Not Found", "text/plain; charset=utf-8", "404 page not found\n".to_string())
-        }
+        _ => (
+            "404 Not Found",
+            "text/plain; charset=utf-8",
+            "404 page not found\n".to_string(),
+        ),
     }
 }

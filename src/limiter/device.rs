@@ -45,7 +45,14 @@ pub struct DeviceLimiter {
 
 impl DeviceLimiter {
     pub fn new(window_secs: u64, prefix_v4: u8, prefix_v6: u8, redis_url: Option<String>) -> Self {
-        Self::new_with_redis(window_secs, prefix_v4, prefix_v6, redis_url, window_secs, 300)
+        Self::new_with_redis(
+            window_secs,
+            prefix_v4,
+            prefix_v6,
+            redis_url,
+            window_secs,
+            300,
+        )
     }
 
     pub fn new_with_redis(
@@ -114,7 +121,11 @@ impl DeviceLimiter {
     }
 
     #[cfg(feature = "distributed")]
-    async fn get_redis_online_devices(&self, user_id: u32, url: &str) -> redis::RedisResult<Vec<String>> {
+    async fn get_redis_online_devices(
+        &self,
+        user_id: u32,
+        url: &str,
+    ) -> redis::RedisResult<Vec<String>> {
         let mgr = {
             let manager_guard = self.redis_manager.read().await;
             manager_guard.clone()
@@ -195,7 +206,8 @@ impl DeviceLimiter {
     pub async fn check_and_record_async(&self, user_id: u32, ip: IpAddr) -> bool {
         #[cfg(feature = "distributed")]
         if let Some(url) = &self.redis_url {
-            let res = tokio::time::timeout(self.redis_timeout, self.check_redis(user_id, ip, url)).await;
+            let res =
+                tokio::time::timeout(self.redis_timeout, self.check_redis(user_id, ip, url)).await;
             match res {
                 Ok(Ok(allowed)) => {
                     if allowed {
@@ -204,10 +216,18 @@ impl DeviceLimiter {
                     return allowed;
                 }
                 Ok(Err(e)) => {
-                    tracing::warn!(user_id, "Redis device limit check error, falling back to local: {}", e);
+                    tracing::warn!(
+                        user_id,
+                        "Redis device limit check error, falling back to local: {}",
+                        e
+                    );
                 }
                 Err(_) => {
-                    tracing::warn!(user_id, "Redis device limit check timed out after {}ms, falling back to local", self.redis_timeout.as_millis());
+                    tracing::warn!(
+                        user_id,
+                        "Redis device limit check timed out after {}ms, falling back to local",
+                        self.redis_timeout.as_millis()
+                    );
                 }
             }
         }

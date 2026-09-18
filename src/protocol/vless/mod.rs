@@ -27,7 +27,7 @@ use crate::transport::types::{
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -138,8 +138,13 @@ impl Inbound for VlessInbound {
         let node_config = Arc::new(node_config);
         let stream_settings = Arc::new(node_config.stream.clone());
 
+        let mut connections = tokio::task::JoinSet::new();
+        ctx.mark_ready();
         loop {
             tokio::select! {
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Connection task failed"); }
+                }
                 _ = shutdown_rx.recv() => {
                     info!("VLESS inbound on port {} stopping", ctx.port);
                     break;
@@ -162,7 +167,7 @@ impl Inbound for VlessInbound {
                     let tls_manager = tls_manager.clone();
                     let node_config = node_config.clone();
 
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let _ = handle_connection(
                             stream,
                             remote_addr,
@@ -178,6 +183,8 @@ impl Inbound for VlessInbound {
                 }
             }
         }
+        drop(listener);
+        crate::protocol::common::inbound::drain_connections(&mut connections).await;
         Ok(())
     }
 }
@@ -540,6 +547,7 @@ async fn handle_vless_standard_tcp(
     };
 
     let mut client_conn = MonitoredStream::new(stream, user.id, remote_addr);
+    let _traffic = client_conn.traffic_guard(ctx.on_traffic.clone());
     let start_time = Instant::now();
 
     let _ = crate::conn::copy_bidirectional_throttled(
@@ -547,15 +555,12 @@ async fn handle_vless_standard_tcp(
         &mut out_stream,
         user.id,
         Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
     )
     .await;
 
     let duration = start_time.elapsed();
     let (up, down) = client_conn.stats();
-
-    if up > 0 || down > 0 {
-        (ctx.on_traffic)(user.id, up, down);
-    }
 
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,
@@ -588,11 +593,12 @@ async fn handle_vless_vision_tcp(
     target_ip: Option<IpAddr>,
     target_port: u16,
 ) -> std::io::Result<()> {
+    let idle = crate::conn::IdleTimeout::new(ctx.global_config.tcp_timeout);
     let (client_read, client_write) = tokio::io::split(stream);
     let mut vision_reader = VisionReader::new(client_read, uuid_bytes);
 
     let mut sniff_buf = vec![0u8; 4096];
-    let n = vision_reader.read_payload(&mut sniff_buf).await?;
+    let n = idle.run(vision_reader.read_payload(&mut sniff_buf)).await?;
     if n == 0 {
         return Ok(());
     }
@@ -636,8 +642,11 @@ async fn handle_vless_vision_tcp(
         Err(_) => return Ok(()),
     };
 
-    out_stream.write_all(&sniff_buf).await?;
+    ctx.rate_limiter.throttle(user.id, sniff_buf.len()).await;
+    idle.run(out_stream.write_all(&sniff_buf)).await?;
     let initial_up = sniff_buf.len() as u64;
+    let traffic = crate::conn::TrafficGuard::new(user.id, ctx.on_traffic.clone());
+    traffic.add(initial_up, 0);
 
     let (mut out_read, mut out_write) = tokio::io::split(out_stream);
     let mut vision_writer = VisionWriter::new(client_write, uuid_bytes);
@@ -651,66 +660,51 @@ async fn handle_vless_vision_tcp(
 
     let up_task = async {
         let mut buf = vec![0u8; 32768];
-        let mut up = 0u64;
         loop {
-            let read_res = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                vision_reader.read_payload(&mut buf),
-            )
-            .await;
+            let read_res = idle.run(vision_reader.read_payload(&mut buf)).await;
 
             let n = match read_res {
-                Ok(Ok(n)) if n > 0 => n,
+                Ok(n) if n > 0 => n,
                 _ => break,
             };
 
             rate_limiter.throttle(user_id, n).await;
-            if out_write.write_all(&buf[..n]).await.is_err() {
+            if idle.run(out_write.write_all(&buf[..n])).await.is_err() {
                 break;
             }
-            up += n as u64;
+            total_up += n as u64;
+            traffic.add(n as u64, 0);
         }
         let _ = out_write.shutdown().await;
-        up
     };
 
     let down_task = async {
         let mut buf = vec![0u8; 32768];
-        let mut down = 0u64;
         loop {
-            let read_res =
-                tokio::time::timeout(std::time::Duration::from_secs(60), out_read.read(&mut buf))
-                    .await;
+            let read_res = idle.run(out_read.read(&mut buf)).await;
 
             let n = match read_res {
-                Ok(Ok(n)) if n > 0 => n,
+                Ok(n) if n > 0 => n,
                 _ => break,
             };
 
             rate_limiter.throttle(user_id, n).await;
-            if vision_writer.write_payload(&buf[..n]).await.is_err() {
+            if idle
+                .run(vision_writer.write_payload(&buf[..n]))
+                .await
+                .is_err()
+            {
                 break;
             }
-            down += n as u64;
+            total_down += n as u64;
+            traffic.add(0, n as u64);
         }
         let _ = vision_writer.shutdown().await;
-        down
     };
 
-    tokio::select! {
-        u = up_task => {
-            total_up += u;
-        }
-        d = down_task => {
-            total_down += d;
-        }
-    }
+    tokio::join!(up_task, down_task);
 
     let duration = start_time.elapsed();
-
-    if total_up > 0 || total_down > 0 {
-        (ctx.on_traffic)(user.id, total_up, total_down);
-    }
 
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,
@@ -755,50 +749,14 @@ async fn handle_vless_udp(
     };
     let outbound = ctx.router.match_outbound(&mctx);
 
-    let bind_addr = match local_ip {
-        Some(IpAddr::V4(v4)) => SocketAddr::new(IpAddr::V4(v4), 0),
-        Some(IpAddr::V6(v6)) => SocketAddr::new(IpAddr::V6(v6), 0),
-        None => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
-    };
+    let udp_socket = Arc::new(
+        ctx.router
+            .dialer()
+            .dial_udp_outbound(&outbound, &target_host, target_port, local_ip)
+            .await?,
+    );
 
-    let udp_socket = match tokio::net::UdpSocket::bind(bind_addr).await {
-        Ok(s) => Arc::new(s),
-        Err(_) => return Ok(()),
-    };
-
-    let is_v4 = match bind_addr {
-        SocketAddr::V4(_) => true,
-        SocketAddr::V6(_) => false,
-    };
-
-    let dst_addr: SocketAddr = match target_ip {
-        Some(ip) => SocketAddr::new(ip, target_port),
-        None => {
-            let mut matched = None;
-            if let Ok(addrs) =
-                tokio::net::lookup_host(format!("{}:{}", target_host, target_port)).await
-            {
-                for addr in addrs {
-                    if addr.is_ipv4() == is_v4 {
-                        matched = Some(addr);
-                        break;
-                    }
-                    if matched.is_none() {
-                        matched = Some(addr);
-                    }
-                }
-            }
-            match matched {
-                Some(a) => a,
-                None => return Ok(()),
-            }
-        }
-    };
-
-    if udp_socket.connect(dst_addr).await.is_err() {
-        return Ok(());
-    }
-
+    let idle = crate::conn::IdleTimeout::new(ctx.global_config.udp_timeout);
     let (mut client_read, mut client_write) = tokio::io::split(stream);
     let start_time = Instant::now();
 
@@ -808,23 +766,19 @@ async fn handle_vless_udp(
     let rate_limiter = ctx.rate_limiter.clone();
     let user_id = user.id;
 
+    let traffic = crate::conn::TrafficGuard::new(user_id, ctx.on_traffic.clone());
     let mut total_up = 0u64;
     let mut total_down = 0u64;
 
     let up_task = async {
         let mut len_buf = [0u8; 2];
         let mut payload = vec![0u8; 65535];
-        let mut up = 0u64;
 
         loop {
-            let read_res = tokio::time::timeout(
-                std::time::Duration::from_secs(60),
-                client_read.read_exact(&mut len_buf),
-            )
-            .await;
+            let read_res = idle.run(client_read.read_exact(&mut len_buf)).await;
 
             match read_res {
-                Ok(Ok(_)) => {}
+                Ok(_) => {}
                 _ => break,
             }
 
@@ -837,8 +791,8 @@ async fn handle_vless_udp(
                 payload.resize(length, 0);
             }
 
-            if client_read
-                .read_exact(&mut payload[..length])
+            if idle
+                .run(client_read.read_exact(&mut payload[..length]))
                 .await
                 .is_err()
             {
@@ -847,27 +801,24 @@ async fn handle_vless_udp(
 
             rate_limiter.throttle(user_id, 2 + length).await;
 
-            if sock_send.send(&payload[..length]).await.is_err() {
+            if idle.run(sock_send.send(&payload[..length])).await.is_err() {
                 break;
             }
 
-            up += (2 + length) as u64;
+            total_up += (2 + length) as u64;
+            traffic.add((2 + length) as u64, 0);
         }
-        up
     };
 
     let down_task = async {
         let mut buf = [0u8; 65535];
         let mut out_pkt = Vec::with_capacity(65535 + 4);
-        let mut down = 0u64;
 
         loop {
-            let recv_res =
-                tokio::time::timeout(std::time::Duration::from_secs(60), sock_recv.recv(&mut buf))
-                    .await;
+            let recv_res = idle.run(sock_recv.recv(&mut buf)).await;
 
             let n = match recv_res {
-                Ok(Ok(n)) => n,
+                Ok((n, _)) => n,
                 _ => break,
             };
 
@@ -877,29 +828,18 @@ async fn handle_vless_udp(
 
             rate_limiter.throttle(user_id, out_pkt.len()).await;
 
-            if client_write.write_all(&out_pkt).await.is_err() {
+            if idle.run(client_write.write_all(&out_pkt)).await.is_err() {
                 break;
             }
-            down += out_pkt.len() as u64;
+            total_down += out_pkt.len() as u64;
+            traffic.add(0, out_pkt.len() as u64);
         }
         let _ = client_write.shutdown().await;
-        down
     };
 
-    tokio::select! {
-        u = up_task => {
-            total_up = u;
-        }
-        d = down_task => {
-            total_down = d;
-        }
-    }
+    tokio::select! { _ = up_task => {}, _ = down_task => {} }
 
     let duration = start_time.elapsed();
-
-    if total_up > 0 || total_down > 0 {
-        (ctx.on_traffic)(user.id, total_up, total_down);
-    }
 
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,
@@ -922,6 +862,169 @@ async fn handle_vless_udp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    fn context(on_traffic: crate::protocol::TrafficCallback) -> InboundContext {
+        let geo = Arc::new(crate::geo::GeoEngine::default());
+        let dialer = Arc::new(crate::proxy::router::OutboundDialer::new(
+            Arc::new(crate::dns::DNSResolver::default()),
+            None,
+            None,
+            false,
+        ));
+        let mut config = crate::config::GlobalConfig::default();
+        config.domain_sniff = false;
+        InboundContext {
+            ready: None,
+            node_id: 1,
+            listen_addr: "127.0.0.1".into(),
+            port: 0,
+            router: Arc::new(crate::proxy::router::Router::new(
+                Default::default(),
+                dialer,
+                geo.clone(),
+            )),
+            rate_limiter: Arc::new(crate::limiter::RateLimiter::new()),
+            conn_limiter: Arc::new(crate::limiter::ConnectionLimiter::new()),
+            device_limiter: Arc::new(crate::limiter::DeviceLimiter::new(60, 32, 128, None)),
+            audit: Arc::new(crate::security::AuditController::new("", "", geo)),
+            defense: Arc::new(crate::security::AttackDefenseManager::default()),
+            tls_manager: Arc::new(crate::security::TLSManager::new(false, "localhost".into())),
+            audit_logger: Arc::new(crate::observability::AuditLogger::new(None::<&str>)),
+            clickhouse_logger: Arc::new(crate::observability::ClickHouseLogger::new(
+                false,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+            )),
+            on_traffic,
+            global_config: Arc::new(config),
+            ip_user_cache: Arc::new(crate::limiter::IpUserCache::new(1, false, "")),
+        }
+    }
+
+    #[tokio::test]
+    async fn vision_half_close_preserves_other_direction_and_traffic() {
+        for target_first in [false, true] {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let target = tokio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    if target_first {
+                        stream.write_all(b"reply").await.unwrap();
+                        stream.shutdown().await.unwrap();
+                    }
+                    let mut data = Vec::new();
+                    stream.read_to_end(&mut data).await.unwrap();
+                    assert_eq!(data, b"firstlater");
+                    if !target_first {
+                        stream.write_all(b"reply").await.unwrap();
+                    }
+                });
+                let traffic = Arc::new(parking_lot::Mutex::new(Vec::new()));
+                let records = traffic.clone();
+                let ctx = context(Arc::new(move |uid, up, down| {
+                    records.lock().push((uid, up, down))
+                }));
+                let guard = ctx.conn_limiter.try_acquire(42).unwrap();
+                let (client, server) = tokio::io::duplex(65536);
+                let handler = tokio::spawn(handle_vless_vision_tcp(
+                    Box::new(server),
+                    [7; 16],
+                    guard,
+                    "127.0.0.1".parse().unwrap(),
+                    None,
+                    Arc::new(User {
+                        id: 42,
+                        ..Default::default()
+                    }),
+                    ctx,
+                    "127.0.0.1:1".parse().unwrap(),
+                    "127.0.0.1".into(),
+                    None,
+                    port,
+                ));
+                let (read, write) = tokio::io::split(client);
+                let mut reader = VisionReader::new(read, [7; 16]);
+                let mut writer = VisionWriter::new(write, [7; 16]);
+                writer.write_payload(b"first").await.unwrap();
+                if !target_first {
+                    writer.write_payload(b"later").await.unwrap();
+                    writer.shutdown().await.unwrap();
+                }
+                let mut reply = Vec::new();
+                let mut buf = [0; 128];
+                loop {
+                    let n = reader.read_payload(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    reply.extend_from_slice(&buf[..n]);
+                }
+                assert_eq!(reply, b"reply");
+                if target_first {
+                    writer.write_payload(b"later").await.unwrap();
+                    writer.shutdown().await.unwrap();
+                }
+                handler.await.unwrap().unwrap();
+                target.await.unwrap();
+                assert_eq!(*traffic.lock(), vec![(42, 10, 5)]);
+            })
+            .await
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn udp_eof_keeps_both_traffic_counters() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let port = socket.local_addr().unwrap().port();
+            let target = tokio::spawn(async move {
+                let mut buf = [0; 100];
+                for _ in 0..2 {
+                    let (n, peer) = socket.recv_from(&mut buf).await.unwrap();
+                    socket.send_to(&buf[..n], peer).await.unwrap();
+                }
+            });
+            let traffic = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let records = traffic.clone();
+            let ctx = context(Arc::new(move |uid, up, down| {
+                records.lock().push((uid, up, down))
+            }));
+            let guard = ctx.conn_limiter.try_acquire(42).unwrap();
+            let (mut client, server) = tokio::io::duplex(1024);
+            let handler = tokio::spawn(handle_vless_udp(
+                Box::new(server),
+                guard,
+                "127.0.0.1".parse().unwrap(),
+                None,
+                Arc::new(User {
+                    id: 42,
+                    ..Default::default()
+                }),
+                ctx,
+                "127.0.0.1".into(),
+                None,
+                port,
+            ));
+            for _ in 0..2 {
+                client.write_all(b"\0\x04ping").await.unwrap();
+                let mut reply = [0; 6];
+                client.read_exact(&mut reply).await.unwrap();
+                assert_eq!(&reply, b"\0\x04ping");
+            }
+            client.shutdown().await.unwrap();
+            handler.await.unwrap().unwrap();
+            target.await.unwrap();
+            assert_eq!(*traffic.lock(), vec![(42, 12, 12)]);
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn test_vless_node_config_mapping_full() {

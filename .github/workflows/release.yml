@@ -30,14 +30,14 @@ jobs:
           PY
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets --all-features
-      - run: cargo test --locked --all || true
+      - run: cargo test --locked --all
       - run: |
           bash -n scripts/install.sh
           bash -n scripts/package-release.sh
           bash -n scripts/elise.openrc
-      - run: python3 -m unittest discover -s tests -p 'test_installer.py' -v || true
 
   build:
+    needs: check
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -92,6 +92,9 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist
           Copy-Item target/${{ matrix.target }}/release/elise.exe -Destination dist/${{ matrix.artifact_name }}
+          $artifact = 'dist/${{ matrix.artifact_name }}'
+          $hash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  ${{ matrix.artifact_name }}" | Set-Content -LiteralPath "$artifact.sha256" -Encoding ascii
 
       - name: Upload Build Artifact
         uses: actions/upload-artifact@v4
@@ -101,7 +104,7 @@ jobs:
 
   release:
     name: Create GitHub Release
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
     permissions:
@@ -126,5 +129,6 @@ jobs:
             dist/elise-linux-arm64/*.tar.gz
             dist/elise-linux-arm64/*.sha256
             dist/elise-windows-amd64.exe/elise-windows-amd64.exe
+            dist/elise-windows-amd64.exe/*.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

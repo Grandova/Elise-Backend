@@ -293,7 +293,9 @@ async fn apply_xhttp_http1(
             let clean_expected = expected_host.split(':').next().unwrap_or(expected_host);
             if clean_req != clean_expected {
                 let _ = stream
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    )
                     .await;
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
@@ -559,7 +561,6 @@ impl<S: AsyncRead + AsyncWrite + Send + Unpin> AsyncWrite for XHttpChunkedStream
         Pin::new(&mut this.inner).poll_flush(cx)
     }
 }
-
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack

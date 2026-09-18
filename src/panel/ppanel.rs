@@ -18,8 +18,7 @@ pub struct PPanelClient {
     client: Client,
     base_url: String,
     key: String,
-    etag: Arc<RwLock<Option<String>>>,
-    cached_users: Arc<RwLock<Vec<User>>>,
+    cached_users: RwLock<HashMap<u32, Arc<tokio::sync::Mutex<(Option<String>, Vec<User>)>>>>,
 }
 
 impl PPanelClient {
@@ -31,8 +30,7 @@ impl PPanelClient {
                 .unwrap_or_default(),
             base_url: base_url.trim_end_matches('/').to_string(),
             key,
-            etag: Arc::new(RwLock::new(None)),
-            cached_users: Arc::new(RwLock::new(Vec::new())),
+            cached_users: RwLock::new(HashMap::new()),
         }
     }
 
@@ -43,8 +41,14 @@ impl PPanelClient {
     ) -> Result<NodeInfo, Box<dyn std::error::Error + Send + Sync>> {
         // 1. 尝试官方 V2 路径 (/v2/server/{node_id} 与 /api/v2/server/{node_id})
         for v2_path in [
-            format!("{}/v2/server/{}?secret_key={}", self.base_url, node_id, self.key),
-            format!("{}/api/v2/server/{}?secret_key={}", self.base_url, node_id, self.key),
+            format!(
+                "{}/v2/server/{}?secret_key={}",
+                self.base_url, node_id, self.key
+            ),
+            format!(
+                "{}/api/v2/server/{}?secret_key={}",
+                self.base_url, node_id, self.key
+            ),
         ] {
             if let Ok(resp) = self.client.get(&v2_path).send().await {
                 if resp.status().is_success() {
@@ -53,7 +57,10 @@ impl PPanelClient {
                         if let Some(protocols) = data.get("protocols").and_then(|p| p.as_array()) {
                             // 查找第一个已启用的协议配置
                             for proto in protocols {
-                                let enabled = proto.get("enable").and_then(|e| e.as_bool()).unwrap_or(true);
+                                let enabled = proto
+                                    .get("enable")
+                                    .and_then(|e| e.as_bool())
+                                    .unwrap_or(true);
                                 if enabled {
                                     return Ok(self.parse_v2_protocol(node_id, proto, data));
                                 }
@@ -99,7 +106,10 @@ impl PPanelClient {
             }
         }
 
-        let security = proto.get("security").and_then(|v| v.as_str()).unwrap_or("none");
+        let security = proto
+            .get("security")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none");
         let tls = match security.to_ascii_lowercase().as_str() {
             "reality" => Some(2),
             "tls" => Some(1),
@@ -143,8 +153,15 @@ impl PPanelClient {
             .and_then(|v| v.as_u64())
             .map(|v| v as u32);
 
-        let routes = root_data.get("block").or_else(|| root_data.get("routes")).and_then(|v| v.as_array()).cloned();
-        let custom_outbounds = root_data.get("outbound").and_then(|v| v.as_array()).cloned();
+        let routes = root_data
+            .get("block")
+            .or_else(|| root_data.get("routes"))
+            .and_then(|v| v.as_array())
+            .cloned();
+        let custom_outbounds = root_data
+            .get("outbound")
+            .and_then(|v| v.as_array())
+            .cloned();
 
         NodeInfo {
             id: node_id,
@@ -155,17 +172,29 @@ impl PPanelClient {
             server_name,
             tls,
             network,
-            cipher: proto.get("cipher").and_then(|v| v.as_str()).map(String::from),
-            plugin: proto.get("plugin").and_then(|v| v.as_str()).map(String::from),
+            cipher: proto
+                .get("cipher")
+                .and_then(|v| v.as_str())
+                .map(String::from),
+            plugin: proto
+                .get("plugin")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             plugin_opts: proto.get("plugin_opts").cloned(),
             up_mbps,
             down_mbps,
-            server_key: proto.get("server_key").and_then(|v| v.as_str()).map(String::from),
+            server_key: proto
+                .get("server_key")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             short_ids,
             public_key,
             routes,
             custom_outbounds,
-            obfs_password: proto.get("obfs_password").and_then(|v| v.as_str()).map(String::from),
+            obfs_password: proto
+                .get("obfs_password")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             flow: proto.get("flow").and_then(|v| v.as_str()).map(String::from),
             congestion_control: proto
                 .get("congestion_controller")
@@ -173,7 +202,10 @@ impl PPanelClient {
                 .and_then(|v| v.as_str())
                 .map(String::from),
             padding_scheme: proto.get("padding_scheme").cloned(),
-            encryption: proto.get("encryption").and_then(|v| v.as_str()).map(String::from),
+            encryption: proto
+                .get("encryption")
+                .and_then(|v| v.as_str())
+                .map(String::from),
             rate: proto.get("ratio").and_then(|v| v.as_f64()),
             ..Default::default()
         }
@@ -188,7 +220,11 @@ impl PPanelClient {
                 .and_then(|v| v.as_str())
                 .unwrap_or("vless")
                 .to_string(),
-            server_port: data.get("port").or_else(|| data.get("server_port")).and_then(|v| v.as_u64()).unwrap_or(443) as u16,
+            server_port: data
+                .get("port")
+                .or_else(|| data.get("server_port"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(443) as u16,
             host: data.get("host").and_then(|v| v.as_str()).map(String::from),
             path: data.get("path").and_then(|v| v.as_str()).map(String::from),
             server_name: data
@@ -243,13 +279,22 @@ impl PPanelClient {
             self.base_url, node_id, self.key
         );
 
+        let cache = self
+            .cached_users
+            .write()
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new((None, Vec::new()))))
+            .clone();
+        let mut cache = cache.lock().await;
         let mut req = self.client.get(&official_url);
-        if let Some(etag) = self.etag.read().as_ref() {
+        if let Some(etag) = cache.0.as_ref() {
             req = req.header(IF_NONE_MATCH, etag);
         }
 
         let resp = match req.send().await {
-            Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_MODIFIED => r,
+            Ok(r) if r.status().is_success() || r.status() == reqwest::StatusCode::NOT_MODIFIED => {
+                r
+            }
             _ => {
                 // 回退到老版路径 /api/v1/server/nodes/{node_id}/users?token={key}
                 let fallback_url = format!(
@@ -257,7 +302,7 @@ impl PPanelClient {
                     self.base_url, node_id, self.key
                 );
                 let mut fallback_req = self.client.get(&fallback_url);
-                if let Some(etag) = self.etag.read().as_ref() {
+                if let Some(etag) = cache.0.as_ref() {
                     fallback_req = fallback_req.header(IF_NONE_MATCH, etag);
                 }
                 fallback_req.send().await?
@@ -265,16 +310,21 @@ impl PPanelClient {
         };
 
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-            return Ok(self.cached_users.read().clone());
+            if cache.0.is_none() {
+                return Err("Panel returned 304 without a cached ETag".into());
+            }
+            return Ok(cache.1.clone());
         }
 
         if !resp.status().is_success() {
             return Err(format!("PPanel API user sync returned status {}", resp.status()).into());
         }
 
-        if let Some(new_etag) = resp.headers().get("ETag").and_then(|h| h.to_str().ok()) {
-            *self.etag.write() = Some(new_etag.to_string());
-        }
+        let new_etag = resp
+            .headers()
+            .get("ETag")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_owned);
 
         let val: Value = resp.json().await?;
         let user_list = val
@@ -283,6 +333,9 @@ impl PPanelClient {
             .or_else(|| val.get("users"))
             .and_then(|v| v.as_array());
 
+        if user_list.is_none() {
+            return Err("Panel user response has no users array".into());
+        }
         let mut users = Vec::new();
         if let Some(arr) = user_list {
             for item in arr {
@@ -293,10 +346,7 @@ impl PPanelClient {
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    speed_limit: item
-                        .get("speed_limit")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
+                    speed_limit: crate::panel::types::speed_limit_bps(item.get("speed_limit"))?,
                     device_limit: item
                         .get("device_limit")
                         .and_then(|v| v.as_u64())
@@ -315,7 +365,7 @@ impl PPanelClient {
             }
         }
 
-        *self.cached_users.write() = users.clone();
+        *cache = (new_etag, users.clone());
         Ok(users)
     }
 
@@ -443,4 +493,3 @@ impl PPanelClient {
         Ok(res)
     }
 }
-

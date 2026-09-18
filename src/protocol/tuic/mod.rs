@@ -52,7 +52,9 @@ impl Inbound for TuicInbound {
 
     fn update_users(&self, users: Vec<User>) {
         let version = *self.version.read();
-        let new_users = TuicUsers::from_users(users, version);
+        // Users are loaded before start() selects the configured protocol version.
+        let mut new_users = TuicUsers::from_users(users.clone(), TuicProtocolVersion::V4);
+        new_users.v5_users = TuicUsers::from_users(users, TuicProtocolVersion::V5).v5_users;
         *self.users.write() = new_users;
         debug!(
             "TUIC user snapshot updated (protocol version: {:?})",
@@ -100,6 +102,7 @@ impl Inbound for TuicInbound {
         let protocol_version = config.protocol;
         let auth_timeout = config.runtime.auth_timeout;
 
+        ctx.mark_ready();
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -178,6 +181,28 @@ impl Inbound for TuicInbound {
         .await;
 
         conn_join_set.abort_all();
+        while conn_join_set.join_next().await.is_some() {}
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_update_before_start_populates_both_versions() {
+        let inbound = TuicInbound::new();
+        inbound.update_users(vec![User {
+            id: 42,
+            uuid: "12345678-1234-4234-9234-123456789042".into(),
+            password: Some("fixture".into()),
+            ..Default::default()
+        }]);
+        assert_eq!(inbound.users.read().v4_tokens.len(), 1);
+        assert_eq!(inbound.users.read().v5_users.len(), 1);
+        inbound.update_users(Vec::new());
+        assert!(inbound.users.read().v4_tokens.is_empty());
+        assert!(inbound.users.read().v5_users.is_empty());
     }
 }

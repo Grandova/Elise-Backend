@@ -66,6 +66,7 @@ pub struct OutboundDialer {
     out_ip_v4: Option<IpAddr>,
     out_ip_v6: Option<IpAddr>,
     auto_out_ip: bool,
+    audit: parking_lot::RwLock<Option<Arc<crate::security::AuditController>>>,
 }
 
 impl OutboundDialer {
@@ -80,7 +81,42 @@ impl OutboundDialer {
             out_ip_v4,
             out_ip_v6,
             auto_out_ip,
+            audit: parking_lot::RwLock::new(None),
         }
+    }
+
+    pub fn set_audit(&self, audit: Arc<crate::security::AuditController>) {
+        *self.audit.write() = Some(audit);
+    }
+
+    async fn resolve_target(&self, host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+        let audit = self.audit.read().clone();
+        if audit
+            .as_ref()
+            .is_some_and(|a| a.should_block(host, host.parse().ok(), port))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Target blocked before DNS",
+            ));
+        }
+        let mut addresses = self.dns_resolver.resolve(host, port).await?;
+        if addresses.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "No target addresses",
+            ));
+        }
+        if let Some(audit) = audit {
+            addresses.retain(|address| !audit.should_block(host, Some(address.ip()), port));
+            if addresses.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Resolved target blocked by audit",
+                ));
+            }
+        }
+        Ok(addresses)
     }
 
     pub fn dns_resolver(&self) -> &Arc<DNSResolver> {
@@ -112,10 +148,8 @@ impl OutboundDialer {
             "socks" => {
                 let proxy_addr = outbound.target_host().unwrap_or("127.0.0.1");
                 let proxy_port = outbound.port.unwrap_or(1080);
-                let target = match target_host.parse::<IpAddr>() {
-                    Ok(ip) => Address::SocketAddress(SocketAddr::new(ip, target_port)),
-                    Err(_) => Address::DomainNameAddress(target_host.to_owned(), target_port),
-                };
+                let target =
+                    Address::SocketAddress(self.resolve_target(target_host, target_port).await?[0]);
                 self.dial_socks5(
                     proxy_addr,
                     proxy_port,
@@ -130,10 +164,11 @@ impl OutboundDialer {
             "http" => {
                 let proxy_addr = outbound.target_host().unwrap_or("127.0.0.1");
                 let proxy_port = outbound.port.unwrap_or(8080);
+                let target = self.resolve_target(target_host, target_port).await?[0];
                 self.dial_http_connect(
                     proxy_addr,
                     proxy_port,
-                    target_host,
+                    &target.ip().to_string(),
                     target_port,
                     outbound.username.as_deref(),
                     outbound.password.as_deref(),
@@ -185,7 +220,7 @@ impl OutboundDialer {
         target_port: u16,
         inbound_local_ip: Option<IpAddr>,
     ) -> std::io::Result<TcpStream> {
-        let addrs = self.dns_resolver.resolve(target_host, target_port).await?;
+        let addrs = self.resolve_target(target_host, target_port).await?;
         if addrs.is_empty() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -239,7 +274,7 @@ impl OutboundDialer {
         let target_addr = if is_unspecified {
             SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
         } else {
-            let addrs = self.dns_resolver.resolve(target_host, target_port).await?;
+            let addrs = self.resolve_target(target_host, target_port).await?;
             addrs.into_iter().next().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::NotFound,
@@ -248,6 +283,14 @@ impl OutboundDialer {
             })?
         };
 
+        self.bind_udp(target_addr, inbound_local_ip).await
+    }
+
+    async fn bind_udp(
+        &self,
+        target_addr: SocketAddr,
+        inbound_local_ip: Option<IpAddr>,
+    ) -> io::Result<(UdpSocket, SocketAddr)> {
         let bind_ip = if self.auto_out_ip {
             inbound_local_ip.or(self.out_ip_v4).or(self.out_ip_v6)
         } else {
@@ -267,7 +310,7 @@ impl OutboundDialer {
         };
 
         let socket = UdpSocket::bind(local_addr).await?;
-        if !is_unspecified {
+        if target_addr.port() != 0 {
             socket.connect(target_addr).await?;
         }
         Ok((socket, target_addr))
@@ -318,6 +361,8 @@ impl OutboundDialer {
                 })
             }
             "socks" => {
+                let target =
+                    Address::SocketAddress(self.resolve_target(target_host, target_port).await?[0]);
                 let proxy_host = outbound.target_host().ok_or_else(|| {
                     io::Error::new(io::ErrorKind::InvalidInput, "Missing SOCKS5 proxy address")
                 })?;
@@ -343,13 +388,16 @@ impl OutboundDialer {
                         "SOCKS5 returned UDP port zero",
                     ));
                 }
-                let (socket, _) = self
-                    .dial_udp(&relay_host, relay.port(), inbound_local_ip)
-                    .await?;
-                let target = match target_host.parse::<IpAddr>() {
-                    Ok(ip) => Address::SocketAddress(SocketAddr::new(ip, target_port)),
-                    Err(_) => Address::DomainNameAddress(target_host.to_owned(), target_port),
-                };
+                let relay_addr = self
+                    .dns_resolver
+                    .resolve(&relay_host, relay.port())
+                    .await?
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "SOCKS5 relay DNS empty")
+                    })?;
+                let (socket, _) = self.bind_udp(relay_addr, inbound_local_ip).await?;
                 Ok(UdpOutbound {
                     socket,
                     control: Some(control),
@@ -525,4 +573,65 @@ fn base64_encode(input: &[u8]) -> String {
         i += 3;
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn dns_target_is_audited_and_whitelisted_domain_preserves_policy() {
+        let dns = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let resolver = Arc::new(DNSResolver::new(
+            "ipv4_only",
+            1,
+            Some(&format!("udp://{}", dns.local_addr().unwrap())),
+        ));
+        let dns_task = tokio::spawn(async move {
+            let mut query = [0; 512];
+            let (n, peer) = dns.recv_from(&mut query).await.unwrap();
+            let mut response = query[..n].to_vec();
+            response[2] = 0x81;
+            response[3] = 0x80;
+            response[6] = 0;
+            response[7] = 1;
+            response.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 127, 0, 0, 1]);
+            dns.send_to(&response, peer).await.unwrap();
+        });
+        let dialer = OutboundDialer::new(resolver, None, None, false);
+        let audit = Arc::new(crate::security::AuditController::new_with_options(
+            "",
+            "",
+            Arc::new(crate::geo::GeoEngine::default()),
+            vec![],
+            true,
+            false,
+        ));
+        assert!(!audit.should_block("private.test", None, 80));
+        dialer.set_audit(audit.clone());
+        assert_eq!(
+            dialer
+                .dial_direct("private.test", 80, None)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            dialer
+                .dial_udp("private.test", 80, None)
+                .await
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        dns_task.await.unwrap();
+        audit.reload_white_list("full:private.test");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = dialer
+            .dial_direct("private.test", listener.local_addr().unwrap().port(), None)
+            .await
+            .unwrap();
+        assert_eq!(stream.peer_addr().unwrap(), listener.local_addr().unwrap());
+    }
 }

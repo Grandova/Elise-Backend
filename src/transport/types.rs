@@ -975,7 +975,7 @@ impl StreamSettings {
                 // Transport compatibility check: mKCP runs over UDP and cannot run on stream REALITY
                 if transport.transport_type() == TransportType::MKcp {
                     return Err(
-                        "REALITY security is strictly forbidden on mKCP transport".to_string(),
+                        "REALITY security is strictly forbidden on mKCP transport".to_string()
                     );
                 }
 

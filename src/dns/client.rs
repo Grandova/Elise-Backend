@@ -39,7 +39,8 @@ pub fn parse_dns_endpoint(raw: &str) -> io::Result<DnsEndpoint> {
         });
     }
 
-    if let Some(rest) = raw.strip_prefix("tcp-tls://")
+    if let Some(rest) = raw
+        .strip_prefix("tcp-tls://")
         .or_else(|| raw.strip_prefix("tls://"))
         .or_else(|| raw.strip_prefix("dot://"))
     {
@@ -145,28 +146,25 @@ impl DnsClient {
 
         match endpoint {
             DnsEndpoint::Udp { host, port } => {
-                tokio::time::timeout(
-                    DNS_TIMEOUT,
-                    self.query_udp(host, *port, &query_bytes, id),
-                )
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "UDP DNS query timed out"))?
+                tokio::time::timeout(DNS_TIMEOUT, self.query_udp(host, *port, &query_bytes, id))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "UDP DNS query timed out")
+                    })?
             }
             DnsEndpoint::Tcp { host, port } => {
-                tokio::time::timeout(
-                    DNS_TIMEOUT,
-                    self.query_tcp(host, *port, &query_bytes, id),
-                )
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TCP DNS query timed out"))?
+                tokio::time::timeout(DNS_TIMEOUT, self.query_tcp(host, *port, &query_bytes, id))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "TCP DNS query timed out")
+                    })?
             }
             DnsEndpoint::Dot { host, port } => {
-                tokio::time::timeout(
-                    DNS_TIMEOUT,
-                    self.query_dot(host, *port, &query_bytes, id),
-                )
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "DoT DNS query timed out"))?
+                tokio::time::timeout(DNS_TIMEOUT, self.query_dot(host, *port, &query_bytes, id))
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(io::ErrorKind::TimedOut, "DoT DNS query timed out")
+                    })?
             }
             DnsEndpoint::Doh { url } => {
                 tokio::time::timeout(DNS_TIMEOUT, self.query_doh(url, &query_bytes))
@@ -279,7 +277,12 @@ impl DnsClient {
             .tls_connector
             .connect(server_name, tcp_stream)
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::ConnectionRefused, format!("DoT TLS error: {e}")))?;
+            .map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    format!("DoT TLS error: {e}"),
+                )
+            })?;
 
         let len_prefix = (query.len() as u16).to_be_bytes();
         tls_stream.write_all(&len_prefix).await?;
@@ -315,7 +318,9 @@ impl DnsClient {
             .body(query.to_vec())
             .send()
             .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("DoH HTTP request error: {e}")))?;
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("DoH HTTP request error: {e}"))
+            })?;
 
         if !resp.status().is_success() {
             return Err(io::Error::new(

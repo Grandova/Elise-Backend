@@ -14,8 +14,8 @@ use crate::protocol::vmess::VmessInbound;
 use crate::protocol::Inbound;
 use std::sync::Arc;
 
-pub fn create_inbound(protocol_name: &str) -> Arc<dyn Inbound> {
-    match protocol_name.to_lowercase().as_str() {
+pub fn create_inbound(protocol_name: &str) -> std::io::Result<Arc<dyn Inbound>> {
+    Ok(match protocol_name.to_lowercase().as_str() {
         "vless" => Arc::new(VlessInbound::new()),
         "vmess" | "v2ray" => Arc::new(VmessInbound::new()),
         "trojan" => Arc::new(TrojanInbound::new()),
@@ -29,6 +29,11 @@ pub fn create_inbound(protocol_name: &str) -> Arc<dyn Inbound> {
         "naive" | "naiveproxy" => Arc::new(NaiveInbound::new()),
         "http" | "https" => Arc::new(HttpInbound::new()),
         "mieru" => Arc::new(MieruInbound::new()),
-        _ => Arc::new(VlessInbound::new()),
-    }
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("Unsupported inbound: {protocol_name}"),
+            ))
+        }
+    })
 }

@@ -1,5 +1,4 @@
 use super::quic::QuicStream;
-use crate::limiter::ConnGuard;
 use crate::observability::AuditRecord;
 use crate::panel::types::User;
 use crate::protocol::InboundContext;
@@ -11,7 +10,6 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -296,6 +294,10 @@ impl V5Defragmenter {
             total_bytes: 0,
         });
 
+        if entry.total_count != total {
+            return None;
+        }
+
         if index == 0 && entry.addr.is_none() {
             entry.addr = Some(addr);
         }
@@ -334,10 +336,10 @@ pub struct TuicV5Session {
     auth_done: Arc<Notify>,
     auth_ok: Arc<AtomicBool>,
     authenticated_user: Arc<Mutex<Option<User>>>,
-    conn_guard: Arc<Mutex<Option<ConnGuard>>>,
     udp_sessions: Arc<Mutex<HashMap<u16, mpsc::Sender<(TuicV5Address, Vec<u8>, TuicV5RelayMode)>>>>,
     defragmenter: Arc<V5Defragmenter>,
     cancel: CancellationToken,
+    tasks: Mutex<tokio::task::JoinSet<()>>,
 }
 
 impl TuicV5Session {
@@ -358,18 +360,19 @@ impl TuicV5Session {
             auth_done: Arc::new(Notify::new()),
             auth_ok: Arc::new(AtomicBool::new(false)),
             authenticated_user: Arc::new(Mutex::new(None)),
-            conn_guard: Arc::new(Mutex::new(None)),
             udp_sessions: Arc::new(Mutex::new(HashMap::new())),
             defragmenter: Arc::new(V5Defragmenter::new()),
-            cancel,
+            cancel: cancel.child_token(),
+            tasks: Mutex::new(tokio::task::JoinSet::new()),
         }
     }
 
     pub async fn run(self: Arc<Self>) {
+        let _cancel = self.cancel.clone().drop_guard();
         let auth_timeout = self.auth_timeout;
         let session = self.clone();
 
-        tokio::spawn(async move {
+        self.spawn(async move {
             tokio::select! {
                 _ = session.cancel.cancelled() => {}
                 _ = tokio::time::sleep(auth_timeout) => {
@@ -395,6 +398,36 @@ impl TuicV5Session {
             _ = s2.loop_uni_streams() => {}
             _ = s3.loop_datagrams() => {}
         }
+        self.cancel.cancel();
+        self.quic_conn
+            .close(quinn::VarInt::from_u32(0), b"Session closed");
+        let mut tasks = std::mem::take(&mut *self.tasks.lock());
+        while let Some(result) = tasks.join_next().await {
+            if let Err(e) = result {
+                warn!(error = %e, "TUIC worker failed");
+            }
+        }
+        self.udp_sessions.lock().clear();
+    }
+
+    fn spawn(
+        &self,
+        future: impl std::future::Future<Output = ()> + Send + 'static,
+    ) -> tokio::task::AbortHandle {
+        let cancel = self.cancel.clone();
+        let mut tasks = self.tasks.lock();
+        while let Some(result) = tasks.try_join_next() {
+            if let Err(e) = result {
+                warn!(error = %e, "TUIC worker failed");
+            }
+        }
+        tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => {},
+                _ = future => {},
+            }
+        })
     }
 
     async fn loop_bidi_streams(self: Arc<Self>) {
@@ -410,7 +443,7 @@ impl TuicV5Session {
                         }
                     };
                     let session = self.clone();
-                    tokio::spawn(async move {
+                    self.spawn(async move {
                         session.handle_bidi_stream(send, recv).await;
                     });
                 }
@@ -431,7 +464,7 @@ impl TuicV5Session {
                         }
                     };
                     let session = self.clone();
-                    tokio::spawn(async move {
+                    self.spawn(async move {
                         session.handle_uni_stream(recv).await;
                     });
                 }
@@ -452,7 +485,7 @@ impl TuicV5Session {
                         }
                     };
                     let session = self.clone();
-                    tokio::spawn(async move {
+                    self.spawn(async move {
                         session.handle_datagram(data).await;
                     });
                 }
@@ -507,25 +540,18 @@ impl TuicV5Session {
 
                         if export_res.is_ok() && constant_time_eq(&expected_token, client_token) {
                             self.ctx.defense.record_success(client_ip);
-                            if !self.ctx.device_limiter.check_and_record_async(user.id, client_ip).await {
+                            if !self
+                                .ctx
+                                .device_limiter
+                                .check_and_record_async(user.id, client_ip)
+                                .await
+                            {
                                 let _ = self
                                     .quic_conn
                                     .close(quinn::VarInt::from_u32(0x101), b"DeviceLimitExceeded");
                                 return;
                             }
 
-                            let guard = match self.ctx.conn_limiter.try_acquire(user.id) {
-                                Some(g) => g,
-                                None => {
-                                    let _ = self.quic_conn.close(
-                                        quinn::VarInt::from_u32(0x101),
-                                        b"ConnLimitExceeded",
-                                    );
-                                    return;
-                                }
-                            };
-
-                            *self.conn_guard.lock() = Some(guard);
                             *self.authenticated_user.lock() = Some(user);
                             self.auth_ok.store(true, Ordering::Release);
                             self.auth_done.notify_waiters();
@@ -650,6 +676,9 @@ impl TuicV5Session {
             }
         };
 
+        let Some(_conn_guard) = self.ctx.conn_limiter.try_acquire(user.id) else {
+            return;
+        };
         let target_host = addr.host();
         let target_ip = addr.ip();
         let target_port = addr.port();
@@ -694,37 +723,36 @@ impl TuicV5Session {
         };
 
         // TUIC V5 specification: Zero response for Connect! Directly relay data!
-        let mut client_stream = QuicStream::new(recv, send);
-        let user_id = user.id;
-        let on_traffic = self.ctx.on_traffic.clone();
-
-        let relay_res = tokio::io::copy_bidirectional_with_sizes(
+        let mut client_stream = crate::conn::MonitoredStream::new(
+            QuicStream::new(recv, send),
+            user.id,
+            self.remote_addr,
+        );
+        let _traffic = client_stream.traffic_guard(self.ctx.on_traffic.clone());
+        let started = std::time::Instant::now();
+        let result = crate::conn::copy_bidirectional_throttled(
             &mut client_stream,
             &mut out_stream,
-            8192,
-            8192,
+            user.id,
+            Some(&self.ctx.rate_limiter),
+            self.ctx.global_config.tcp_timeout,
         )
         .await;
-
-        if let Ok((up, down)) = relay_res {
-            on_traffic(user_id, up, down);
-            self.ctx.audit_logger.record(AuditRecord::new(
-                self.ctx.node_id,
-                user_id,
-                "tuic",
-                "tcp",
-                &self.remote_addr.ip().to_string(),
-                &target_host,
-                target_port,
-                up,
-                down,
-                0,
-                &outbound.tag,
-                "completed",
-            ));
-        }
-
-        let _ = client_stream.shutdown().await;
+        let (up, down) = client_stream.stats();
+        self.ctx.audit_logger.record(AuditRecord::new(
+            self.ctx.node_id,
+            user.id,
+            "tuic",
+            "tcp",
+            &self.remote_addr.ip().to_string(),
+            &target_host,
+            target_port,
+            up,
+            down,
+            started.elapsed().as_millis() as i64,
+            &outbound.tag,
+            if result.is_ok() { "completed" } else { "error" },
+        ));
     }
 
     async fn handle_datagram(self: Arc<Self>, data: bytes::Bytes) {
@@ -785,12 +813,15 @@ impl TuicV5Session {
     }
 
     async fn wait_auth(&self) -> bool {
+        let authenticated = self.auth_done.notified();
+        tokio::pin!(authenticated);
+        authenticated.as_mut().enable();
         if self.auth_ok.load(Ordering::Acquire) {
             return true;
         }
         tokio::select! {
             _ = self.cancel.cancelled() => false,
-            _ = self.auth_done.notified() => self.auth_ok.load(Ordering::Acquire),
+            _ = authenticated => self.auth_ok.load(Ordering::Acquire),
             _ = tokio::time::sleep(self.auth_timeout) => false,
         }
     }
@@ -807,24 +838,32 @@ impl TuicV5Session {
             None => return,
         };
 
-        let tx_opt = self.udp_sessions.lock().get(&assoc_id).cloned();
+        let tx = {
+            let mut sessions = self.udp_sessions.lock();
+            let tx_opt = sessions
+                .get(&assoc_id)
+                .filter(|tx| !tx.is_closed())
+                .cloned();
+            match tx_opt {
+                Some(tx) => tx,
+                None => {
+                    let (tx, rx) = mpsc::channel(256);
+                    sessions.insert(assoc_id, tx.clone());
 
-        let tx = match tx_opt {
-            Some(tx) => tx,
-            None => {
-                let (tx, rx) = mpsc::channel(256);
-                self.udp_sessions.lock().insert(assoc_id, tx.clone());
+                    let session = self.clone();
+                    self.spawn(async move {
+                        session
+                            .clone()
+                            .run_udp_association(assoc_id, user, rx, mode)
+                            .await;
+                        let mut sessions = session.udp_sessions.lock();
+                        if sessions.get(&assoc_id).is_some_and(|tx| tx.is_closed()) {
+                            sessions.remove(&assoc_id);
+                        }
+                    });
 
-                let session = self.clone();
-                tokio::spawn(async move {
-                    session
-                        .clone()
-                        .run_udp_association(assoc_id, user, rx, mode)
-                        .await;
-                    session.udp_sessions.lock().remove(&assoc_id);
-                });
-
-                tx
+                    tx
+                }
             }
         };
 
@@ -838,40 +877,40 @@ impl TuicV5Session {
         mut rx: mpsc::Receiver<(TuicV5Address, Vec<u8>, TuicV5RelayMode)>,
         initial_mode: TuicV5RelayMode,
     ) {
-        let (socket, _) = match self.ctx.router.dialer().dial_udp("0.0.0.0", 0, None).await {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("TUIC V5 failed to allocate dedicated UDP socket: {:?}", e);
-                return;
-            }
-        };
-        let socket = Arc::new(socket);
-        let socket_recv = socket.clone();
+        let (responses, mut response_rx) = mpsc::channel::<(
+            Vec<u8>,
+            shadowsocks::relay::socks5::Address,
+            tokio::sync::oneshot::Sender<()>,
+        )>(256);
+        let mut sessions: HashMap<(String, u16), mpsc::Sender<Vec<u8>>> = HashMap::new();
+        let mut workers = tokio::task::JoinSet::new();
+        let association_cancel = self.cancel.child_token();
+        let _cancel = association_cancel.clone().drop_guard();
         let quic_conn = self.quic_conn.clone();
-        let on_traffic = self.ctx.on_traffic.clone();
-        let user_id = user.id;
-        let cancel = self.cancel.clone();
+        let cancel = association_cancel.clone();
+        let activity = Arc::new(Notify::new());
+        let sent = activity.clone();
         let current_mode = Arc::new(RwLock::new(initial_mode));
         let current_mode_send = current_mode.clone();
         let packet_id_seq = Arc::new(AtomicU16::new(0));
         let packet_id_seq_recv = packet_id_seq.clone();
 
-        // Inbound relay task: socket.recv_from -> package TUIC V5 Packet -> send to client
-        let send_task = tokio::spawn(async move {
-            let mut recv_buf = [0u8; 65536];
+        // Acknowledge only complete protocol responses to the shared accounting core.
+        let send_task = self.spawn(async move {
             let max_packet_size = 1200 - 3; // Standard QUIC MTU headroom
 
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => break,
-                    res = socket_recv.recv_from(&mut recv_buf) => {
-                        let (len, src_addr) = match res {
-                            Ok(r) => r,
-                            Err(_) => break,
+                    res = response_rx.recv() => {
+                        let Some((data, address, ack)) = res else { break; };
+                        let len = data.len();
+                        let data = data.as_slice();
+                        let addr = match address {
+                            shadowsocks::relay::socks5::Address::SocketAddress(addr) => TuicV5Address::from_socket_addr(addr),
+                            shadowsocks::relay::socks5::Address::DomainNameAddress(host, port) => TuicV5Address::Domain(host, port),
                         };
-                        let data = &recv_buf[..len];
                         let pkt_id = packet_id_seq_recv.fetch_add(1, Ordering::Relaxed);
-                        let addr = TuicV5Address::from_socket_addr(src_addr);
                         let mode = *current_mode_send.read();
 
                         match mode {
@@ -894,11 +933,12 @@ impl TuicV5Session {
                                     packet_buf.extend_from_slice(data);
 
                                     if quic_conn.send_datagram(packet_buf.into()).is_ok() {
-                                        on_traffic(user_id, 0, len as u64);
+                                        let _ = ack.send(());
+                                        sent.notify_one();
                                     }
                                 } else {
                                     // Fragmented Native Datagram
-                                    let fragment_data_mtu = max_packet_size.saturating_sub(11); // 10B header + 1B None addr
+                                    let fragment_data_mtu = max_packet_size.saturating_sub(header_overhead);
                                     if fragment_data_mtu == 0 {
                                         continue;
                                     }
@@ -928,7 +968,8 @@ impl TuicV5Session {
                                         }
                                     }
                                     if sent_all {
-                                        on_traffic(user_id, 0, len as u64);
+                                        let _ = ack.send(());
+                                        sent.notify_one();
                                     }
                                 }
                             }
@@ -948,7 +989,8 @@ impl TuicV5Session {
                                 if let Ok(mut uni_stream) = quic_conn.open_uni().await {
                                     if uni_stream.write_all(&packet_buf).await.is_ok() {
                                         let _ = uni_stream.finish();
-                                        on_traffic(user_id, 0, len as u64);
+                                        let _ = ack.send(());
+                                        sent.notify_one();
                                     }
                                 }
                             }
@@ -958,32 +1000,55 @@ impl TuicV5Session {
             }
         });
 
-        // Outbound send task: rx -> socket.send_to
-        let idle_timeout = Duration::from_secs(60);
+        let idle_timeout = if self.ctx.global_config.udp_timeout == 0 {
+            Duration::from_secs(u32::MAX as u64)
+        } else {
+            Duration::from_secs(self.ctx.global_config.udp_timeout)
+        };
+        let idle = tokio::time::sleep(idle_timeout);
+        tokio::pin!(idle);
         loop {
             tokio::select! {
+                biased;
                 _ = self.cancel.cancelled() => break,
-                res = tokio::time::timeout(idle_timeout, rx.recv()) => {
-                    let (addr, payload, mode) = match res {
-                        Ok(Some(item)) => item,
-                        _ => break, // Idle timeout or channel closed
-                    };
-
+                _ = activity.notified() => { idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout); },
+                _ = &mut idle => break,
+                result = workers.join_next(), if !workers.is_empty() => {
+                    if let Some(Err(e)) = result { warn!(error = %e, "TUIC UDP worker failed"); }
+                    sessions.retain(|_, tx| !tx.is_closed());
+                },
+                packet = rx.recv() => {
+                    let Some((addr, payload, mode)) = packet else { break; };
                     *current_mode.write() = mode;
-
-                    let target_host = addr.host();
-                    let target_port = addr.port();
-
-                    if let Ok(mut resolved_addrs) = tokio::net::lookup_host(format!("{}:{}", target_host, target_port)).await {
-                        if let Some(target_sock) = resolved_addrs.next() {
-                            if socket.send_to(&payload, target_sock).await.is_ok() {
-                                (self.ctx.on_traffic)(user.id, payload.len() as u64, 0);
-                            }
+                    let key = (addr.host(), addr.port());
+                    if key.1 == 0 { continue; }
+                    if sessions.get(&key).is_none_or(|tx| tx.is_closed()) {
+                        let session = match crate::conn::udp::UdpSession::connect(
+                            self.ctx.clone(), user.id, self.remote_addr,
+                            key.0.clone(), key.1, None, "tuic",
+                        ).await {
+                            Ok(session) => session,
+                            Err(e) => { debug!(error = %e, "TUIC UDP rejected"); continue; }
+                        };
+                        let (tx, requests) = mpsc::channel(256);
+                        sessions.insert(key.clone(), tx);
+                        let responses = responses.clone();
+                        let cancel = association_cancel.clone();
+                        workers.spawn(async move { let _ = session.relay(requests, responses, cancel).await; });
+                    }
+                    if let Some(tx) = sessions.get(&key) {
+                        tokio::select! {
+                            _ = self.cancel.cancelled() => break,
+                            _ = &mut idle => break,
+                            _ = tx.send(payload) => {},
                         }
                     }
+                    idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
                 }
             }
         }
+        association_cancel.cancel();
+        while workers.join_next().await.is_some() {}
 
         send_task.abort();
     }
@@ -998,4 +1063,24 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         result |= x ^ y;
     }
     result == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inconsistent_fragment_count_does_not_index_out_of_bounds() {
+        let fragments = V5Defragmenter::new();
+        let address = TuicV5Address::None;
+        assert!(fragments
+            .insert(1, 2, 2, 0, address.clone(), vec![1])
+            .is_none());
+        assert!(fragments
+            .insert(1, 2, 3, 2, address.clone(), vec![2])
+            .is_none());
+        let (_, payload) = fragments.insert(1, 2, 2, 1, address, vec![3]).unwrap();
+        assert_eq!(payload, vec![1, 3]);
+        assert_eq!(*fragments.total_memory.lock(), 0);
+    }
 }

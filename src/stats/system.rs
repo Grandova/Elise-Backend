@@ -45,14 +45,18 @@ impl SystemCollector {
     }
 
     pub fn dec_connection(&self) {
-        let _ = self.active_connections.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-            Some(v.saturating_sub(1))
-        });
+        let _ = self
+            .active_connections
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
     }
 
     pub fn add_traffic(&self, in_bytes: u64, out_bytes: u64) {
-        self.cumulative_in_bytes.fetch_add(in_bytes, Ordering::Relaxed);
-        self.cumulative_out_bytes.fetch_add(out_bytes, Ordering::Relaxed);
+        self.cumulative_in_bytes
+            .fetch_add(in_bytes, Ordering::Relaxed);
+        self.cumulative_out_bytes
+            .fetch_add(out_bytes, Ordering::Relaxed);
     }
 
     pub fn collect(&self, total_users: u32, active_users: u32) -> NodeStatusReport {
@@ -130,7 +134,9 @@ impl SystemCollector {
     fn check_kernel_status() -> bool {
         #[cfg(target_os = "linux")]
         {
-            if let Ok(content) = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_congestion_control") {
+            if let Ok(content) =
+                std::fs::read_to_string("/proc/sys/net/ipv4/tcp_congestion_control")
+            {
                 if content.trim() == "bbr" {
                     return true;
                 }

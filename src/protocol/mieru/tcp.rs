@@ -1,9 +1,10 @@
 use crate::conn::{bind_tcp_listener, read_proxy_protocol, BoxedStream};
-use crate::protocol::mieru::crypto::{increment_nonce, MieruUserIndex, OVERHEAD};
+use crate::protocol::mieru::crypto::{increment_nonce, MieruUser, MieruUserIndex};
 use crate::protocol::mieru::pattern::TrafficPatternExecutor;
 use crate::protocol::mieru::relay::handle_socks5_session;
 use crate::protocol::mieru::session::{
-    MieruSessionReader, MieruSessionState, MieruSessionWriter, MieruStreamCipher,
+    MieruFrame, MieruSessionReader, MieruSessionState, MieruSessionWriter, MieruStreamCipher,
+    PROTOCOL_ACK_C2S, PROTOCOL_CLOSE_SESSION_REQ, PROTOCOL_CLOSE_SESSION_RESP,
     PROTOCOL_OPEN_SESSION_REQ, PROTOCOL_OPEN_SESSION_RESP,
 };
 use crate::protocol::InboundContext;
@@ -11,13 +12,15 @@ use chacha20poly1305::KeyInit;
 use chacha20poly1305::XChaCha20Poly1305;
 use parking_lot::RwLock;
 use rand::RngCore;
+use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 pub async fn start_tcp_server(
@@ -30,8 +33,13 @@ pub async fn start_tcp_server(
     let listener = bind_tcp_listener(&bind_addr, ctx.global_config.mptcp).await?;
     info!("Mieru TCP inbound listening on {}", bind_addr);
 
+    let mut connections = tokio::task::JoinSet::new();
+    ctx.mark_ready();
     loop {
         tokio::select! {
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Connection task failed"); }
+                }
             _ = shutdown_rx.recv() => {
                 info!("Mieru TCP inbound on port {} stopping", ctx.port);
                 break;
@@ -50,14 +58,33 @@ pub async fn start_tcp_server(
                 let user_index = user_index.clone();
                 let pattern = pattern.clone();
 
-                tokio::spawn(async move {
-                    let _ = handle_tcp_connection(stream, remote_addr, ctx, user_index, pattern).await;
+                let shutdown = shutdown_rx.resubscribe();
+                connections.spawn(async move {
+                    if let Err(e) = handle_tcp_connection(stream, remote_addr, ctx, user_index, pattern, shutdown).await {
+                        debug!(error = %e, "Mieru TCP connection closed");
+                    }
                 });
             }
         }
     }
+    drop(listener);
+    crate::protocol::common::inbound::drain_connections(&mut connections).await;
     Ok(())
 }
+
+struct TcpSession {
+    input: mpsc::Sender<Vec<u8>>,
+    state: Arc<Mutex<MieruSessionState>>,
+    cancel: CancellationToken,
+}
+
+type HandshakeTuple = (
+    MieruSessionReader<tokio::io::ReadHalf<BoxedStream>>,
+    MieruSessionWriter<tokio::io::WriteHalf<BoxedStream>>,
+    MieruUser,
+    IpAddr,
+    MieruFrame,
+);
 
 async fn handle_tcp_connection(
     stream: TcpStream,
@@ -65,29 +92,191 @@ async fn handle_tcp_connection(
     ctx: InboundContext,
     user_index: Arc<RwLock<MieruUserIndex>>,
     pattern: Arc<TrafficPatternExecutor>,
+    mut shutdown: broadcast::Receiver<()>,
 ) -> io::Result<()> {
-    // Timeout of 15 seconds for handshake to protect against slowloris attacks
-    let handshake_res = tokio::time::timeout(
-        Duration::from_secs(15),
-        perform_tcp_handshake(stream, remote_addr, &ctx, &user_index, &pattern),
-    )
-    .await;
-
-    let (client_rx, client_tx, user, client_ip, conn_guard) = match handshake_res {
-        Ok(Ok(Some(tuple))) => tuple,
+    let handshake = tokio::select! {
+        _ = shutdown.recv() => return Ok(()),
+        result = tokio::time::timeout(Duration::from_secs(15),
+            perform_tcp_handshake(stream, remote_addr, &ctx, &user_index, &pattern)) => result,
+    };
+    let (mut reader, writer, authenticated, client_ip, first) = match handshake {
+        Ok(Ok(Some(value))) => value,
+        Ok(Err(error)) => return Err(error),
         _ => return Ok(()),
     };
-
-    handle_socks5_session(client_rx, client_tx, user, client_ip, ctx, conn_guard).await
+    let writer = Arc::new(Mutex::new(writer));
+    let cancel = CancellationToken::new();
+    let (frames_tx, mut frames_rx) = mpsc::channel(16);
+    let mut readers = tokio::task::JoinSet::new();
+    readers.spawn(async move {
+        if frames_tx.send(Ok(Some(first))).await.is_err() {
+            return;
+        }
+        loop {
+            let frame = reader.read_next_segment().await;
+            let done = !matches!(&frame, Ok(Some(_)));
+            if frames_tx.send(frame).await.is_err() || done {
+                break;
+            }
+        }
+    });
+    let mut sessions = HashMap::<u32, TcpSession>::new();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut idle = tokio::time::interval(Duration::from_secs(1));
+    let mut last_activity = tokio::time::Instant::now();
+    let result = async {
+        loop {
+            let frame = tokio::select! {
+                _ = shutdown.recv() => break,
+                _ = cancel.cancelled() => break,
+                _ = idle.tick() => {
+                    if sessions.is_empty() && ctx.global_config.tcp_timeout > 0
+                        && last_activity.elapsed().as_secs() >= ctx.global_config.tcp_timeout {
+                        break;
+                    }
+                    continue;
+                }
+                done = tasks.join_next(), if !tasks.is_empty() => {
+                    match done {
+                        Some(Ok(id)) => { sessions.remove(&id); }
+                        Some(Err(error)) => return Err(Error::other(error)),
+                        None => {}
+                    }
+                    last_activity = tokio::time::Instant::now();
+                    continue;
+                }
+                frame = frames_rx.recv() => match frame {
+                    Some(Ok(Some(frame))) => frame,
+                    Some(Err(error)) => return Err(error),
+                    _ => break,
+                },
+            };
+            last_activity = tokio::time::Instant::now();
+            let id = u32::from_be_bytes(frame.meta[6..10].try_into().unwrap());
+            let seq = u32::from_be_bytes(frame.meta[10..14].try_into().unwrap());
+            match frame.meta[0] {
+                PROTOCOL_OPEN_SESSION_REQ => {
+                    if sessions.contains_key(&id) { continue; }
+                    let state = Arc::new(Mutex::new(MieruSessionState::new(id)));
+                    state.lock().await.advance_recv_seq(seq);
+                    // Revalidate new logical sessions against the current panel user generation.
+                    let user = user_index.read().users().iter()
+                        .find(|u| u.panel_user.id == authenticated.panel_user.id
+                            && u.hashed_password == authenticated.hashed_password)
+                        .map(|u| u.panel_user.clone());
+                    let Some(user) = user else {
+                        writer.lock().await.write_control(&state, PROTOCOL_CLOSE_SESSION_REQ).await?;
+                        continue;
+                    };
+                    let guard = if ctx.device_limiter.check_and_record_async(user.id, client_ip).await {
+                        ctx.conn_limiter.try_acquire(user.id)
+                    } else { None };
+                    let Some(guard) = guard else {
+                        writer.lock().await.write_control(&state, PROTOCOL_CLOSE_SESSION_REQ).await?;
+                        continue;
+                    };
+                    writer.lock().await.write_control(&state, PROTOCOL_OPEN_SESSION_RESP).await?;
+                    let (input, mut packets) = mpsc::channel::<Vec<u8>>(8);
+                    if !frame.payload.is_empty() {
+                        input.try_send(frame.payload).map_err(|_| Error::other("Mieru initial payload queue failed"))?;
+                    }
+                    let session_cancel = cancel.child_token();
+                    sessions.insert(id, TcpSession { input, state: state.clone(), cancel: session_cancel.clone() });
+                    let writer = writer.clone();
+                    let ctx = ctx.clone();
+                    let connection_cancel = cancel.clone();
+                    tasks.spawn(async move {
+                        let (client, transport) = tokio::io::duplex(65536);
+                        let (client_read, client_write) = tokio::io::split(client);
+                        let (mut output, mut input) = tokio::io::split(transport);
+                        let mut pumps = tokio::task::JoinSet::new();
+                        let incoming = pumps.spawn(async move {
+                            while let Some(packet) = packets.recv().await {
+                                if input.write_all(&packet).await.is_err() { break; }
+                            }
+                            let _ = input.shutdown().await;
+                        });
+                        let output_writer = writer.clone();
+                        let output_state = state.clone();
+                        let failed = connection_cancel.clone();
+                        pumps.spawn(async move {
+                            let mut buffer = vec![0u8; 16384];
+                            loop {
+                                match output.read(&mut buffer).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        if let Err(e) = output_writer.lock().await.write_data(&output_state, &buffer[..n]).await {
+                                            debug!(error = %e, "Mieru TCP writer failed");
+                                            failed.cancel();
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                        tokio::select! {
+                            _ = session_cancel.cancelled() => {},
+                            result = handle_socks5_session(client_read, client_write, user, client_ip, ctx, guard) => {
+                                if let Err(error) = result { debug!(session_id = id, %error, "Mieru session closed"); }
+                            },
+                        }
+                        incoming.abort();
+                        // Drain buffered response bytes before the session close frame.
+                        while let Some(result) = pumps.join_next().await {
+                            if result.is_err_and(|e| e.is_panic()) { connection_cancel.cancel(); }
+                        }
+                        let mut writer = writer.lock().await;
+                        if !state.lock().await.is_closed {
+                            if writer.write_control(&state, PROTOCOL_CLOSE_SESSION_REQ).await.is_err() {
+                                connection_cancel.cancel();
+                            }
+                        }
+                        id
+                    });
+                }
+                PROTOCOL_CLOSE_SESSION_REQ | PROTOCOL_CLOSE_SESSION_RESP => {
+                    if let Some(session) = sessions.get(&id) {
+                        session.state.lock().await.advance_recv_seq(seq);
+                        if frame.meta[0] == PROTOCOL_CLOSE_SESSION_REQ {
+                            writer.lock().await.write_control(&session.state, PROTOCOL_CLOSE_SESSION_RESP).await?;
+                        } else {
+                            session.state.lock().await.is_closed = true;
+                        }
+                        session.cancel.cancel();
+                    }
+                }
+                _ => {
+                    if let Some(session) = sessions.get(&id) {
+                        session.state.lock().await.advance_recv_seq(seq);
+                        if frame.meta[0] != PROTOCOL_ACK_C2S && !frame.payload.is_empty() {
+                            let sent = tokio::select! {
+                                _ = shutdown.recv() => break,
+                                _ = cancel.cancelled() => break,
+                                _ = session.cancel.cancelled() => continue,
+                                sent = session.input.send(frame.payload) => sent,
+                            };
+                            if sent.is_err() {
+                                writer.lock().await.write_control(&session.state, PROTOCOL_CLOSE_SESSION_REQ).await?;
+                                session.cancel.cancel();
+                            }
+                        }
+                    } else {
+                        let state = Arc::new(Mutex::new(MieruSessionState::new(id)));
+                        state.lock().await.next_send_seq = u32::from_be_bytes(frame.meta[14..18].try_into().unwrap());
+                        writer.lock().await.write_control(&state, PROTOCOL_CLOSE_SESSION_REQ).await?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }.await;
+    cancel.cancel();
+    readers.abort_all();
+    tasks.abort_all();
+    while readers.join_next().await.is_some() {}
+    while tasks.join_next().await.is_some() {}
+    result
 }
-
-type HandshakeTuple = (
-    tokio::io::ReadHalf<tokio::io::DuplexStream>,
-    tokio::io::WriteHalf<tokio::io::DuplexStream>,
-    crate::panel::types::User,
-    std::net::IpAddr,
-    crate::limiter::ConnGuard,
-);
 
 async fn perform_tcp_handshake(
     stream: TcpStream,
@@ -96,164 +285,48 @@ async fn perform_tcp_handshake(
     user_index: &Arc<RwLock<MieruUserIndex>>,
     pattern: &Arc<TrafficPatternExecutor>,
 ) -> io::Result<Option<HandshakeTuple>> {
-    let (src_opt, mut stream) =
+    let (source, mut stream) =
         read_proxy_protocol(stream, ctx.global_config.get_proxy_protocol_mode()).await?;
-    if let Some(src) = src_opt {
-        remote_addr = src;
+    if let Some(source) = source {
+        remote_addr = source;
     }
-
     let client_ip = remote_addr.ip();
     if ctx.defense.is_banned(client_ip) {
         return Ok(None);
     }
-
-    // 1. Read first segment: 24B Nonce + 32B Meta ciphertext + 16B Tag = 72B
-    let mut initial_hdr = [0u8; 72];
-    stream.read_exact(&mut initial_hdr).await?;
-
-    let mut recv_nonce = [0u8; 24];
-    recv_nonce.copy_from_slice(&initial_hdr[..24]);
-
-    let now_sec = SystemTime::now()
+    let mut header = [0u8; 72];
+    stream.read_exact(&mut header).await?;
+    let mut nonce = [0u8; 24];
+    nonce.copy_from_slice(&header[..24]);
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-
-    let decrypt_opt = {
-        let guard = user_index.read();
-        guard.try_decrypt_metadata(&initial_hdr[24..72], &recv_nonce, now_sec)
-    };
-
-    let (user, key, meta) = match decrypt_opt {
-        Some(res) => {
-            ctx.defense.record_success(client_ip);
-            res
-        }
-        None => {
-            ctx.defense.record_failure(client_ip);
-            return Ok(None);
-        }
-    };
-
-    let proto = meta[0];
-    if proto != PROTOCOL_OPEN_SESSION_REQ {
+    let decrypted = user_index
+        .read()
+        .try_decrypt_metadata(&header[24..], &nonce, now);
+    let Some((user, key, meta)) = decrypted else {
+        ctx.defense.record_failure(client_ip);
         return Ok(None);
-    }
-
-    let session_id = u32::from_be_bytes(meta[6..10].try_into().unwrap());
-    if session_id == 0 {
-        return Ok(None);
-    }
-    let open_req_seq = u32::from_be_bytes(meta[10..14].try_into().unwrap());
-    let payload_len = u16::from_be_bytes(meta[15..17].try_into().unwrap()) as usize;
-    let suffix_len = meta[17] as usize;
-
-    let recv_cipher = XChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "Cipher init failed"))?;
-    let send_cipher = XChaCha20Poly1305::new_from_slice(&key)
-        .map_err(|_| Error::new(ErrorKind::InvalidData, "Cipher init failed"))?;
-
-    increment_nonce(&mut recv_nonce);
-    let mut decoder = MieruStreamCipher::new(recv_cipher, recv_nonce);
-
-    let mut initial_payload = None;
-    if payload_len > 0 {
-        let mut wire_payload = vec![0u8; payload_len + OVERHEAD];
-        stream.read_exact(&mut wire_payload).await?;
-        let p_data = decoder.decrypt_payload(&wire_payload, payload_len)?;
-        initial_payload = Some(p_data);
-    }
-    if suffix_len > 0 {
-        let mut discard_suffix = vec![0u8; suffix_len];
-        stream.read_exact(&mut discard_suffix).await?;
-    }
-
-    // Check device and conn limits
-    if !ctx.device_limiter.check_and_record_async(user.panel_user.id, client_ip).await {
-        return Ok(None);
-    }
-    let conn_guard = match ctx.conn_limiter.try_acquire(user.panel_user.id) {
-        Some(g) => g,
-        None => return Ok(None),
     };
-
-    let mut session_state = MieruSessionState::new(session_id);
-    session_state.advance_recv_seq(open_req_seq);
-    let resp_seq = session_state.alloc_send_seq();
-
+    if meta[0] != PROTOCOL_OPEN_SESSION_REQ {
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Mieru first frame must open a session",
+        ));
+    }
+    increment_nonce(&mut nonce);
+    let decoder = MieruStreamCipher::new(XChaCha20Poly1305::new_from_slice(&key).unwrap(), nonce);
     let mut send_nonce = [0u8; 24];
     rand::thread_rng().fill_bytes(&mut send_nonce);
     pattern.apply_nonce_pattern(&mut send_nonce, false, true);
-
-    let mut encoder = MieruStreamCipher::new(send_cipher, send_nonce);
-
-    let cur_min = (now_sec / 60) as u32;
-    let mut resp_meta = [0u8; 32];
-    resp_meta[0] = PROTOCOL_OPEN_SESSION_RESP;
-    resp_meta[2..6].copy_from_slice(&cur_min.to_be_bytes());
-    resp_meta[6..10].copy_from_slice(&session_id.to_be_bytes());
-    resp_meta[10..14].copy_from_slice(&resp_seq.to_be_bytes());
-    resp_meta[14] = 0; // status: OK
-
-    let first_resp_frame = encoder.encrypt_initial_metadata(&resp_meta)?;
-    stream.write_all(&first_resp_frame).await?;
-    stream.flush().await?;
-
-    let shared_session = Arc::new(Mutex::new(session_state));
-    let boxed_stream: BoxedStream = Box::new(stream);
-    let (read_half, write_half) = tokio::io::split(boxed_stream);
-
-    let mut reader = MieruSessionReader::new(read_half, decoder, shared_session.clone());
-    let mut writer = MieruSessionWriter::new(write_half, encoder, shared_session, (**pattern).clone());
-
-    if let Some(ref p) = initial_payload {
-        if !p.is_empty() {
-            reader.seed_pending(p);
-        }
-    }
-
-    let (duplex_client, duplex_mieru) = tokio::io::duplex(65536);
-    let (client_rx, client_tx) = tokio::io::split(duplex_client);
-    let (mut mieru_rx, mut mieru_tx) = tokio::io::split(duplex_mieru);
-
-    // Downstream pump: read decoded Mieru packets -> write to duplex stream
-    tokio::spawn(async move {
-        loop {
-            match reader.read_next_segment().await {
-                Ok(Some(data)) => {
-                    if mieru_tx.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-                Ok(None) => break,
-                Err(e) => {
-                    debug!("Mieru TCP reader error: {:?}", e);
-                    break;
-                }
-            }
-        }
-        let _ = mieru_tx.shutdown().await;
-    });
-
-    // Upstream pump: read plain bytes from duplex stream -> encode into Mieru packets
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 16384];
-        loop {
-            match mieru_rx.read(&mut buf).await {
-                Ok(0) => {
-                    let _ = writer.close_session().await;
-                    break;
-                }
-                Ok(n) => {
-                    if let Err(e) = writer.write_data(&buf[..n]).await {
-                        debug!("Mieru TCP writer error: {:?}", e);
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-
-    Ok(Some((client_rx, client_tx, user.panel_user, client_ip, conn_guard)))
+    let encoder =
+        MieruStreamCipher::new(XChaCha20Poly1305::new_from_slice(&key).unwrap(), send_nonce);
+    let stream: BoxedStream = Box::new(stream);
+    let (input, output) = tokio::io::split(stream);
+    let mut reader = MieruSessionReader::new(input, decoder);
+    let first = reader.read_payload(meta).await?;
+    let writer = MieruSessionWriter::new(output, encoder, (**pattern).clone());
+    ctx.defense.record_success(client_ip);
+    Ok(Some((reader, writer, user, client_ip, first)))
 }

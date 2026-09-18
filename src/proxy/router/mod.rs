@@ -44,6 +44,14 @@ impl Router {
         *self.config.write() = new_config;
     }
 
+    pub fn fork(&self) -> Self {
+        Self::new(
+            self.config.read().clone(),
+            self.dialer.clone(),
+            self.geo_engine.clone(),
+        )
+    }
+
     pub fn match_outbound(&self, ctx: &MatchContext) -> OutboundConfig {
         let cfg = self.config.read();
         let target_lower = ctx.target_host.to_lowercase();

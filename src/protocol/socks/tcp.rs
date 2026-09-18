@@ -20,7 +20,10 @@ pub async fn handle_socks5_connect<S: AsyncRead + AsyncWrite + Send + Unpin + 's
 ) -> io::Result<()> {
     info!(
         "SOCKS5 CONNECT: user={} client_ip={} target={}:{}",
-        user.id, meta.client_addr.ip(), target_host, target_port
+        user.id,
+        meta.client_addr.ip(),
+        target_host,
+        target_port
     );
 
     // 1. Audit rules check
@@ -52,7 +55,10 @@ pub async fn handle_socks5_connect<S: AsyncRead + AsyncWrite + Send + Unpin + 's
     {
         Ok(s) => s,
         Err(e) => {
-            debug!("SOCKS5 outbound dial failed to {}:{} -> {:?}", target_host, target_port, e);
+            debug!(
+                "SOCKS5 outbound dial failed to {}:{} -> {:?}",
+                target_host, target_port, e
+            );
             // 0x05 Connection refused
             let _ = stream
                 .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
@@ -68,6 +74,7 @@ pub async fn handle_socks5_connect<S: AsyncRead + AsyncWrite + Send + Unpin + 's
 
     // 5. Wrap client stream to record bandwidth stats per user and log audit record with real client_addr
     let mut client_monitored = MonitoredStream::new(stream, user.id, meta.client_addr);
+    let _traffic = client_monitored.traffic_guard(ctx.on_traffic.clone());
     let start_time = Instant::now();
 
     let _ = copy_bidirectional_throttled(
@@ -75,15 +82,12 @@ pub async fn handle_socks5_connect<S: AsyncRead + AsyncWrite + Send + Unpin + 's
         &mut out_stream,
         user.id,
         Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
     )
     .await;
 
     let duration = start_time.elapsed();
     let (up, down) = client_monitored.stats();
-
-    if up > 0 || down > 0 {
-        (ctx.on_traffic)(user.id, up, down);
-    }
 
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,

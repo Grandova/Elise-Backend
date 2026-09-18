@@ -27,71 +27,67 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    // 1. Read SOCKS5 greeting: 05 [nmethods] [methods...]
-    let mut greeting_hdr = [0u8; 2];
-    reader.read_exact(&mut greeting_hdr).await?;
+    // Mieru authenticates the user in its encrypted transport; the client sends the request directly.
+    let (cmd, target_host, target_ip, target_port) =
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let mut req_hdr = [0u8; 4];
+            reader.read_exact(&mut req_hdr).await?;
 
-    if greeting_hdr[0] != 0x05 {
-        return Err(Error::new(ErrorKind::InvalidData, "Invalid SOCKS version"));
-    }
+            if req_hdr[0] != 0x05 || req_hdr[2] != 0 {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Invalid SOCKS version in request",
+                ));
+            }
 
-    let nmethods = greeting_hdr[1] as usize;
-    let mut methods = vec![0u8; nmethods];
-    reader.read_exact(&mut methods).await?;
+            let cmd = req_hdr[1];
+            let atyp = req_hdr[3];
 
-    if !methods.contains(&0x00) {
-        // No acceptable methods
-        writer.write_all(&[0x05, 0xFF]).await?;
-        writer.flush().await?;
-        return Err(Error::new(ErrorKind::InvalidData, "No acceptable auth method"));
-    }
+            let (target_host, target_ip, target_port) = match atyp {
+                0x01 => {
+                    let mut addr_buf = [0u8; 6];
+                    reader.read_exact(&mut addr_buf).await?;
+                    let ip = IpAddr::V4(Ipv4Addr::new(
+                        addr_buf[0],
+                        addr_buf[1],
+                        addr_buf[2],
+                        addr_buf[3],
+                    ));
+                    let port = u16::from_be_bytes([addr_buf[4], addr_buf[5]]);
+                    (ip.to_string(), Some(ip), port)
+                }
+                0x03 => {
+                    let mut len_buf = [0u8; 1];
+                    reader.read_exact(&mut len_buf).await?;
+                    let domain_len = len_buf[0] as usize;
+                    let mut domain_buf = vec![0u8; domain_len + 2];
+                    reader.read_exact(&mut domain_buf).await?;
+                    let domain = String::from_utf8_lossy(&domain_buf[..domain_len]).to_string();
+                    let port =
+                        u16::from_be_bytes([domain_buf[domain_len], domain_buf[domain_len + 1]]);
+                    (domain, None, port)
+                }
+                0x04 => {
+                    let mut addr_buf = [0u8; 18];
+                    reader.read_exact(&mut addr_buf).await?;
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&addr_buf[..16]);
+                    let ip = IpAddr::V6(Ipv6Addr::from(octets));
+                    let port = u16::from_be_bytes([addr_buf[16], addr_buf[17]]);
+                    (ip.to_string(), Some(ip), port)
+                }
+                _ => {
+                    return Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Unsupported SOCKS5 address type",
+                    ));
+                }
+            };
 
-    // Reply 05 00 (No auth required)
-    writer.write_all(&[0x05, 0x00]).await?;
-    writer.flush().await?;
-
-    // 2. Read SOCKS5 request: 05 [cmd] 00 [atyp] ...
-    let mut req_hdr = [0u8; 4];
-    reader.read_exact(&mut req_hdr).await?;
-
-    if req_hdr[0] != 0x05 {
-        return Err(Error::new(ErrorKind::InvalidData, "Invalid SOCKS version in request"));
-    }
-
-    let cmd = req_hdr[1];
-    let atyp = req_hdr[3];
-
-    let (target_host, target_ip, target_port) = match atyp {
-        0x01 => {
-            let mut addr_buf = [0u8; 6];
-            reader.read_exact(&mut addr_buf).await?;
-            let ip = IpAddr::V4(Ipv4Addr::new(addr_buf[0], addr_buf[1], addr_buf[2], addr_buf[3]));
-            let port = u16::from_be_bytes([addr_buf[4], addr_buf[5]]);
-            (ip.to_string(), Some(ip), port)
-        }
-        0x03 => {
-            let mut len_buf = [0u8; 1];
-            reader.read_exact(&mut len_buf).await?;
-            let domain_len = len_buf[0] as usize;
-            let mut domain_buf = vec![0u8; domain_len + 2];
-            reader.read_exact(&mut domain_buf).await?;
-            let domain = String::from_utf8_lossy(&domain_buf[..domain_len]).to_string();
-            let port = u16::from_be_bytes([domain_buf[domain_len], domain_buf[domain_len + 1]]);
-            (domain, None, port)
-        }
-        0x04 => {
-            let mut addr_buf = [0u8; 18];
-            reader.read_exact(&mut addr_buf).await?;
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&addr_buf[..16]);
-            let ip = IpAddr::V6(Ipv6Addr::from(octets));
-            let port = u16::from_be_bytes([addr_buf[16], addr_buf[17]]);
-            (ip.to_string(), Some(ip), port)
-        }
-        _ => {
-            return Err(Error::new(ErrorKind::InvalidData, "Unsupported SOCKS5 address type"));
-        }
-    };
+            Ok::<_, io::Error>((cmd, target_host, target_ip, target_port))
+        })
+        .await
+        .map_err(|_| Error::new(ErrorKind::TimedOut, "Mieru SOCKS request timed out"))??;
 
     match cmd {
         0x01 => {
@@ -109,28 +105,27 @@ where
             .await
         }
         0x03 => {
-            // CMD = 0x03: UDP ASSOCIATE
-            handle_socks5_udp_associate(
-                reader,
-                writer,
-                user,
-                client_ip,
-                ctx,
-            )
-            .await
+            // UDP destinations acquire their own shared session quota.
+            drop(_conn_guard);
+            handle_socks5_udp_associate(reader, writer, user, client_ip, ctx).await
         }
         _ => {
             // Send Command not supported
-            let _ = writer.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            let _ = writer
+                .write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
             let _ = writer.flush().await;
-            Err(Error::new(ErrorKind::InvalidData, format!("Unsupported SOCKS5 command {}", cmd)))
+            Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("Unsupported SOCKS5 command {}", cmd),
+            ))
         }
     }
 }
 
 /// Handle SOCKS5 TCP CONNECT forwarding
 async fn handle_socks5_tcp_connect<R, W>(
-    mut client_read: R,
+    client_read: R,
     mut client_write: W,
     user: User,
     client_ip: IpAddr,
@@ -147,7 +142,9 @@ where
     let user_id = user.id;
 
     if ctx.audit.should_block(&target_host, target_ip, target_port) {
-        let _ = client_write.write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+        let _ = client_write
+            .write_all(&[0x05, 0x02, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+            .await;
         let _ = client_write.flush().await;
         return Ok(());
     }
@@ -170,86 +167,34 @@ where
     let outbound_stream = match outbound_res {
         Ok(s) => s,
         Err(e) => {
-            let _ = client_write.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await;
+            let _ = client_write
+                .write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                .await;
             let _ = client_write.flush().await;
             return Err(e);
         }
     };
 
     // Respond success: 05 00 00 01 00 00 00 00 00 00
-    client_write.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    client_write
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+        .await?;
     client_write.flush().await?;
 
-    let (mut out_read, mut out_write) = tokio::io::split(outbound_stream);
-
-    let cancel_token = CancellationToken::new();
-    let write_cancel = cancel_token.clone();
-
-    let rate_limiter = ctx.rate_limiter.clone();
-    let on_traffic_up = ctx.on_traffic.clone();
-    let on_traffic_down = ctx.on_traffic.clone();
-
-    // Client -> Outbound
-    let up_rate_limiter = rate_limiter.clone();
-    let up_task = async move {
-        let mut buf = vec![0u8; 16384];
-        let mut total_up = 0u64;
-        loop {
-            tokio::select! {
-                _ = write_cancel.cancelled() => break,
-                res = client_read.read(&mut buf) => {
-                    match res {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            up_rate_limiter.throttle(user_id, n).await;
-                            if out_write.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                            total_up += n as u64;
-                            (on_traffic_up)(user_id, n as u64, 0);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-        let _ = out_write.shutdown().await;
-        write_cancel.cancel();
-        total_up
-    };
-
-    // Outbound -> Client
-    let read_cancel = cancel_token.clone();
-    let down_rate_limiter = rate_limiter.clone();
-    let down_task = async move {
-        let mut buf = vec![0u8; 16384];
-        let mut total_down = 0u64;
-        loop {
-            tokio::select! {
-                _ = read_cancel.cancelled() => break,
-                res = out_read.read(&mut buf) => {
-                    match res {
-                        Ok(0) => break,
-                        Ok(n) => {
-                            down_rate_limiter.throttle(user_id, n).await;
-                            if client_write.write_all(&buf[..n]).await.is_err() {
-                                break;
-                            }
-                            let _ = client_write.flush().await;
-                            total_down += n as u64;
-                            (on_traffic_down)(user_id, 0, n as u64);
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-        let _ = client_write.shutdown().await;
-        read_cancel.cancel();
-        total_down
-    };
-
-    let (up_bytes, down_bytes) = tokio::join!(up_task, down_task);
+    let mut outbound_stream = outbound_stream;
+    let stream = tokio::io::join(client_read, client_write);
+    let mut client =
+        crate::conn::MonitoredStream::new(stream, user_id, std::net::SocketAddr::new(client_ip, 0));
+    let _traffic = client.traffic_guard(ctx.on_traffic.clone());
+    let result = crate::conn::copy_bidirectional_throttled(
+        &mut client,
+        &mut outbound_stream,
+        user_id,
+        Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
+    )
+    .await;
+    let (up_bytes, down_bytes) = client.stats();
     let duration = start_time.elapsed().as_millis() as i64;
 
     ctx.audit_logger.record(AuditRecord::new(
@@ -263,11 +208,11 @@ where
         up_bytes,
         down_bytes,
         duration,
-        "direct",
-        "success",
+        &outbound.tag,
+        if result.is_ok() { "success" } else { "error" },
     ));
 
-    Ok(())
+    result.map(|_| ())
 }
 
 /// Handle SOCKS5 UDP ASSOCIATE packet framing inside Mieru stream tunnel
@@ -283,230 +228,165 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let start_time = Instant::now();
-    let user_id = user.id;
-
-    // Send SOCKS5 UDP Associate success: BND.ADDR=0.0.0.0, BND.PORT=0
-    client_write.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
+    client_write
+        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+        .await?;
     client_write.flush().await?;
-
-    let (response_tx, mut response_rx) = mpsc::channel::<Vec<u8>>(256);
-    let cancel_token = CancellationToken::new();
-
-    let mut sessions: HashMap<(String, u16), mpsc::Sender<Vec<u8>>> = HashMap::new();
-    let rate_limiter = ctx.rate_limiter.clone();
-    let on_traffic_up = ctx.on_traffic.clone();
-    let on_traffic_down = ctx.on_traffic.clone();
-
-    let write_cancel = cancel_token.clone();
+    let (responses, mut response_rx) = mpsc::channel::<(
+        Vec<u8>,
+        shadowsocks::relay::socks5::Address,
+        tokio::sync::oneshot::Sender<()>,
+    )>(256);
+    let cancel = CancellationToken::new();
+    let _cancel = cancel.clone().drop_guard();
     let write_task = async {
-        let mut total_down = 0u64;
-        while let Some(pkt) = response_rx.recv().await {
-            rate_limiter.throttle(user_id, pkt.len()).await;
-            if client_write.write_all(&pkt).await.is_err() {
-                break;
-            }
-            if client_write.flush().await.is_err() {
-                break;
-            }
-            total_down += pkt.len() as u64;
-            (on_traffic_down)(user_id, 0, pkt.len() as u64);
-        }
-        let _ = client_write.shutdown().await;
-        write_cancel.cancel();
-        total_down
-    };
-
-    let read_cancel = cancel_token.clone();
-    let read_task = async {
-        let mut total_up = 0u64;
-        let mut pkt_buf = vec![0u8; 65536];
-
+        let _done = cancel.clone().drop_guard();
         loop {
+            let (data, src_addr, ack) = tokio::select! {
+                _ = cancel.cancelled() => break,
+                response = response_rx.recv() => match response { Some(response) => response, None => break },
+            };
+            let mut socks5_pkt = vec![0, 0, 0];
+            match src_addr {
+                shadowsocks::relay::socks5::Address::SocketAddress(sa) => {
+                    match sa.ip() {
+                        IpAddr::V4(v4) => {
+                            socks5_pkt.push(0x01);
+                            socks5_pkt.extend_from_slice(&v4.octets());
+                        }
+                        IpAddr::V6(v6) => {
+                            socks5_pkt.push(0x04);
+                            socks5_pkt.extend_from_slice(&v6.octets());
+                        }
+                    }
+                    socks5_pkt.extend_from_slice(&sa.port().to_be_bytes());
+                }
+                shadowsocks::relay::socks5::Address::DomainNameAddress(ref d, p) => {
+                    socks5_pkt.push(0x03);
+                    socks5_pkt.push(d.len() as u8);
+                    socks5_pkt.extend_from_slice(d.as_bytes());
+                    socks5_pkt.extend_from_slice(&p.to_be_bytes());
+                }
+            }
+
+            socks5_pkt.extend_from_slice(&data);
+            if socks5_pkt.len() > u16::MAX as usize {
+                continue;
+            }
+            let mut frame = Vec::with_capacity(socks5_pkt.len() + 4);
+            frame.push(0);
+            frame.extend_from_slice(&(socks5_pkt.len() as u16).to_be_bytes());
+            frame.extend_from_slice(&socks5_pkt);
+            frame.push(0xff);
             tokio::select! {
-                _ = read_cancel.cancelled() => break,
-                read_res = read_mieru_encapsulated_packet(&mut client_read, &mut pkt_buf) => {
-                    let n = match read_res {
-                        Ok(0) => break,
-                        Ok(len) => len,
-                        Err(e) => {
-                            debug!("Error reading encapsulated UDP packet: {:?}", e);
-                            break;
-                        }
-                    };
-
-                    rate_limiter.throttle(user_id, n).await;
-                    total_up += n as u64;
-                    (on_traffic_up)(user_id, n as u64, 0);
-
-                    // Parse SOCKS5 UDP header: RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT | DATA
-                    if n < 7 {
+                _ = cancel.cancelled() => break,
+                result = async { client_write.write_all(&frame).await?; client_write.flush().await } => result?,
+            }
+            let _ = ack.send(());
+        }
+        Ok::<_, io::Error>(())
+    };
+    let read_task = async {
+        let _done = cancel.clone().drop_guard();
+        let mut workers = tokio::task::JoinSet::new();
+        let mut sessions: HashMap<(String, u16), mpsc::Sender<Vec<u8>>> = HashMap::new();
+        let mut pkt_buf = vec![0; MAX_UDP_PAYLOAD_SIZE];
+        loop {
+            let n = tokio::select! {
+                _ = cancel.cancelled() => break,
+                result = read_mieru_encapsulated_packet(&mut client_read, &mut pkt_buf) => match result {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) => { debug!(error = %e, "Invalid Mieru UDP frame"); break; }
+                },
+            };
+            if n < 7 || pkt_buf[..3] != [0, 0, 0] {
+                continue;
+            }
+            let atyp = pkt_buf[3];
+            let (dst_host, dst_port, data_offset) = match atyp {
+                0x01 => {
+                    // IPv4
+                    if n < 10 {
                         continue;
                     }
-                    if pkt_buf[0] != 0x00 || pkt_buf[1] != 0x00 {
+                    let ip = IpAddr::V4(Ipv4Addr::new(
+                        pkt_buf[4], pkt_buf[5], pkt_buf[6], pkt_buf[7],
+                    ));
+                    let port = u16::from_be_bytes([pkt_buf[8], pkt_buf[9]]);
+                    (ip.to_string(), port, 10)
+                }
+                0x03 => {
+                    // Domain
+                    let dlen = pkt_buf[4] as usize;
+                    if n < 7 + dlen {
                         continue;
                     }
-                    if pkt_buf[2] != 0x00 {
-                        // Frag != 0 unsupported
+                    let domain = String::from_utf8_lossy(&pkt_buf[5..5 + dlen]).to_string();
+                    let port = u16::from_be_bytes([pkt_buf[5 + dlen], pkt_buf[6 + dlen]]);
+                    (domain, port, 7 + dlen)
+                }
+                0x04 => {
+                    // IPv6
+                    if n < 22 {
                         continue;
                     }
+                    let mut octets = [0u8; 16];
+                    octets.copy_from_slice(&pkt_buf[4..20]);
+                    let ip = IpAddr::V6(Ipv6Addr::from(octets));
+                    let port = u16::from_be_bytes([pkt_buf[20], pkt_buf[21]]);
+                    (ip.to_string(), port, 22)
+                }
+                _ => continue,
+            };
 
-                    let atyp = pkt_buf[3];
-                    let (dst_host, dst_port, data_offset) = match atyp {
-                        0x01 => {
-                            // IPv4
-                            if n < 10 { continue; }
-                            let ip = IpAddr::V4(Ipv4Addr::new(pkt_buf[4], pkt_buf[5], pkt_buf[6], pkt_buf[7]));
-                            let port = u16::from_be_bytes([pkt_buf[8], pkt_buf[9]]);
-                            (ip.to_string(), port, 10)
-                        }
-                        0x03 => {
-                            // Domain
-                            let dlen = pkt_buf[4] as usize;
-                            if n < 7 + dlen { continue; }
-                            let domain = String::from_utf8_lossy(&pkt_buf[5..5 + dlen]).to_string();
-                            let port = u16::from_be_bytes([pkt_buf[5 + dlen], pkt_buf[6 + dlen]]);
-                            (domain, port, 7 + dlen)
-                        }
-                        0x04 => {
-                            // IPv6
-                            if n < 22 { continue; }
-                            let mut octets = [0u8; 16];
-                            octets.copy_from_slice(&pkt_buf[4..20]);
-                            let ip = IpAddr::V6(Ipv6Addr::from(octets));
-                            let port = u16::from_be_bytes([pkt_buf[20], pkt_buf[21]]);
-                            (ip.to_string(), port, 22)
-                        }
-                        _ => continue,
-                    };
-
-                    let udp_data = pkt_buf[data_offset..n].to_vec();
-
-                    if ctx.audit.should_block(&dst_host, None, dst_port) {
+            let key = (dst_host, dst_port);
+            if dst_port == 0 {
+                continue;
+            }
+            if sessions.get(&key).is_none_or(|tx| tx.is_closed()) {
+                let session = match crate::conn::udp::UdpSession::connect(
+                    ctx.clone(),
+                    user.id,
+                    std::net::SocketAddr::new(client_ip, 0),
+                    key.0.clone(),
+                    key.1,
+                    None,
+                    "mieru-udp-associate",
+                )
+                .await
+                {
+                    Ok(session) => session,
+                    Err(e) => {
+                        debug!(error = %e, "Mieru UDP rejected");
                         continue;
                     }
-
-                    let key = (dst_host.clone(), dst_port);
-                    if let Some(tx) = sessions.get(&key) {
-                        if tx.send(udp_data.clone()).await.is_ok() {
-                            continue;
-                        }
+                };
+                let (tx, requests) = mpsc::channel(256);
+                sessions.insert(key.clone(), tx);
+                let responses = responses.clone();
+                let cancel = cancel.clone();
+                while let Some(result) = workers.try_join_next() {
+                    if let Err(e) = result {
+                        tracing::warn!(error = %e, "Mieru UDP worker failed");
                     }
-
-                    // New outbound UDP session
-                    let mctx = MatchContext {
-                        node_id: ctx.node_id,
-                        network: "udp",
-                        target_host: &dst_host,
-                        target_ip: None,
-                        target_port: dst_port,
-                        inbound_local_ip: None,
-                    };
-                    let outbound = ctx.router.match_outbound(&mctx);
-
-                    let udp_outbound = match ctx.router.dialer().dial_udp_outbound(&outbound, &dst_host, dst_port, None).await {
-                        Ok(s) => s,
-                        Err(e) => {
-                            debug!("Mieru UDP Associate outbound dial error for {}:{}: {:?}", dst_host, dst_port, e);
-                            continue;
-                        }
-                    };
-
-                    let (req_tx, mut req_rx) = mpsc::channel::<Vec<u8>>(128);
-                    let resp_tx = response_tx.clone();
-                    let child_cancel = read_cancel.child_token();
-                    let child_host = dst_host.clone();
-
-                    tokio::spawn(async move {
-                        let mut recv_buf = [0u8; 65535];
-                        let idle_timeout = Duration::from_secs(60);
-
-                        loop {
-                            tokio::select! {
-                                _ = child_cancel.cancelled() => break,
-                                req = req_rx.recv() => {
-                                    let Some(data) = req else { break; };
-                                    if udp_outbound.send(&data).await.is_err() {
-                                        break;
-                                    }
-                                }
-                                recv_res = tokio::time::timeout(idle_timeout, udp_outbound.recv(&mut recv_buf)) => {
-                                    match recv_res {
-                                        Ok(Ok((n, src_addr))) if n > 0 => {
-                                            // Format into SOCKS5 UDP response
-                                            let mut socks5_pkt = Vec::with_capacity(32 + n);
-                                            socks5_pkt.extend_from_slice(&[0x00, 0x00, 0x00]); // RSV(2) + FRAG(1)
-                                            match src_addr {
-                                                shadowsocks::relay::socks5::Address::SocketAddress(sa) => {
-                                                    match sa.ip() {
-                                                        IpAddr::V4(v4) => {
-                                                            socks5_pkt.push(0x01);
-                                                            socks5_pkt.extend_from_slice(&v4.octets());
-                                                        }
-                                                        IpAddr::V6(v6) => {
-                                                            socks5_pkt.push(0x04);
-                                                            socks5_pkt.extend_from_slice(&v6.octets());
-                                                        }
-                                                    }
-                                                    socks5_pkt.extend_from_slice(&sa.port().to_be_bytes());
-                                                }
-                                                shadowsocks::relay::socks5::Address::DomainNameAddress(ref d, p) => {
-                                                    socks5_pkt.push(0x03);
-                                                    socks5_pkt.push(d.len() as u8);
-                                                    socks5_pkt.extend_from_slice(d.as_bytes());
-                                                    socks5_pkt.extend_from_slice(&p.to_be_bytes());
-                                                }
-                                            }
-                                            socks5_pkt.extend_from_slice(&recv_buf[..n]);
-
-                                            // Encapsulate into Mieru PacketOverStreamTunnel frame:
-                                            // 0x00 || uint16(len) || socks5_pkt || 0xFF
-                                            let mut enc_frame = Vec::with_capacity(4 + socks5_pkt.len());
-                                            enc_frame.push(0x00);
-                                            enc_frame.extend_from_slice(&(socks5_pkt.len() as u16).to_be_bytes());
-                                            enc_frame.extend_from_slice(&socks5_pkt);
-                                            enc_frame.push(0xFF);
-
-                                            if resp_tx.send(enc_frame).await.is_err() {
-                                                break;
-                                            }
-                                        }
-                                        _ => break,
-                                    }
-                                }
-                            }
-                        }
-                        debug!("Mieru UDP Associate session for {}:{} terminated", child_host, dst_port);
-                    });
-
-                    let _ = req_tx.send(udp_data).await;
-                    sessions.insert(key, req_tx);
+                }
+                workers.spawn(async move {
+                    let _ = session.relay(requests, responses, cancel).await;
+                });
+            }
+            if let Some(tx) = sessions.get(&key) {
+                tokio::select! {
+                    _ = cancel.cancelled() => break,
+                    _ = tx.send(pkt_buf[data_offset..n].to_vec()) => {},
                 }
             }
         }
-        read_cancel.cancel();
-        total_up
+        cancel.cancel();
+        while workers.join_next().await.is_some() {}
     };
-
-    let (down_bytes, up_bytes) = tokio::join!(write_task, read_task);
-    let duration = start_time.elapsed().as_millis() as i64;
-
-    ctx.audit_logger.record(AuditRecord::new(
-        ctx.node_id,
-        user_id,
-        "mieru-udp-associate",
-        "udp",
-        &client_ip.to_string(),
-        "udp-associate",
-        0,
-        up_bytes,
-        down_bytes,
-        duration,
-        "direct",
-        "success",
-    ));
-
-    Ok(())
+    let (result, ()) = tokio::join!(write_task, read_task);
+    result
 }
 
 /// Helper to read a single Mieru PacketOverStreamTunnel frame:
@@ -536,7 +416,11 @@ async fn read_mieru_encapsulated_packet<R: AsyncRead + Unpin>(
     if len > buf.len() {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            format!("Encapsulated UDP packet length {} exceeds buffer limit {}", len, buf.len()),
+            format!(
+                "Encapsulated UDP packet length {} exceeds buffer limit {}",
+                len,
+                buf.len()
+            ),
         ));
     }
 
@@ -551,4 +435,162 @@ async fn read_mieru_encapsulated_packet<R: AsyncRead + Unpin>(
     }
 
     Ok(len)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn packet_over_stream_validates_delimiters_and_lengths() {
+        let mut output = [0u8; 8];
+        let mut valid = &[0, 0, 3, 1, 2, 3, 0xff][..];
+        assert_eq!(
+            read_mieru_encapsulated_packet(&mut valid, &mut output)
+                .await
+                .unwrap(),
+            3
+        );
+        assert_eq!(&output[..3], &[1, 2, 3]);
+        for frame in [
+            vec![1],
+            vec![0, 0, 1, 2, 0],
+            vec![0, 0, 2, 1],
+            vec![0, 0, 9],
+        ] {
+            assert!(
+                read_mieru_encapsulated_packet(&mut frame.as_slice(), &mut output)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tcp_relay_preserves_half_close_and_accounts_on_abort() {
+        for abort in [false, true] {
+            let totals = Arc::new(parking_lot::Mutex::new((0u64, 0u64)));
+            let geo = Arc::new(crate::geo::GeoEngine::default());
+            let dialer = Arc::new(crate::proxy::router::OutboundDialer::new(
+                Arc::new(crate::dns::DNSResolver::default()),
+                None,
+                None,
+                false,
+            ));
+            let ctx = InboundContext {
+                ready: None,
+                node_id: 1,
+                listen_addr: "127.0.0.1".into(),
+                port: 0,
+                router: Arc::new(crate::proxy::router::Router::new(
+                    Default::default(),
+                    dialer,
+                    geo.clone(),
+                )),
+                rate_limiter: Arc::new(crate::limiter::RateLimiter::new()),
+                conn_limiter: Arc::new(crate::limiter::ConnectionLimiter::new()),
+                device_limiter: Arc::new(crate::limiter::DeviceLimiter::new(60, 32, 128, None)),
+                audit: Arc::new(crate::security::AuditController::new("", "", geo)),
+                defense: Arc::new(crate::security::AttackDefenseManager::default()),
+                tls_manager: Arc::new(crate::security::TLSManager::new(false, "localhost".into())),
+                audit_logger: Arc::new(crate::observability::AuditLogger::new(None::<&str>)),
+                clickhouse_logger: Arc::new(crate::observability::ClickHouseLogger::new(
+                    false,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    None,
+                )),
+                on_traffic: {
+                    let totals = totals.clone();
+                    Arc::new(move |_, up, down| {
+                        let mut total = totals.lock();
+                        total.0 += up;
+                        total.1 += down;
+                    })
+                },
+                global_config: Arc::new(crate::config::GlobalConfig {
+                    tcp_timeout: 2,
+                    ..Default::default()
+                }),
+                ip_user_cache: Arc::new(crate::limiter::IpUserCache::new(1, false, "")),
+            };
+            for header in [[4, 1, 0, 1], [5, 1, 1, 1], [5, 1, 0, 255], [5, 1, 0, 1]] {
+                let (mut client, relay) = tokio::io::duplex(64);
+                let (read, write) = tokio::io::split(relay);
+                let guard = ctx.conn_limiter.try_acquire(42).unwrap();
+                let task = tokio::spawn(handle_socks5_session(
+                    read,
+                    write,
+                    User {
+                        id: 42,
+                        ..Default::default()
+                    },
+                    "127.0.0.1".parse().unwrap(),
+                    ctx.clone(),
+                    guard,
+                ));
+                client.write_all(&header).await.unwrap();
+                client.shutdown().await.unwrap();
+                assert!(task.await.unwrap().is_err());
+            }
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (received, notified) = tokio::sync::oneshot::channel();
+            let target = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut data = [0; 1024];
+                socket.read_exact(&mut data).await.unwrap();
+                received.send(()).unwrap();
+                let mut rest = Vec::new();
+                socket.read_to_end(&mut rest).await.unwrap();
+                assert!(rest.is_empty());
+                if !abort {
+                    socket.write_all(b"reply").await.unwrap();
+                }
+            });
+            let (mut client, relay) = tokio::io::duplex(65536);
+            let (read, write) = tokio::io::split(relay);
+            let guard = ctx.conn_limiter.try_acquire(42).unwrap();
+            let task = tokio::spawn(handle_socks5_session(
+                read,
+                write,
+                User {
+                    id: 42,
+                    ..Default::default()
+                },
+                "127.0.0.1".parse().unwrap(),
+                ctx,
+                guard,
+            ));
+            let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+            request.extend_from_slice(&address.port().to_be_bytes());
+            client.write_all(&request).await.unwrap();
+            let mut response = [0; 10];
+            client.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response[..2], &[5, 0]);
+            client.write_all(&[1; 1024]).await.unwrap();
+            notified.await.unwrap();
+            if abort {
+                task.abort();
+                assert!(task.await.unwrap_err().is_cancelled());
+            } else {
+                client.shutdown().await.unwrap();
+                let mut reply = Vec::new();
+                tokio::time::timeout(Duration::from_secs(3), client.read_to_end(&mut reply))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reply, b"reply");
+                task.await.unwrap().unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(3), target)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(*totals.lock(), (1024, if abort { 0 } else { 5 }));
+        }
+    }
 }

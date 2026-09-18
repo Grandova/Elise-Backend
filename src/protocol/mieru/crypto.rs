@@ -100,10 +100,13 @@ pub struct MieruUser {
 
 impl MieruUser {
     pub fn from_panel_user(user: User) -> Self {
-        // In XBoard, both username and password for Mieru are set to user.uuid
-        let username = user.uuid.clone();
-        let password = user.password.clone().unwrap_or_else(|| user.uuid.clone());
-        let hashed_password = hash_password(password.as_bytes(), username.as_bytes());
+        // XBoard subscriptions use the same panel credential for both fields.
+        let username = user
+            .password
+            .clone()
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| user.uuid.clone());
+        let hashed_password = hash_password(username.as_bytes(), username.as_bytes());
         Self {
             panel_user: user,
             username,
@@ -122,7 +125,10 @@ pub struct MieruUserIndex {
 
 impl MieruUserIndex {
     pub fn new(panel_users: Vec<User>) -> Self {
-        let users: Vec<MieruUser> = panel_users.into_iter().map(MieruUser::from_panel_user).collect();
+        let users: Vec<MieruUser> = panel_users
+            .into_iter()
+            .map(MieruUser::from_panel_user)
+            .collect();
         Self {
             users: Arc::new(users),
             cached_keys: Arc::new(parking_lot::RwLock::new(HashMap::new())),
@@ -214,5 +220,31 @@ impl MieruUserIndex {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panel_credential_is_used_for_both_fields() {
+        for password in [None, Some(String::new()), Some("panel-password".into())] {
+            let user = User {
+                id: 7,
+                uuid: "panel-uuid".into(),
+                password: password.clone(),
+                ..Default::default()
+            };
+            let expected = password
+                .filter(|s| !s.is_empty())
+                .unwrap_or("panel-uuid".into());
+            let user = MieruUser::from_panel_user(user);
+            assert_eq!(user.username, expected);
+            assert_eq!(
+                user.hashed_password,
+                hash_password(expected.as_bytes(), expected.as_bytes())
+            );
+        }
     }
 }

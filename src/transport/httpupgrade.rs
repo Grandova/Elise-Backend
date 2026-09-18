@@ -113,7 +113,9 @@ pub async fn apply_httpupgrade_transport(
     }
 
     if let Some(ref expected_host) = config.host {
-        let clean_req_host = host_header.as_deref().map(|s| s.split(':').next().unwrap_or(s));
+        let clean_req_host = host_header
+            .as_deref()
+            .map(|s| s.split(':').next().unwrap_or(s));
         let clean_expected = expected_host.split(':').next().unwrap_or(expected_host);
         if clean_req_host != Some(clean_expected) {
             let _ = stream

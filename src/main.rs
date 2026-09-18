@@ -196,7 +196,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 fn handle_config_command(custom_path: Option<PathBuf>, args: Vec<String>) {
-    let path = custom_path.unwrap_or_else(|| find_config_path(PathBuf::from("/etc/elise/elise.conf")));
+    let path =
+        custom_path.unwrap_or_else(|| find_config_path(PathBuf::from("/etc/elise/elise.conf")));
     if args.is_empty() {
         if let Ok(content) = fs::read_to_string(&path) {
             println!("# 当前生效配置文件: {}\n{}", path.display(), content);
@@ -248,9 +249,10 @@ fn handle_config_command(custom_path: Option<PathBuf>, args: Vec<String>) {
     }
 }
 
-
 fn handle_node_command(custom_path: Option<PathBuf>, sub: Option<NodeSubcommands>) {
-    let path = custom_path.clone().unwrap_or_else(|| find_config_path(PathBuf::from("/etc/elise/elise.conf")));
+    let path = custom_path
+        .clone()
+        .unwrap_or_else(|| find_config_path(PathBuf::from("/etc/elise/elise.conf")));
     let cfg = GlobalConfig::load_from_file(&path).unwrap_or_default();
 
     match sub.unwrap_or(NodeSubcommands::List) {

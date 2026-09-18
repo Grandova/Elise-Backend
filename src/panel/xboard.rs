@@ -10,8 +10,7 @@ pub struct XboardClient {
     client: Client,
     base_url: String,
     token: String,
-    etag: Arc<RwLock<Option<String>>>,
-    cached_users: Arc<RwLock<Vec<User>>>,
+    cached_users: RwLock<HashMap<u32, Arc<tokio::sync::Mutex<(Option<String>, Vec<User>)>>>>,
 }
 
 impl XboardClient {
@@ -25,8 +24,7 @@ impl XboardClient {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
-            etag: Arc::new(RwLock::new(None)),
-            cached_users: Arc::new(RwLock::new(Vec::new())),
+            cached_users: RwLock::new(HashMap::new()),
         }
     }
 
@@ -235,31 +233,45 @@ impl XboardClient {
             self.base_url, node_id, self.token
         );
 
+        let cache = self
+            .cached_users
+            .write()
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new((None, Vec::new()))))
+            .clone();
+        let mut cache = cache.lock().await;
         let mut req = self.client.get(&url);
-        if let Some(etag) = self.etag.read().as_ref() {
+        if let Some(etag) = cache.0.as_ref() {
             req = req.header(IF_NONE_MATCH, etag);
         }
 
         let resp = req.send().await?;
 
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-            // ETag 304 Not Modified: return cached users
-            return Ok(self.cached_users.read().clone());
+            if cache.0.is_none() {
+                return Err("Xboard returned 304 without a cached ETag".into());
+            }
+            return Ok(cache.1.clone());
         }
 
         if !resp.status().is_success() {
             return Err(format!("Xboard API user sync returned status {}", resp.status()).into());
         }
 
-        if let Some(new_etag) = resp.headers().get("ETag").and_then(|h| h.to_str().ok()) {
-            *self.etag.write() = Some(new_etag.to_string());
-        }
+        let new_etag = resp
+            .headers()
+            .get("ETag")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_owned);
 
         let val: Value = resp.json().await?;
         let user_list = val
             .get("users")
             .or_else(|| val.get("data"))
             .and_then(|v| v.as_array());
+        if user_list.is_none() {
+            return Err("Xboard user response has no users array".into());
+        }
 
         let mut users = Vec::new();
         if let Some(arr) = user_list {
@@ -270,10 +282,7 @@ impl XboardClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let speed_limit = item
-                    .get("speed_limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let speed_limit = crate::panel::types::speed_limit_bps(item.get("speed_limit"))?;
                 let device_limit = item
                     .get("device_limit")
                     .and_then(|v| v.as_u64())
@@ -298,7 +307,7 @@ impl XboardClient {
             }
         }
 
-        *self.cached_users.write() = users.clone();
+        *cache = (new_etag, users.clone());
         Ok(users)
     }
 
@@ -469,5 +478,66 @@ impl XboardClient {
 
         let _ = self.client.post(&v1_url).json(&v1_payload).send().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn node_caches_and_etags_are_isolated_and_commit_after_parse() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = XboardClient::new(
+            format!("http://{}", listener.local_addr().unwrap()),
+            "fixture".into(),
+        );
+        let server = tokio::spawn(async move {
+            let mut hits = HashMap::new();
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                while !bytes.ends_with(b"\r\n\r\n") {
+                    bytes.push(stream.read_u8().await.unwrap());
+                }
+                let request = String::from_utf8(bytes).unwrap().to_lowercase();
+                let node = if request.contains("node_id=1&") { 1 } else { 2 };
+                let hit = hits.entry(node).or_insert(0);
+                *hit += 1;
+                let (status, etag, body) = if *hit == 1 {
+                    assert!(!request.contains("if-none-match:"));
+                    (
+                        "200 OK",
+                        "ETag: same\r\n",
+                        format!("{{\"users\":[{{\"id\":{node},\"uuid\":\"user-{node}\"}}]}}"),
+                    )
+                } else if node == 1 && *hit == 3 {
+                    assert!(request.contains("if-none-match: same"));
+                    ("200 OK", "ETag: invalid-new\r\n", "{".into())
+                } else if node == 1 && *hit == 5 {
+                    assert!(request.contains("if-none-match: same"));
+                    ("200 OK", "", "{\"users\":[]}".into())
+                } else if node == 1 && *hit == 6 {
+                    assert!(!request.contains("if-none-match:"));
+                    ("304 Not Modified", "", "".into())
+                } else {
+                    assert!(request.contains("if-none-match: same"));
+                    ("304 Not Modified", "", "".into())
+                };
+                stream.write_all(format!("HTTP/1.1 {status}\r\n{etag}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let (a, b) = tokio::join!(client.get_users(1), client.get_users(2));
+        assert_eq!(a.unwrap()[0].id, 1);
+        assert_eq!(b.unwrap()[0].id, 2);
+        let (a, b) = tokio::join!(client.get_users(1), client.get_users(2));
+        assert_eq!(a.unwrap()[0].id, 1);
+        assert_eq!(b.unwrap()[0].id, 2);
+        assert!(client.get_users(1).await.is_err());
+        assert_eq!(client.get_users(1).await.unwrap()[0].id, 1);
+        assert!(client.get_users(1).await.unwrap().is_empty());
+        assert!(client.get_users(1).await.is_err());
+        server.await.unwrap();
     }
 }

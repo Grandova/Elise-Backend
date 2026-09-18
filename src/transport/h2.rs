@@ -65,7 +65,9 @@ async fn apply_h2_framed(
     let normalized_config_path = config.path.trim_end_matches('/');
     let normalized_req_path = path.trim_end_matches('/');
 
-    if normalized_req_path != normalized_config_path && !normalized_req_path.starts_with(normalized_config_path) {
+    if normalized_req_path != normalized_config_path
+        && !normalized_req_path.starts_with(normalized_config_path)
+    {
         let resp = Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(())
@@ -280,7 +282,9 @@ async fn apply_h2_http1(
     let normalized_config_path = config.path.trim_end_matches('/');
     let normalized_req_path = req_path.trim_end_matches('/');
 
-    if normalized_req_path != normalized_config_path && !normalized_req_path.starts_with(normalized_config_path) {
+    if normalized_req_path != normalized_config_path
+        && !normalized_req_path.starts_with(normalized_config_path)
+    {
         let _ = stream
             .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -310,7 +314,9 @@ async fn apply_h2_http1(
                 clean_h == clean_req
             }) {
                 let _ = stream
-                    .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
+                    .write_all(
+                        b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                    )
                     .await;
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,

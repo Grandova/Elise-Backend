@@ -1,82 +1,129 @@
-use crate::conn::BoxedStream;
+use crate::conn::{BoxedStream, MonitoredStream, PrefixedStream};
+use crate::observability::AuditRecord;
 use crate::panel::types::User;
 use crate::protocol::http::auth::{RESP_200_CONNECTION_ESTABLISHED, RESP_502_BAD_GATEWAY};
+use crate::protocol::InboundContext;
+use crate::proxy::router::MatchContext;
 use std::io;
+use std::net::SocketAddr;
+use std::time::Instant;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tracing::{info, warn};
 
-/// Handles an HTTP CONNECT tunnel request.
-/// Once established, client and target stream are linked via transparent bidirectional copy (no MITM).
 pub async fn handle_connect(
-    mut client_stream: BoxedStream,
+    client_stream: BoxedStream,
     target: &str,
     leftover: &[u8],
     user: &User,
-    conn_id: u64,
+    remote_addr: SocketAddr,
+    ctx: &InboundContext,
 ) -> io::Result<(u64, u64)> {
-    let mut target_stream = match TcpStream::connect(target).await {
-        Ok(s) => s,
+    let authority = target
+        .parse::<http::uri::Authority>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "Invalid CONNECT authority"))?;
+    let port = authority.port_u16().filter(|p| *p > 0).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "CONNECT requires a valid port")
+    })?;
+    let host = authority
+        .host()
+        .trim_start_matches('[')
+        .trim_end_matches(']');
+    relay(
+        client_stream,
+        host,
+        port,
+        leftover.to_vec(),
+        user,
+        remote_addr,
+        ctx,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn relay(
+    mut client_stream: BoxedStream,
+    host: &str,
+    port: u16,
+    prefix: Vec<u8>,
+    user: &User,
+    remote_addr: SocketAddr,
+    ctx: &InboundContext,
+    connect: bool,
+) -> io::Result<(u64, u64)> {
+    let ip = host.parse().ok();
+    // CONNECT clients normally wait for 200 before sending TLS; only early data
+    // can affect routing before the tunnel is established.
+    let sniffed = if ctx.global_config.domain_sniff && ip.is_some() {
+        crate::conn::sniff_domain(&prefix).map(|(host, _)| host)
+    } else {
+        None
+    };
+    let match_host = sniffed.as_deref().unwrap_or(host);
+    if ctx.audit.should_block(host, ip, port) || ctx.audit.should_block(match_host, ip, port) {
+        client_stream.write_all(RESP_502_BAD_GATEWAY).await?;
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Blocked by audit",
+        ));
+    }
+    let outbound = ctx.router.match_outbound(&MatchContext {
+        node_id: ctx.node_id,
+        network: "tcp",
+        target_host: match_host,
+        target_ip: ip,
+        target_port: port,
+        inbound_local_ip: None,
+    });
+    let dial_host = if ctx.global_config.sniff_redirect {
+        match_host
+    } else {
+        host
+    };
+    let mut target = match ctx
+        .router
+        .dialer()
+        .dial(&outbound, dial_host, port, None)
+        .await
+    {
+        Ok(stream) => stream,
         Err(e) => {
-            warn!(
-                "[HTTP CONNECT] conn={} user_id={} failed to connect target {}: {}",
-                conn_id, user.id, target, e
-            );
             let _ = client_stream.write_all(RESP_502_BAD_GATEWAY).await;
-            let _ = client_stream.flush().await;
             return Err(e);
         }
     };
-    let _ = target_stream.set_nodelay(true);
-
-    // Reply 200 Connection Established to client
-    if let Err(e) = client_stream.write_all(RESP_200_CONNECTION_ESTABLISHED).await {
-        warn!(
-            "[HTTP CONNECT] conn={} user_id={} failed to send 200 Established: {}",
-            conn_id, user.id, e
-        );
-        return Err(e);
+    if connect {
+        client_stream
+            .write_all(RESP_200_CONNECTION_ESTABLISHED)
+            .await?;
+        client_stream.flush().await?;
     }
-    let _ = client_stream.flush().await;
-
-    // Send leftover bytes if client sent early data after CONNECT headers
-    let mut initial_up = 0u64;
-    if !leftover.is_empty() {
-        if let Err(e) = target_stream.write_all(leftover).await {
-            warn!(
-                "[HTTP CONNECT] conn={} user_id={} failed to write leftover data to target: {}",
-                conn_id, user.id, e
-            );
-            return Err(e);
-        }
-        let _ = target_stream.flush().await;
-        initial_up = leftover.len() as u64;
-    }
-
-    info!(
-        "[HTTP CONNECT] conn={} user_id={} target={} tunnel established",
-        conn_id, user.id, target
-    );
-
-    // Bidirectional transparent relay
-    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-    let (mut target_read, mut target_write) = target_stream.into_split();
-
-    let client_to_target = async {
-        tokio::io::copy(&mut client_read, &mut target_write).await
-    };
-    let target_to_client = async {
-        tokio::io::copy(&mut target_read, &mut client_write).await
-    };
-
-    let (up_res, down_res) = tokio::join!(client_to_target, target_to_client);
-    let up = up_res.unwrap_or(0) + initial_up;
-    let down = down_res.unwrap_or(0);
-
-    info!(
-        "[HTTP CONNECT] conn={} user_id={} target={} tunnel closed (up={} bytes, down={} bytes)",
-        conn_id, user.id, target, up, down
-    );
-
-    Ok((up, down))
+    let stream = PrefixedStream::new(client_stream, Some(prefix));
+    let mut client = MonitoredStream::new(stream, user.id, remote_addr);
+    let _traffic = client.traffic_guard(ctx.on_traffic.clone());
+    let started = Instant::now();
+    let result = crate::conn::copy_bidirectional_throttled(
+        &mut client,
+        &mut target,
+        user.id,
+        Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
+    )
+    .await;
+    let (up, down) = client.stats();
+    ctx.audit_logger.record(AuditRecord::new(
+        ctx.node_id,
+        user.id,
+        "http",
+        "tcp",
+        &remote_addr.ip().to_string(),
+        host,
+        port,
+        up,
+        down,
+        started.elapsed().as_millis() as i64,
+        &outbound.tag,
+        if result.is_ok() { "completed" } else { "error" },
+    ));
+    result.map(|_| (up, down))
 }

@@ -111,8 +111,13 @@ impl Inbound for TrojanInbound {
 
         let users = self.users.clone();
 
+        let mut connections = tokio::task::JoinSet::new();
+        ctx.mark_ready();
         loop {
             tokio::select! {
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Connection task failed"); }
+                }
                 _ = shutdown_rx.recv() => {
                     info!("Trojan inbound on port {} stopping", ctx.port);
                     break;
@@ -133,7 +138,7 @@ impl Inbound for TrojanInbound {
                     let tls_manager = tls_manager.clone();
                     let reality_server = reality_server.clone();
 
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         if let Err(e) = handle_connection(
                             stream,
                             remote_addr,
@@ -151,6 +156,8 @@ impl Inbound for TrojanInbound {
                 }
             }
         }
+        drop(listener);
+        crate::protocol::common::inbound::drain_connections(&mut connections).await;
         Ok(())
     }
 }
@@ -164,20 +171,16 @@ async fn handle_connection(
     tls_manager: Option<&TLSManager>,
     reality_server: Option<&RealityServer>,
 ) -> io::Result<()> {
-    tokio::time::timeout(
-        Duration::from_secs(15),
-        handle_connection_inner(
-            stream,
-            remote_addr,
-            ctx,
-            users,
-            settings,
-            tls_manager,
-            reality_server,
-        ),
+    handle_connection_inner(
+        stream,
+        remote_addr,
+        ctx,
+        users,
+        settings,
+        tls_manager,
+        reality_server,
     )
     .await
-    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "Trojan handshake timed out"))?
 }
 
 async fn handle_connection_inner(
@@ -189,55 +192,74 @@ async fn handle_connection_inner(
     tls_manager: Option<&TLSManager>,
     reality_server: Option<&RealityServer>,
 ) -> io::Result<()> {
-    let local_ip = stream.local_addr().ok().map(|s| s.ip());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let handshake = async {
+        let local_ip = stream.local_addr().ok().map(|s| s.ip());
 
-    // 1. PROXY Protocol
-    let (src_opt, stream): (Option<SocketAddr>, BoxedStream) =
-        if settings.accept_proxy_protocol || ctx.global_config.proxy_protocol {
+        // 1. PROXY Protocol
+        let (src_opt, stream): (Option<SocketAddr>, BoxedStream) = if settings.accept_proxy_protocol
+            || ctx.global_config.proxy_protocol
+        {
             let (src, ps) =
                 read_proxy_protocol(stream, ctx.global_config.get_proxy_protocol_mode()).await?;
             (src, Box::new(ps))
         } else {
             (None, Box::new(stream))
         };
-    if let Some(src) = src_opt {
-        remote_addr = src;
-    }
-
-    let client_ip = remote_addr.ip();
-    if ctx.defense.is_banned(client_ip) {
-        return Ok(());
-    }
-
-    // 2. Transport Security (TLS, REALITY, or None)
-    let alpn = match &settings.transport {
-        crate::transport::TransportConfig::Grpc(_)
-        | crate::transport::TransportConfig::LegacyHttp2(_) => {
-            vec![b"h2".to_vec()]
+        if let Some(src) = src_opt {
+            remote_addr = src;
         }
-        crate::transport::TransportConfig::XHttp(_) => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
-        _ => vec![b"http/1.1".to_vec()],
-    };
 
-    let sec_stream = match apply_transport_security(
-        stream,
-        remote_addr,
-        &settings.security,
-        tls_manager,
-        reality_server,
-        alpn,
-    )
-    .await?
-    {
-        Some(s) => s,
-        None => return Ok(()), // Transparently fallbacked to dest (REALITY)
-    };
+        let client_ip = remote_addr.ip();
+        if ctx.defense.is_banned(client_ip) {
+            return Ok(None);
+        }
 
-    // 3. Transport Layer (RAW/TCP, WebSocket, gRPC, HttpUpgrade, XHTTP, LegacyHttp2)
-    let stream = apply_transport(sec_stream, &settings.transport).await?;
+        // 2. Transport Security (TLS, REALITY, or None)
+        let alpn = match &settings.transport {
+            crate::transport::TransportConfig::Grpc(_)
+            | crate::transport::TransportConfig::LegacyHttp2(_) => {
+                vec![b"h2".to_vec()]
+            }
+            crate::transport::TransportConfig::XHttp(_) => {
+                vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+            }
+            _ => vec![b"http/1.1".to_vec()],
+        };
+
+        let sec_stream = match apply_transport_security(
+            stream,
+            remote_addr,
+            &settings.security,
+            tls_manager,
+            reality_server,
+            alpn,
+        )
+        .await?
+        {
+            Some(s) => s,
+            None => return Ok(None), // Transparently fallbacked to dest (REALITY)
+        };
+
+        // 3. Transport Layer (RAW/TCP, WebSocket, gRPC, HttpUpgrade, XHTTP, LegacyHttp2)
+        let stream = apply_transport(sec_stream, &settings.transport).await?;
+
+        Ok::<_, io::Error>(Some((stream, remote_addr, local_ip)))
+    };
+    let Some((stream, remote_addr, local_ip)) = tokio::time::timeout_at(deadline, handshake)
+        .await
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Trojan transport handshake timed out",
+            )
+        })??
+    else {
+        return Ok(());
+    };
 
     // 4. Trojan Protocol Core
-    handle_trojan_protocol(stream, remote_addr, local_ip, ctx, users).await
+    handle_trojan_protocol(stream, remote_addr, local_ip, ctx, users, deadline).await
 }
 
 async fn handle_trojan_protocol(
@@ -246,88 +268,113 @@ async fn handle_trojan_protocol(
     local_ip: Option<IpAddr>,
     ctx: InboundContext,
     users: Arc<RwLock<Arc<HashMap<String, Arc<User>>>>>,
+    deadline: tokio::time::Instant,
 ) -> io::Result<()> {
     let client_ip = remote_addr.ip();
 
-    // Read Trojan Header: [SHA224(password) 56 bytes] [\r\n 2 bytes] [CMD 1 byte] [ATYP 1 byte] [ADDR] [PORT 2 bytes] [\r\n 2 bytes]
-    let mut hash_buf = [0u8; 56];
-    stream.read_exact(&mut hash_buf).await?;
-    let mut crlf = [0u8; 2];
-    stream.read_exact(&mut crlf).await?;
-    if &crlf != b"\r\n" {
-        return Ok(());
-    }
-    let hash_str = String::from_utf8_lossy(&hash_buf).to_lowercase();
+    let handshake = async {
+        // Read Trojan Header: [SHA224(password) 56 bytes] [\r\n 2 bytes] [CMD 1 byte] [ATYP 1 byte] [ADDR] [PORT 2 bytes] [\r\n 2 bytes]
+        let mut hash_buf = [0u8; 56];
+        stream.read_exact(&mut hash_buf).await?;
+        let mut crlf = [0u8; 2];
+        stream.read_exact(&mut crlf).await?;
+        if &crlf != b"\r\n" {
+            return Ok(None);
+        }
+        let hash_str = String::from_utf8_lossy(&hash_buf).to_lowercase();
 
-    let user = {
-        let users_map = users.read().clone();
-        match users_map.get(&hash_str).cloned() {
-            Some(u) => {
-                ctx.defense.record_success(client_ip);
-                u
+        let user = {
+            let users_map = users.read().clone();
+            match users_map.get(&hash_str).cloned() {
+                Some(u) => {
+                    ctx.defense.record_success(client_ip);
+                    u
+                }
+                None => {
+                    ctx.defense.record_failure(client_ip);
+                    return Ok(None); // Password mismatch
+                }
             }
-            None => {
-                ctx.defense.record_failure(client_ip);
-                return Ok(()); // Password mismatch
+        };
+
+        // Device limit check
+        if !ctx
+            .device_limiter
+            .check_and_record_async(user.id, client_ip)
+            .await
+        {
+            return Ok(None);
+        }
+
+        // Connection limit check
+        let conn_guard = match ctx.conn_limiter.try_acquire(user.id) {
+            Some(g) => g,
+            None => return Ok(None),
+        };
+
+        // Read Command (0x01 = CONNECT, 0x03 = UDP)
+        let mut cmd_buf = [0u8; 1];
+        stream.read_exact(&mut cmd_buf).await?;
+
+        // Read Address Type (0x01 = IPv4, 0x03 = Domain, 0x04 = IPv6)
+        let mut atyp_buf = [0u8; 1];
+        stream.read_exact(&mut atyp_buf).await?;
+
+        let (target_host, target_ip) = match atyp_buf[0] {
+            0x01 => {
+                let mut ipv4 = [0u8; 4];
+                stream.read_exact(&mut ipv4).await?;
+                let ip = IpAddr::V4(Ipv4Addr::from(ipv4));
+                (ip.to_string(), Some(ip))
             }
-        }
-    };
+            0x03 => {
+                let mut len_buf = [0u8; 1];
+                stream.read_exact(&mut len_buf).await?;
+                let mut domain_buf = vec![0u8; len_buf[0] as usize];
+                stream.read_exact(&mut domain_buf).await?;
+                let domain = String::from_utf8_lossy(&domain_buf).to_string();
+                (domain, None)
+            }
+            0x04 => {
+                let mut ipv6 = [0u8; 16];
+                stream.read_exact(&mut ipv6).await?;
+                let ip = IpAddr::V6(Ipv6Addr::from(ipv6));
+                (ip.to_string(), Some(ip))
+            }
+            _ => return Ok(None),
+        };
 
-    // Device limit check
-    if !ctx.device_limiter.check_and_record_async(user.id, client_ip).await {
+        let mut port_buf = [0u8; 2];
+        stream.read_exact(&mut port_buf).await?;
+        let target_port = u16::from_be_bytes(port_buf);
+
+        // Read terminating CRLF
+        let mut end_crlf = [0u8; 2];
+        stream.read_exact(&mut end_crlf).await?;
+        if &end_crlf != b"\r\n" {
+            return Ok(None);
+        }
+
+        Ok::<_, io::Error>(Some((
+            user,
+            conn_guard,
+            cmd_buf[0],
+            target_host,
+            target_ip,
+            target_port,
+        )))
+    };
+    let Some((user, conn_guard, command, target_host, target_ip, target_port)) =
+        tokio::time::timeout_at(deadline, handshake)
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "Trojan authentication timed out")
+            })??
+    else {
         return Ok(());
-    }
-
-    // Connection limit check
-    let conn_guard = match ctx.conn_limiter.try_acquire(user.id) {
-        Some(g) => g,
-        None => return Ok(()),
     };
 
-    // Read Command (0x01 = CONNECT, 0x03 = UDP)
-    let mut cmd_buf = [0u8; 1];
-    stream.read_exact(&mut cmd_buf).await?;
-
-    // Read Address Type (0x01 = IPv4, 0x03 = Domain, 0x04 = IPv6)
-    let mut atyp_buf = [0u8; 1];
-    stream.read_exact(&mut atyp_buf).await?;
-
-    let (target_host, target_ip) = match atyp_buf[0] {
-        0x01 => {
-            let mut ipv4 = [0u8; 4];
-            stream.read_exact(&mut ipv4).await?;
-            let ip = IpAddr::V4(Ipv4Addr::from(ipv4));
-            (ip.to_string(), Some(ip))
-        }
-        0x03 => {
-            let mut len_buf = [0u8; 1];
-            stream.read_exact(&mut len_buf).await?;
-            let mut domain_buf = vec![0u8; len_buf[0] as usize];
-            stream.read_exact(&mut domain_buf).await?;
-            let domain = String::from_utf8_lossy(&domain_buf).to_string();
-            (domain, None)
-        }
-        0x04 => {
-            let mut ipv6 = [0u8; 16];
-            stream.read_exact(&mut ipv6).await?;
-            let ip = IpAddr::V6(Ipv6Addr::from(ipv6));
-            (ip.to_string(), Some(ip))
-        }
-        _ => return Ok(()),
-    };
-
-    let mut port_buf = [0u8; 2];
-    stream.read_exact(&mut port_buf).await?;
-    let target_port = u16::from_be_bytes(port_buf);
-
-    // Read terminating CRLF
-    let mut end_crlf = [0u8; 2];
-    stream.read_exact(&mut end_crlf).await?;
-    if &end_crlf != b"\r\n" {
-        return Ok(());
-    }
-
-    if cmd_buf[0] == 0x03 {
+    if command == 0x03 {
         // Command 0x03: UDP ASSOCIATE
         return handle_trojan_udp(
             stream,
@@ -381,6 +428,7 @@ async fn handle_trojan_protocol(
     };
 
     let mut client_conn = MonitoredStream::new(stream, user.id, remote_addr);
+    let _traffic = client_conn.traffic_guard(ctx.on_traffic.clone());
     let start_time = Instant::now();
 
     let _ = crate::conn::copy_bidirectional_throttled(
@@ -388,15 +436,12 @@ async fn handle_trojan_protocol(
         &mut out_stream,
         user.id,
         Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
     )
     .await;
 
     let duration = start_time.elapsed();
     let (up, down) = client_conn.stats();
-
-    if up > 0 || down > 0 {
-        (ctx.on_traffic)(user.id, up, down);
-    }
 
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,
@@ -726,6 +771,120 @@ async fn handle_trojan_udp(
 mod tests {
     use super::*;
     use sha2::{Digest, Sha224};
+
+    fn context(on_traffic: crate::protocol::TrafficCallback) -> InboundContext {
+        let geo = Arc::new(crate::geo::GeoEngine::default());
+        let dialer = Arc::new(crate::proxy::router::OutboundDialer::new(
+            Arc::new(crate::dns::DNSResolver::default()),
+            None,
+            None,
+            false,
+        ));
+        let mut config = crate::config::GlobalConfig::default();
+        config.domain_sniff = false;
+        InboundContext {
+            ready: None,
+            node_id: 1,
+            listen_addr: "127.0.0.1".into(),
+            port: 0,
+            router: Arc::new(crate::proxy::router::Router::new(
+                Default::default(),
+                dialer,
+                geo.clone(),
+            )),
+            rate_limiter: Arc::new(crate::limiter::RateLimiter::new()),
+            conn_limiter: Arc::new(crate::limiter::ConnectionLimiter::new()),
+            device_limiter: Arc::new(crate::limiter::DeviceLimiter::new(60, 32, 128, None)),
+            audit: Arc::new(crate::security::AuditController::new("", "", geo)),
+            defense: Arc::new(crate::security::AttackDefenseManager::default()),
+            tls_manager: Arc::new(TLSManager::new(false, "localhost".into())),
+            audit_logger: Arc::new(crate::observability::AuditLogger::new(None::<&str>)),
+            clickhouse_logger: Arc::new(crate::observability::ClickHouseLogger::new(
+                false,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+            )),
+            on_traffic,
+            global_config: Arc::new(config),
+            ip_user_cache: Arc::new(crate::limiter::IpUserCache::new(1, false, "")),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_deadline_rejects_silent_client() {
+        let (_client, server) = tokio::io::duplex(1024);
+        let inbound = TrojanInbound::new();
+        let error = handle_trojan_protocol(
+            Box::new(server),
+            "127.0.0.1:1234".parse().unwrap(),
+            None,
+            context(Arc::new(|_, _, _| panic!("unauthenticated traffic"))),
+            inbound.users,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn authenticated_session_outlives_deadline_and_reports_traffic() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (connected, ready) = tokio::sync::oneshot::channel();
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            connected.send(()).unwrap();
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input).await.unwrap();
+            assert_eq!(input, b"after deadline");
+            stream.write_all(b"response after FIN").await.unwrap();
+        });
+        let traffic = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let records = traffic.clone();
+        let ctx = context(Arc::new(move |uid, up, down| {
+            records.lock().push((uid, up, down))
+        }));
+        let inbound = TrojanInbound::new();
+        inbound.update_users(vec![User {
+            id: 42,
+            password: Some("fixture".into()),
+            ..Default::default()
+        }]);
+        let (mut client, server) = tokio::io::duplex(1024);
+        let handler = tokio::spawn(handle_trojan_protocol(
+            Box::new(server),
+            "127.0.0.1:1234".parse().unwrap(),
+            None,
+            ctx,
+            inbound.users,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        ));
+        let mut header = hex::encode(Sha224::digest(b"fixture")).into_bytes();
+        header.extend_from_slice(b"\r\n\x01\x01\x7f\0\0\x01");
+        header.extend_from_slice(&port.to_be_bytes());
+        header.extend_from_slice(b"\r\n");
+        client.write_all(&header).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.write_all(b"after deadline").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, b"response after FIN");
+        handler.await.unwrap().unwrap();
+        target.await.unwrap();
+        assert_eq!(*traffic.lock(), vec![(42, 14, 18)]);
+    }
 
     #[test]
     fn test_trojan_password_hashing() {

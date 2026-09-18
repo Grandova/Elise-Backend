@@ -1,6 +1,5 @@
 use crate::protocol::mieru::crypto::{increment_nonce, METADATA_LENGTH, NONCE_SIZE, OVERHEAD};
 use crate::protocol::mieru::pattern::{decode_low_entropy, TrafficPatternExecutor};
-use bytes::BytesMut;
 use chacha20poly1305::aead::AeadInPlace;
 use chacha20poly1305::{Tag as XTag, XChaCha20Poly1305, XNonce};
 use std::io::{self, Error, ErrorKind};
@@ -84,7 +83,10 @@ impl MieruStreamCipher {
     }
 
     /// Encrypt initial metadata (includes 24-byte nonce prefix)
-    pub fn encrypt_initial_metadata(&mut self, meta: &[u8; METADATA_LENGTH]) -> io::Result<Vec<u8>> {
+    pub fn encrypt_initial_metadata(
+        &mut self,
+        meta: &[u8; METADATA_LENGTH],
+    ) -> io::Result<Vec<u8>> {
         let mut out = Vec::with_capacity(NONCE_SIZE + METADATA_LENGTH + OVERHEAD);
         out.extend_from_slice(&self.nonce);
 
@@ -92,7 +94,12 @@ impl MieruStreamCipher {
         let tag = self
             .cipher
             .encrypt_in_place_detached(XNonce::from_slice(&self.nonce), b"", &mut buf)
-            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Metadata encrypt failed: {:?}", e)))?;
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Metadata encrypt failed: {:?}", e),
+                )
+            })?;
 
         out.extend_from_slice(&buf);
         out.extend_from_slice(tag.as_slice());
@@ -102,12 +109,20 @@ impl MieruStreamCipher {
     }
 
     /// Encrypt subsequent metadata (48 bytes: 32 meta + 16 tag)
-    pub fn encrypt_subsequent_metadata(&mut self, meta: &[u8; METADATA_LENGTH]) -> io::Result<Vec<u8>> {
+    pub fn encrypt_subsequent_metadata(
+        &mut self,
+        meta: &[u8; METADATA_LENGTH],
+    ) -> io::Result<Vec<u8>> {
         let mut buf = meta.to_vec();
         let tag = self
             .cipher
             .encrypt_in_place_detached(XNonce::from_slice(&self.nonce), b"", &mut buf)
-            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Subsequent metadata encrypt failed: {:?}", e)))?;
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Subsequent metadata encrypt failed: {:?}", e),
+                )
+            })?;
 
         let mut out = Vec::with_capacity(METADATA_LENGTH + OVERHEAD);
         out.extend_from_slice(&buf);
@@ -123,7 +138,12 @@ impl MieruStreamCipher {
         let tag = self
             .cipher
             .encrypt_in_place_detached(XNonce::from_slice(&self.nonce), b"", &mut buf)
-            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Payload encrypt failed: {:?}", e)))?;
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Payload encrypt failed: {:?}", e),
+                )
+            })?;
 
         buf.extend_from_slice(tag.as_slice());
         increment_nonce(&mut self.nonce);
@@ -141,7 +161,12 @@ impl MieruStreamCipher {
 
         self.cipher
             .decrypt_in_place_detached(XNonce::from_slice(&self.nonce), b"", &mut buf, tag)
-            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Metadata decrypt failed: {:?}", e)))?;
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Metadata decrypt failed: {:?}", e),
+                )
+            })?;
 
         increment_nonce(&mut self.nonce);
 
@@ -153,7 +178,10 @@ impl MieruStreamCipher {
     /// Decrypt payload body
     pub fn decrypt_payload(&mut self, data: &[u8], payload_len: usize) -> io::Result<Vec<u8>> {
         if data.len() < payload_len + OVERHEAD {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "Payload wire buffer too short"));
+            return Err(Error::new(
+                ErrorKind::UnexpectedEof,
+                "Payload wire buffer too short",
+            ));
         }
 
         let mut buf = data[..payload_len].to_vec();
@@ -161,153 +189,110 @@ impl MieruStreamCipher {
 
         self.cipher
             .decrypt_in_place_detached(XNonce::from_slice(&self.nonce), b"", &mut buf, tag)
-            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Payload decrypt failed: {:?}", e)))?;
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("Payload decrypt failed: {:?}", e),
+                )
+            })?;
 
         increment_nonce(&mut self.nonce);
         Ok(buf)
     }
 }
 
-/// Reader that parses incoming Mieru segments and exposes an AsyncRead stream
+pub struct MieruFrame {
+    pub meta: [u8; METADATA_LENGTH],
+    pub payload: Vec<u8>,
+}
+
+/// Nonce state belongs to the TCP connection, not to an individual multiplexed session.
 pub struct MieruSessionReader<S> {
     stream: S,
     decoder: MieruStreamCipher,
-    session: Arc<Mutex<MieruSessionState>>,
-    pending: BytesMut,
-    eof_reached: bool,
 }
 
 impl<S: AsyncReadExt + Unpin> MieruSessionReader<S> {
-    pub fn new(stream: S, decoder: MieruStreamCipher, session: Arc<Mutex<MieruSessionState>>) -> Self {
-        Self {
-            stream,
-            decoder,
-            session,
-            pending: BytesMut::new(),
-            eof_reached: false,
-        }
+    pub fn new(stream: S, decoder: MieruStreamCipher) -> Self {
+        Self { stream, decoder }
     }
 
-    pub fn seed_pending(&mut self, initial: &[u8]) {
-        self.pending.extend_from_slice(initial);
-    }
-
-    /// Read next Mieru segment from the stream and decrypt payload.
-    /// Returns Ok(Some(payload)) when data arrives.
-    /// Returns Ok(None) when the stream closes or receives CLOSE_SESSION_REQ.
-    pub async fn read_next_segment(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if !self.pending.is_empty() {
-            let data = self.pending.to_vec();
-            self.pending.clear();
-            return Ok(Some(data));
-        }
-
-        if self.eof_reached {
+    pub async fn read_next_segment(&mut self) -> io::Result<Option<MieruFrame>> {
+        let mut header = [0u8; METADATA_LENGTH + OVERHEAD];
+        if self.stream.read(&mut header[..1]).await? == 0 {
             return Ok(None);
         }
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            self.stream.read_exact(&mut header[1..]).await?;
+            let meta = self.decoder.decrypt_metadata(&header)?;
+            self.read_payload(meta).await.map(Some)
+        })
+        .await
+        .map_err(|_| Error::new(ErrorKind::TimedOut, "Mieru frame timed out"))?
+    }
 
-        loop {
-            let mut meta_hdr = [0u8; METADATA_LENGTH + OVERHEAD];
-            match self.stream.read_exact(&mut meta_hdr).await {
-                Ok(_) => {}
-                Err(e) if e.kind() == ErrorKind::UnexpectedEof || e.kind() == ErrorKind::ConnectionReset => {
-                    self.eof_reached = true;
-                    return Ok(None);
-                }
-                Err(e) => return Err(e),
-            }
-
-            let meta = self.decoder.decrypt_metadata(&meta_hdr)?;
-            let proto = meta[0];
-
-            match proto {
-                PROTOCOL_DATA_C2S => {
-                    let seq = u32::from_be_bytes(meta[10..14].try_into().unwrap());
-                    let prefix_len = meta[21] as usize;
-                    let payload_len = u16::from_be_bytes(meta[22..24].try_into().unwrap()) as usize;
-                    let suffix_len = meta[24] as usize;
-
-                    if prefix_len > 0 {
-                        let mut p_buf = vec![0u8; prefix_len];
-                        self.stream.read_exact(&mut p_buf).await?;
-                    }
-
-                    let payload = if payload_len > 0 {
-                        let mut wire_payload = vec![0u8; payload_len + OVERHEAD];
-                        self.stream.read_exact(&mut wire_payload).await?;
-                        self.decoder.decrypt_payload(&wire_payload, payload_len)?
-                    } else {
-                        Vec::new()
-                    };
-
-                    if suffix_len > 0 {
-                        let mut s_buf = vec![0u8; suffix_len];
-                        self.stream.read_exact(&mut s_buf).await?;
-                    }
-
-                    let mut s = self.session.lock().await;
-                    s.advance_recv_seq(seq);
-
-                    if !payload.is_empty() {
-                        return Ok(Some(payload));
-                    }
-                }
-                PROTOCOL_DATA_C2S_LOW_ENTROPY => {
-                    let mode = meta[1] as i32;
-                    let seq = u32::from_be_bytes(meta[10..14].try_into().unwrap());
-                    let prefix_len = meta[21] as usize;
-                    let payload_len = u16::from_be_bytes(meta[22..24].try_into().unwrap()) as usize;
-                    let suffix_len = meta[24] as usize;
-                    let half_mask = u32::from_be_bytes(meta[25..29].try_into().unwrap());
-                    let extracted_len = u16::from_be_bytes(meta[29..31].try_into().unwrap()) as usize;
-                    let rotation = meta[31] as i32;
-
-                    if prefix_len > 0 {
-                        let mut p_buf = vec![0u8; prefix_len];
-                        self.stream.read_exact(&mut p_buf).await?;
-                    }
-
-                    let raw_payload = if payload_len > 0 {
-                        let mut wire_payload = vec![0u8; payload_len + OVERHEAD];
-                        self.stream.read_exact(&mut wire_payload).await?;
-                        let enc_payload = self.decoder.decrypt_payload(&wire_payload, payload_len)?;
-                        decode_low_entropy(&enc_payload, extracted_len, mode, half_mask, rotation)?
-                    } else {
-                        Vec::new()
-                    };
-
-                    if suffix_len > 0 {
-                        let mut s_buf = vec![0u8; suffix_len];
-                        self.stream.read_exact(&mut s_buf).await?;
-                    }
-
-                    let mut s = self.session.lock().await;
-                    s.advance_recv_seq(seq);
-
-                    if !raw_payload.is_empty() {
-                        return Ok(Some(raw_payload));
-                    }
-                }
-                PROTOCOL_ACK_C2S => {
-                    // Client sent ACK segment, advance session unack seq
-                    let seq = u32::from_be_bytes(meta[10..14].try_into().unwrap());
-                    let mut s = self.session.lock().await;
-                    s.advance_recv_seq(seq);
-                }
-                PROTOCOL_CLOSE_SESSION_REQ => {
-                    self.eof_reached = true;
-                    let mut s = self.session.lock().await;
-                    s.is_closed = true;
-                    return Ok(None);
-                }
-                other => {
+    pub async fn read_payload(&mut self, meta: [u8; METADATA_LENGTH]) -> io::Result<MieruFrame> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            / 60;
+        let timestamp = u32::from_be_bytes(meta[2..6].try_into().unwrap()) as u64;
+        if now.abs_diff(timestamp) > 1 || meta[6..10] == [0; 4] {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                "Invalid Mieru timestamp or session ID",
+            ));
+        }
+        let (prefix, length, suffix) = match meta[0] {
+            PROTOCOL_OPEN_SESSION_REQ
+            | PROTOCOL_CLOSE_SESSION_REQ
+            | PROTOCOL_CLOSE_SESSION_RESP => {
+                let length = u16::from_be_bytes(meta[15..17].try_into().unwrap()) as usize;
+                if length > 1024 {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
-                        format!("Unexpected protocol byte in session reader: {}", other),
+                        "Mieru session payload exceeds 1024 bytes",
                     ));
                 }
+                (0, length, meta[17] as usize)
             }
-        }
+            PROTOCOL_DATA_C2S | PROTOCOL_DATA_C2S_LOW_ENTROPY | PROTOCOL_ACK_C2S => (
+                meta[21] as usize,
+                u16::from_be_bytes(meta[22..24].try_into().unwrap()) as usize,
+                meta[24] as usize,
+            ),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Invalid Mieru client frame",
+                ))
+            }
+        };
+        let mut padding = [0u8; 255];
+        self.stream.read_exact(&mut padding[..prefix]).await?;
+        let payload = if length > 0 {
+            let mut wire = vec![0u8; length + OVERHEAD];
+            self.stream.read_exact(&mut wire).await?;
+            if meta[0] == PROTOCOL_DATA_C2S_LOW_ENTROPY {
+                let extracted = u16::from_be_bytes(meta[29..31].try_into().unwrap()) as usize;
+                // Upstream expands ciphertext including its tag, before putting it on the wire.
+                wire = decode_low_entropy(
+                    &wire,
+                    extracted + OVERHEAD,
+                    meta[1] as i32,
+                    u32::from_be_bytes(meta[25..29].try_into().unwrap()),
+                    meta[31] as i32,
+                )?;
+                self.decoder.decrypt_payload(&wire, extracted)?
+            } else {
+                self.decoder.decrypt_payload(&wire, length)?
+            }
+        } else {
+            Vec::new()
+        };
+        self.stream.read_exact(&mut padding[..suffix]).await?;
+        Ok(MieruFrame { meta, payload })
     }
 }
 
@@ -315,27 +300,26 @@ impl<S: AsyncReadExt + Unpin> MieruSessionReader<S> {
 pub struct MieruSessionWriter<S> {
     stream: S,
     encoder: MieruStreamCipher,
-    session: Arc<Mutex<MieruSessionState>>,
+    initial: bool,
     pattern: TrafficPatternExecutor,
 }
 
 impl<S: AsyncWriteExt + Unpin> MieruSessionWriter<S> {
-    pub fn new(
-        stream: S,
-        encoder: MieruStreamCipher,
-        session: Arc<Mutex<MieruSessionState>>,
-        pattern: TrafficPatternExecutor,
-    ) -> Self {
+    pub fn new(stream: S, encoder: MieruStreamCipher, pattern: TrafficPatternExecutor) -> Self {
         Self {
             stream,
             encoder,
-            session,
+            initial: true,
             pattern,
         }
     }
 
     /// Write raw application data framed as Mieru Data segments
-    pub async fn write_data(&mut self, payload: &[u8]) -> io::Result<()> {
+    pub async fn write_data(
+        &mut self,
+        session: &Arc<Mutex<MieruSessionState>>,
+        payload: &[u8],
+    ) -> io::Result<()> {
         let mut offset = 0;
         let now_sec = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -348,7 +332,10 @@ impl<S: AsyncWriteExt + Unpin> MieruSessionWriter<S> {
             let chunk = &payload[offset..offset + chunk_len];
 
             let (session_id, seq, unack_seq, window_size) = {
-                let mut s = self.session.lock().await;
+                let mut s = session.lock().await;
+                if s.is_closed {
+                    return Ok(());
+                }
                 (s.session_id, s.alloc_send_seq(), s.unack_seq, s.window_size)
             };
 
@@ -371,7 +358,9 @@ impl<S: AsyncWriteExt + Unpin> MieruSessionWriter<S> {
             let enc_payload = self.encoder.encrypt_payload(chunk)?;
 
             // Construct frame: metadata (48B) + middle padding + payload + end padding
-            let mut frame = Vec::with_capacity(enc_meta.len() + middle_pad.len() + enc_payload.len() + end_pad.len());
+            let mut frame = Vec::with_capacity(
+                enc_meta.len() + middle_pad.len() + enc_payload.len() + end_pad.len(),
+            );
             frame.extend_from_slice(&enc_meta);
             if !middle_pad.is_empty() {
                 frame.extend_from_slice(&middle_pad);
@@ -381,18 +370,22 @@ impl<S: AsyncWriteExt + Unpin> MieruSessionWriter<S> {
                 frame.extend_from_slice(&end_pad);
             }
 
-            // Apply TCP fragmentation if enabled
-            if self.pattern.is_tcp_fragment_enabled() {
-                let fragments = self.pattern.fragment_tcp_buffer(&frame);
-                for frag in fragments {
-                    self.stream.write_all(frag).await?;
-                    if let Some(sleep) = self.pattern.next_tcp_fragment_sleep() {
-                        tokio::time::sleep(sleep).await;
+            tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                if self.pattern.is_tcp_fragment_enabled() {
+                    let fragments = self.pattern.fragment_tcp_buffer(&frame);
+                    for frag in fragments {
+                        self.stream.write_all(frag).await?;
+                        if let Some(sleep) = self.pattern.next_tcp_fragment_sleep() {
+                            tokio::time::sleep(sleep).await;
+                        }
                     }
+                } else {
+                    self.stream.write_all(&frame).await?;
                 }
-            } else {
-                self.stream.write_all(&frame).await?;
-            }
+                Ok::<_, io::Error>(())
+            })
+            .await
+            .map_err(|_| Error::new(ErrorKind::TimedOut, "Mieru frame write timed out"))??;
 
             offset += chunk_len;
         }
@@ -401,29 +394,138 @@ impl<S: AsyncWriteExt + Unpin> MieruSessionWriter<S> {
         Ok(())
     }
 
-    /// Send close session notification
-    pub async fn close_session(&mut self) -> io::Result<()> {
+    pub async fn write_control(
+        &mut self,
+        session: &Arc<Mutex<MieruSessionState>>,
+        protocol: u8,
+    ) -> io::Result<()> {
         let (session_id, seq) = {
-            let mut s = self.session.lock().await;
-            s.is_closed = true;
+            let mut s = session.lock().await;
+            if protocol == PROTOCOL_CLOSE_SESSION_REQ || protocol == PROTOCOL_CLOSE_SESSION_RESP {
+                s.is_closed = true;
+            }
             (s.session_id, s.alloc_send_seq())
         };
-
-        let now_sec = SystemTime::now()
+        let cur_min = (SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
-            .as_secs() as i64;
-        let cur_min = (now_sec / 60) as u32;
-
+            .as_secs()
+            / 60) as u32;
         let mut meta = [0u8; METADATA_LENGTH];
-        meta[0] = PROTOCOL_CLOSE_SESSION_REQ;
+        meta[0] = protocol;
         meta[2..6].copy_from_slice(&cur_min.to_be_bytes());
         meta[6..10].copy_from_slice(&session_id.to_be_bytes());
         meta[10..14].copy_from_slice(&seq.to_be_bytes());
+        let frame = if self.initial {
+            self.initial = false;
+            self.encoder.encrypt_initial_metadata(&meta)?
+        } else {
+            self.encoder.encrypt_subsequent_metadata(&meta)?
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            self.stream.write_all(&frame).await?;
+            self.stream.flush().await
+        })
+        .await
+        .map_err(|_| Error::new(ErrorKind::TimedOut, "Mieru control write timed out"))?
+    }
+}
 
-        let enc_meta = self.encoder.encrypt_subsequent_metadata(&meta)?;
-        self.stream.write_all(&enc_meta).await?;
-        self.stream.flush().await?;
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chacha20poly1305::KeyInit;
+
+    fn metadata(protocol: u8, id: u32) -> [u8; METADATA_LENGTH] {
+        let mut meta = [0u8; METADATA_LENGTH];
+        meta[0] = protocol;
+        let now = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            / 60) as u32;
+        meta[2..6].copy_from_slice(&now.to_be_bytes());
+        meta[6..10].copy_from_slice(&id.to_be_bytes());
+        meta
+    }
+
+    fn cipher() -> MieruStreamCipher {
+        MieruStreamCipher::new(
+            XChaCha20Poly1305::new_from_slice(&[7; 32]).unwrap(),
+            [9; 24],
+        )
+    }
+
+    #[tokio::test]
+    async fn interleaved_frames_share_nonce_and_preserve_session_ids() {
+        let mut encoder = cipher();
+        let mut wire = Vec::new();
+        let cases = [
+            (PROTOCOL_OPEN_SESSION_REQ, 1),
+            (PROTOCOL_OPEN_SESSION_REQ, 2),
+            (PROTOCOL_DATA_C2S, 2),
+            (PROTOCOL_CLOSE_SESSION_REQ, 1),
+            (PROTOCOL_ACK_C2S, 2),
+            (PROTOCOL_DATA_C2S, 2),
+        ];
+        for (protocol, id) in cases {
+            let mut meta = metadata(protocol, id);
+            if protocol == PROTOCOL_OPEN_SESSION_REQ || protocol == PROTOCOL_CLOSE_SESSION_REQ {
+                meta[15..17].copy_from_slice(&3u16.to_be_bytes());
+                meta[17] = 2;
+            } else {
+                meta[21] = 1;
+                meta[22..24].copy_from_slice(&3u16.to_be_bytes());
+                meta[24] = 2;
+            }
+            wire.extend(encoder.encrypt_subsequent_metadata(&meta).unwrap());
+            if protocol != PROTOCOL_OPEN_SESSION_REQ && protocol != PROTOCOL_CLOSE_SESSION_REQ {
+                wire.push(0);
+            }
+            wire.extend(encoder.encrypt_payload(b"abc").unwrap());
+            wire.extend([0; 2]);
+        }
+        let mut reader = MieruSessionReader::new(wire.as_slice(), cipher());
+        for (protocol, id) in cases {
+            let frame = reader.read_next_segment().await.unwrap().unwrap();
+            assert_eq!(frame.meta[0], protocol);
+            assert_eq!(
+                u32::from_be_bytes(frame.meta[6..10].try_into().unwrap()),
+                id
+            );
+            assert_eq!(frame.payload, b"abc");
+        }
+        assert!(reader.read_next_segment().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejects_truncated_frames_bad_tags_and_invalid_metadata() {
+        let mut bad = metadata(PROTOCOL_OPEN_SESSION_REQ, 1);
+        bad[15..17].copy_from_slice(&1025u16.to_be_bytes());
+        for meta in [
+            metadata(PROTOCOL_OPEN_SESSION_REQ, 0),
+            metadata(255, 1),
+            bad,
+            [0; 32],
+        ] {
+            let wire = cipher().encrypt_subsequent_metadata(&meta).unwrap();
+            assert!(MieruSessionReader::new(wire.as_slice(), cipher())
+                .read_next_segment()
+                .await
+                .is_err());
+        }
+        let meta = metadata(PROTOCOL_OPEN_SESSION_REQ, 1);
+        let mut wire = cipher().encrypt_subsequent_metadata(&meta).unwrap();
+        for n in [1, 20, wire.len() - 1] {
+            assert!(MieruSessionReader::new(&wire[..n], cipher())
+                .read_next_segment()
+                .await
+                .is_err());
+        }
+        wire[40] ^= 1;
+        assert!(MieruSessionReader::new(wire.as_slice(), cipher())
+            .read_next_segment()
+            .await
+            .is_err());
     }
 }

@@ -1,10 +1,10 @@
-use crate::conn::{bind_tcp_listener, read_proxy_protocol};
-use crate::observability::AuditRecord;
-use crate::panel::types::{NodeInfo, User};
 use super::crypto::{CipherKind, ShadowsocksServerSession};
 use super::ss2022::{self, Credential, Method, UserIndex};
 use super::transport::Transport;
 use super::udp::run_udp;
+use crate::conn::{bind_tcp_listener, read_proxy_protocol};
+use crate::observability::AuditRecord;
+use crate::panel::types::{NodeInfo, User};
 use crate::protocol::{Inbound, InboundContext};
 use crate::proxy::router::MatchContext;
 use async_trait::async_trait;
@@ -146,7 +146,12 @@ impl Inbound for ShadowsocksInbound {
         let listener = if transport.is_quic() {
             None
         } else {
-            Some(bind_tcp_listener(&bind_addr, ctx.global_config.mptcp).await?)
+            let tcp_bind = if transport.is_kcptun() {
+                "127.0.0.1:0"
+            } else {
+                &bind_addr
+            };
+            Some(bind_tcp_listener(tcp_bind, ctx.global_config.mptcp).await?)
         };
         let socket = if transport.is_kcptun() {
             None
@@ -188,46 +193,25 @@ impl Inbound for ShadowsocksInbound {
             ctx.defense.clone()
         };
 
-        if transport.is_kcptun() {
-            let mut kcptun_bin = None;
-            for path in [
-                "/root/elise-ss-test/bin/kcptun-server",
-                "/usr/local/bin/kcptun-server",
-                "/usr/bin/kcptun-server",
-                "kcptun-server",
-            ] {
-                if std::path::Path::new(path).exists() {
-                    kcptun_bin = Some(path.to_string());
-                    break;
-                }
-            }
-            if let Some(bin) = kcptun_bin {
-                let key = transport.opts.get("key").cloned().unwrap_or_else(|| "testkey".into());
-                let crypt = transport.opts.get("crypt").cloned().unwrap_or_else(|| "aes-128".into());
-                let mode = transport.opts.get("mode").cloned().unwrap_or_else(|| "fast".into());
-                let datashard = transport.opts.get("datashard").cloned().unwrap_or_else(|| "10".into());
-                let parityshard = transport.opts.get("parityshard").cloned().unwrap_or_else(|| "3".into());
-                let l_arg = format!("{}:{}", ctx.listen_addr, ctx.port);
-                let t_arg = format!("127.0.0.1:{}", ctx.port);
-                
-                info!("Starting managed KCPTun server {} -> {}", l_arg, t_arg);
-                if let Ok(mut child) = tokio::process::Command::new(bin)
-                    .args(["-l", &l_arg, "-t", &t_arg, "-key", &key, "-crypt", &crypt, "-mode", &mode, "-datashard", &datashard, "-parityshard", &parityshard])
+        let mut kcptun_child = if transport.is_kcptun() {
+            let target = listener.as_ref().unwrap().local_addr()?.to_string();
+            let args = transport.kcptun_args(&bind_addr, &target)?;
+            info!(listen = %bind_addr, target = %target, "Starting managed KCPTun server");
+            Some(
+                tokio::process::Command::new("kcptun-server")
+                    .args(args)
+                    .kill_on_drop(true)
                     .spawn()
-                {
-                    let cancel_child = cancel.clone();
-                    tasks.spawn(async move {
-                        tokio::select! {
-                            _ = cancel_child.cancelled() => {
-                                let _ = child.kill().await;
-                            }
-                            _ = child.wait() => {}
-                        }
-                        Ok(())
-                    });
-                }
-            }
-        }
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            e.kind(),
+                            format!("Failed to start kcptun-server from PATH: {e}"),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
 
         #[cfg(feature = "quic-protocols")]
         let quic = {
@@ -237,7 +221,9 @@ impl Inbound for ShadowsocksInbound {
                 let ctx = ctx.clone();
                 let users = users.clone();
                 let server_key = server_key.clone();
-                let local_ip = udp.as_ref().and_then(|u| u.local_addr().ok().map(|addr| addr.ip()));
+                let local_ip = udp
+                    .as_ref()
+                    .and_then(|u| u.local_addr().ok().map(|addr| addr.ip()));
                 tasks.spawn(super::quic::serve(
                     endpoint,
                     cancel.clone(),
@@ -273,11 +259,20 @@ impl Inbound for ShadowsocksInbound {
             ));
         }
 
-        loop {
+        ctx.mark_ready();
+        let result = loop {
             tokio::select! {
+                status = async { kcptun_child.as_mut().unwrap().wait().await }, if kcptun_child.is_some() => {
+                    let message = match status {
+                        Ok(status) => format!("kcptun-server exited unexpectedly: {status}"),
+                        Err(e) => format!("Failed to wait for kcptun-server: {e}"),
+                    };
+                    warn!("{message}");
+                    break Err(std::io::Error::other(message));
+                }
                 _ = shutdown_rx.recv() => {
                     info!("Shadowsocks inbound on port {} stopping", ctx.port);
-                    break;
+                    break Ok(());
                 }
                 result = tasks.join_next(), if !tasks.is_empty() => {
                     match result {
@@ -308,6 +303,12 @@ impl Inbound for ShadowsocksInbound {
                     });
                 }
             }
+        };
+        drop(listener);
+        if let Some(child) = &mut kcptun_child {
+            if child.try_wait()?.is_none() {
+                child.kill().await?;
+            }
         }
         cancel.cancel();
         while let Some(result) = tasks.join_next().await {
@@ -315,7 +316,7 @@ impl Inbound for ShadowsocksInbound {
                 warn!(error = %e, "Shadowsocks shutdown task failed");
             }
         }
-        Ok(())
+        result
     }
 }
 
@@ -552,9 +553,10 @@ async fn handle_stream(
 
         // 2. Slow path: acquire concurrency semaphore and test remaining credentials
         if matched.is_none() {
-            let _permit = decrypt_semaphore.acquire().await.map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::Interrupted, e)
-            })?;
+            let _permit = decrypt_semaphore
+                .acquire()
+                .await
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e))?;
             for credential in &user_index.credentials {
                 if Some(credential.user.id) == cached_user_id {
                     continue;
@@ -650,6 +652,7 @@ async fn handle_stream(
     };
     let start_time = Instant::now();
     let mut stream = crate::conn::MonitoredStream::new(stream, user.id, remote_addr);
+    let _traffic = stream.traffic_guard(ctx.on_traffic.clone());
     let result = tokio::select! {
         _ = cancel.cancelled() => Ok((0, 0)),
         result = crate::conn::copy_bidirectional_throttled(
@@ -657,10 +660,10 @@ async fn handle_stream(
         &mut out_stream,
         user.id,
         Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
         ) => result,
     };
     let (up_bytes, down_bytes) = stream.stats();
-    (ctx.on_traffic)(user.id, up_bytes, down_bytes);
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,
         user.id,
@@ -681,6 +684,83 @@ async fn handle_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn kcptun_options_reach_server_or_fail_explicitly() {
+        let mut opts = serde_json::Map::new();
+        for name in [
+            "mtu",
+            "sndwnd",
+            "rcvwnd",
+            "dscp",
+            "nodelay",
+            "interval",
+            "resend",
+            "nc",
+            "sockbuf",
+            "smuxbuf",
+            "framesize",
+            "streambuf",
+            "smuxver",
+            "keepalive",
+            "ratelimit",
+        ] {
+            opts.insert(name.into(), serde_json::json!(2));
+        }
+        opts.insert("nocomp".into(), serde_json::json!(true));
+        opts.insert("acknodelay".into(), serde_json::json!(false));
+        opts.insert("key".into(), serde_json::json!("a key with spaces"));
+        opts.insert("server".into(), serde_json::json!(true));
+        let node = NodeInfo {
+            plugin: Some("kcptun".into()),
+            plugin_opts: Some(opts.into()),
+            ..Default::default()
+        };
+        let transport = Transport::new(
+            &node,
+            &crate::security::TLSManager::new(false, "localhost".into()),
+        )
+        .await
+        .unwrap();
+        let args = transport
+            .kcptun_args("127.0.0.1:3000", "127.0.0.1:4000")
+            .unwrap();
+        for name in [
+            "mtu",
+            "sndwnd",
+            "rcvwnd",
+            "dscp",
+            "nodelay",
+            "interval",
+            "resend",
+            "nc",
+            "sockbuf",
+            "smuxbuf",
+            "framesize",
+            "streambuf",
+            "smuxver",
+            "keepalive",
+            "ratelimit",
+        ] {
+            assert!(args
+                .windows(2)
+                .any(|v| v == [format!("--{name}"), "2".into()]));
+        }
+        assert!(args.contains(&"--nocomp=true".into()));
+        assert!(args.contains(&"--acknodelay=false".into()));
+        assert!(args.contains(&"a key with spaces".into()));
+        for name in ["conn", "autoexpire", "scavengettl"] {
+            let node = NodeInfo {
+                plugin: Some("kcptun".into()),
+                plugin_opts: Some(serde_json::json!({name:1})),
+                ..Default::default()
+            };
+            assert_eq!(
+                Transport::validate(&node).unwrap_err().kind(),
+                std::io::ErrorKind::Unsupported
+            );
+        }
+    }
 
     #[tokio::test]
     async fn target_all_truncations_and_invalid_addresses() {

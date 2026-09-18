@@ -29,7 +29,11 @@ impl IpUserCache {
         Self::new_with_duration(Duration::from_secs(ttl_secs), save_enable, save_dir)
     }
 
-    pub fn new_with_duration<P: AsRef<Path>>(ttl: Duration, save_enable: bool, save_dir: P) -> Self {
+    pub fn new_with_duration<P: AsRef<Path>>(
+        ttl: Duration,
+        save_enable: bool,
+        save_dir: P,
+    ) -> Self {
         let s = Self {
             ttl,
             save_enable,
@@ -99,7 +103,11 @@ impl IpUserCache {
             if let Err(e) = fs::write(&file_path, json_str) {
                 warn!("Failed to persist IP user cache to {:?}: {}", file_path, e);
             } else {
-                debug!("Persisted {} IP user cache entries to {:?}", entries.len(), file_path);
+                debug!(
+                    "Persisted {} IP user cache entries to {:?}",
+                    entries.len(),
+                    file_path
+                );
             }
         }
     }

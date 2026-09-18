@@ -179,11 +179,30 @@ impl Transport {
                     Mode::Kcptun,
                     false,
                     &[
-                        "key", "crypt", "mode", "nocomp", "mtu", "sndwnd", "rcvwnd",
-                        "datashard", "parityshard", "dscp", "nodelay", "interval",
-                        "resend", "nc", "sockbuf", "smuxbuf", "framesize", "streambuf",
-                        "smuxver", "keepalive", "acknodelay", "server", "target", "conn",
-                        "autoexpire", "scavengettl", "ratelimit"
+                        "key",
+                        "crypt",
+                        "mode",
+                        "nocomp",
+                        "mtu",
+                        "sndwnd",
+                        "rcvwnd",
+                        "datashard",
+                        "parityshard",
+                        "dscp",
+                        "nodelay",
+                        "interval",
+                        "resend",
+                        "nc",
+                        "sockbuf",
+                        "smuxbuf",
+                        "framesize",
+                        "streambuf",
+                        "smuxver",
+                        "keepalive",
+                        "acknodelay",
+                        "server",
+                        "target",
+                        "ratelimit",
                     ],
                 )
             }
@@ -435,6 +454,63 @@ impl Transport {
 
     pub fn is_quic(&self) -> bool {
         self.mode == Mode::Quic
+    }
+
+    pub(super) fn kcptun_args(&self, listen: &str, target: &str) -> io::Result<Vec<String>> {
+        let mut args = vec![
+            "--listen".into(),
+            listen.into(),
+            "--target".into(),
+            self.opts
+                .get("target")
+                .map(String::as_str)
+                .unwrap_or(target)
+                .into(),
+        ];
+        for (name, default) in [
+            ("key", "testkey"),
+            ("crypt", "aes-128"),
+            ("mode", "fast"),
+            ("datashard", "10"),
+            ("parityshard", "3"),
+        ] {
+            args.push(format!("--{name}"));
+            args.push(
+                self.opts
+                    .get(name)
+                    .map(String::as_str)
+                    .unwrap_or(default)
+                    .into(),
+            );
+        }
+        for name in ["nocomp", "acknodelay"] {
+            if let Some(value) = self.opts.get(name) {
+                args.push(format!("--{name}={}", flag(Some(value))?));
+            }
+        }
+        for name in [
+            "mtu",
+            "sndwnd",
+            "rcvwnd",
+            "dscp",
+            "nodelay",
+            "interval",
+            "resend",
+            "nc",
+            "sockbuf",
+            "smuxbuf",
+            "framesize",
+            "streambuf",
+            "smuxver",
+            "keepalive",
+            "ratelimit",
+        ] {
+            if let Some(value) = self.opts.get(name) {
+                args.push(format!("--{name}"));
+                args.push(value.clone());
+            }
+        }
+        Ok(args)
     }
 
     pub fn is_kcptun(&self) -> bool {

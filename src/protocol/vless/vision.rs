@@ -118,15 +118,15 @@ impl<R: AsyncRead + Unpin> VisionReader<R> {
             return Ok(0);
         }
 
-        if self.direct {
-            return self.inner.read(dest).await;
-        }
-
         if self.buf_pos < self.buf.len() {
             let n = (self.buf.len() - self.buf_pos).min(dest.len());
             dest[..n].copy_from_slice(&self.buf[self.buf_pos..self.buf_pos + n]);
             self.buf_pos += n;
             return Ok(n);
+        }
+
+        if self.direct {
+            return self.inner.read(dest).await;
         }
 
         // Buffer empty, parse next Vision frame
@@ -143,7 +143,10 @@ impl<R: AsyncRead + Unpin> VisionReader<R> {
         }
 
         let mut hdr = [0u8; 5];
-        self.inner.read_exact(&mut hdr).await?;
+        if self.inner.read(&mut hdr[..1]).await? == 0 {
+            return Ok(0);
+        }
+        self.inner.read_exact(&mut hdr[1..]).await?;
         let command = hdr[0];
         let content_len = u16::from_be_bytes([hdr[1], hdr[2]]) as usize;
         let padding_len = u16::from_be_bytes([hdr[3], hdr[4]]) as usize;
@@ -261,6 +264,31 @@ impl<W: AsyncWrite + Unpin> VisionWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn end_frame_drains_buffer_before_direct_and_rejects_truncation() {
+        let mut wire = vec![0x55; 16];
+        wire.extend_from_slice(&[VISION_CMD_END, 0, 6, 0, 0]);
+        wire.extend_from_slice(b"abcdefraw");
+        let mut reader = VisionReader::new(wire.as_slice(), [0x55; 16]);
+        let mut data = Vec::new();
+        let mut buf = [0; 2];
+        loop {
+            let n = reader.read_payload(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
+            data.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(data, b"abcdefraw");
+        for end in 17..27 {
+            let mut reader = VisionReader::new(&wire[..end], [0x55; 16]);
+            assert_eq!(
+                reader.read_payload(&mut [0; 64]).await.unwrap_err().kind(),
+                io::ErrorKind::UnexpectedEof
+            );
+        }
+    }
 
     #[tokio::test]
     async fn test_vision_reader_and_writer_roundtrip() {

@@ -67,7 +67,10 @@ impl ConnectionLimiter {
 
     pub fn prune_idle(&self) {
         let mut map = self.active_conns.write();
-        map.retain(|_, counter| counter.load(Ordering::Relaxed) > 0);
+        // A cloned zero counter may be between lookup and its acquire CAS.
+        map.retain(|_, counter| {
+            counter.load(Ordering::Relaxed) > 0 || Arc::strong_count(counter) > 1
+        });
     }
 
     pub fn get_total_active(&self) -> u32 {
@@ -91,6 +94,48 @@ impl Drop for ConnGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prune_keeps_an_acquire_in_progress() {
+        let limiter = ConnectionLimiter::new();
+        limiter.set_user_limit(1, 1);
+        drop(limiter.try_acquire(1).unwrap());
+        let pending = limiter.active_conns.read()[&1].clone();
+        limiter.prune_idle();
+        assert!(Arc::ptr_eq(&pending, &limiter.active_conns.read()[&1]));
+        drop(pending);
+        limiter.prune_idle();
+        assert!(limiter.active_conns.read().is_empty());
+    }
+
+    #[test]
+    fn concurrent_acquire_release_and_prune_never_exceeds_limit() {
+        let limiter = ConnectionLimiter::new();
+        limiter.set_user_limit(1, 1);
+        let active = Arc::new(AtomicU32::new(0));
+        let mut workers = Vec::new();
+        for _ in 0..8 {
+            let limiter = limiter.clone();
+            let active = active.clone();
+            workers.push(std::thread::spawn(move || {
+                for _ in 0..10000 {
+                    if let Some(guard) = limiter.try_acquire(1) {
+                        assert_eq!(active.fetch_add(1, Ordering::SeqCst), 0);
+                        std::thread::yield_now();
+                        assert_eq!(active.fetch_sub(1, Ordering::SeqCst), 1);
+                        drop(guard);
+                    }
+                    limiter.prune_idle();
+                }
+            }));
+        }
+        for worker in workers {
+            worker.join().unwrap();
+        }
+        limiter.prune_idle();
+        assert_eq!(limiter.get_total_active(), 0);
+        assert!(limiter.active_conns.read().is_empty());
+    }
 
     #[test]
     fn test_conn_limiter_concurrency() {

@@ -63,7 +63,9 @@ impl DomainMatcher {
                             || d.contains("bilibili.")
                             || d.contains("163.com")
                     }
-                    "google" => d.contains("google") || d.contains("youtube") || d.contains("gstatic"),
+                    "google" => {
+                        d.contains("google") || d.contains("youtube") || d.contains("gstatic")
+                    }
                     "netflix" => d.contains("netflix") || d.contains("nflxvideo"),
                     "openai" => d.contains("openai") || d.contains("chatgpt"),
                     "telegram" => d.contains("telegram") || d.contains("t.me"),
@@ -190,7 +192,10 @@ impl DnsRulesTable {
             });
         }
 
-        Err("Failed to parse DNS rules YAML: format did not match full or shorthand schema".to_string())
+        Err(
+            "Failed to parse DNS rules YAML: format did not match full or shorthand schema"
+                .to_string(),
+        )
     }
 
     /// Match a domain against rules in order.

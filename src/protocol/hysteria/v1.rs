@@ -212,6 +212,7 @@ async fn graceful_drain_join_set<T: 'static>(
         tokio::select! {
             _ = &mut deadline => {
                 join_set.abort_all();
+                while join_set.join_next().await.is_some() {}
                 break;
             }
             res = join_set.join_next() => {
@@ -336,6 +337,7 @@ impl Inbound for Hysteria1Inbound {
         let cancel_token = CancellationToken::new();
         let mut conn_join_set = tokio::task::JoinSet::new();
 
+        ctx.mark_ready();
         loop {
             tokio::select! {
                 _ = shutdown_rx.recv() => {
@@ -459,7 +461,11 @@ async fn handle_hy1_connection(
             }
         };
 
-        if !ctx.device_limiter.check_and_record_async(user.id, client_ip).await {
+        if !ctx
+            .device_limiter
+            .check_and_record_async(user.id, client_ip)
+            .await
+        {
             conn.close(1u32.into(), b"device limit exceeded");
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -902,6 +908,7 @@ async fn handle_hy1_tcp_stream(
     // 5. Wrap in QuicStream and relay with cancellation support
     let stream = QuicStream::new(recv, send);
     let mut client_conn = MonitoredStream::new(stream, user.id, remote_addr);
+    let _traffic = client_conn.traffic_guard(ctx.on_traffic.clone());
     let start_time = Instant::now();
 
     tokio::select! {
@@ -913,6 +920,7 @@ async fn handle_hy1_tcp_stream(
             &mut out_stream,
             user.id,
             Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
         ) => {
             let _ = res;
         }
@@ -922,9 +930,6 @@ async fn handle_hy1_tcp_stream(
     let (up, down) = client_conn.stats();
 
     // Requirement 8: traffic accounting on actual successful bytes
-    if up > 0 || down > 0 {
-        (ctx.on_traffic)(user.id, up, down);
-    }
 
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,

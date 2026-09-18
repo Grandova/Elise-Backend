@@ -71,22 +71,33 @@ impl NodeConfig {
 
                 if let Some((k, v)) = trimmed.split_once('=') {
                     let key = k.trim().to_lowercase();
-                    let val = v.trim().trim_matches('"').trim_matches('\'').trim().to_string();
+                    let val = v
+                        .trim()
+                        .trim_matches('"')
+                        .trim_matches('\'')
+                        .trim()
+                        .to_string();
                     match key.as_str() {
                         "listen_addr" | "listen" => self.listen_addr = Some(val.clone()),
                         "port_offset" => self.port_offset = val.parse().unwrap_or(0),
                         "fake_sni" => self.fake_sni = Some(val.clone()),
                         "proxy_protocol" => {
-                            self.proxy_protocol = Some(val.eq_ignore_ascii_case("true") || val == "1" || val.eq_ignore_ascii_case("auto"));
+                            self.proxy_protocol = Some(
+                                val.eq_ignore_ascii_case("true")
+                                    || val == "1"
+                                    || val.eq_ignore_ascii_case("auto"),
+                            );
                         }
                         "udp_proxy_protocol" => {
-                            self.udp_proxy_protocol = Some(val.eq_ignore_ascii_case("true") || val == "1");
+                            self.udp_proxy_protocol =
+                                Some(val.eq_ignore_ascii_case("true") || val == "1");
                         }
                         "mptcp" => {
                             self.mptcp = Some(val.eq_ignore_ascii_case("true") || val == "1");
                         }
                         "force_close_ssl" | "disable_tls" => {
-                            self.force_close_ssl = Some(val.eq_ignore_ascii_case("true") || val == "1");
+                            self.force_close_ssl =
+                                Some(val.eq_ignore_ascii_case("true") || val == "1");
                         }
                         "cert_file" => self.cert_file = Some(PathBuf::from(val.clone())),
                         "key_file" => self.key_file = Some(PathBuf::from(val.clone())),
@@ -113,7 +124,11 @@ impl NodeConfig {
         }
     }
 
-    pub fn save_node_conf<P: AsRef<Path>>(&self, nodes_dir: P, node_info: &NodeInfo) -> std::io::Result<()> {
+    pub fn save_node_conf<P: AsRef<Path>>(
+        &self,
+        nodes_dir: P,
+        node_info: &NodeInfo,
+    ) -> std::io::Result<()> {
         let dir = nodes_dir.as_ref();
         if !dir.exists() {
             let _ = fs::create_dir_all(dir);

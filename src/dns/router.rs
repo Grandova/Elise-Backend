@@ -65,9 +65,7 @@ impl RuleBasedDNSManager {
             return;
         }
 
-        let mtime = fs::metadata(&self.dns_file)
-            .and_then(|m| m.modified())
-            .ok();
+        let mtime = fs::metadata(&self.dns_file).and_then(|m| m.modified()).ok();
 
         let changed = {
             let last = self.last_mtime.read();
@@ -118,4 +116,3 @@ impl RuleBasedDNSManager {
         }
     }
 }
-

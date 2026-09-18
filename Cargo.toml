@@ -85,7 +85,7 @@ quic-protocols = ["dep:quinn"]
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
+panic = "unwind"
 strip = true
 
 [patch.crates-io]

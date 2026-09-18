@@ -32,6 +32,11 @@ impl SSPanelClient {
         let val: Value = resp.json().await?;
         let data = val.get("data").unwrap_or(&val);
 
+        let is_ssr = matches!(
+            data.get("type").and_then(Value::as_str),
+            Some("ssr" | "shadowsocksr")
+        );
+
         Ok(NodeInfo {
             id: node_id,
             node_type: data
@@ -56,6 +61,7 @@ impl SSPanelClient {
                 .map(String::from),
             cipher: data
                 .get("cipher")
+                .or_else(|| if is_ssr { data.get("method") } else { None })
                 .and_then(|v| v.as_str())
                 .map(String::from),
             plugin: data
@@ -65,7 +71,20 @@ impl SSPanelClient {
             plugin_opts: data.get("plugin_opts").cloned(),
             up_mbps: None,
             down_mbps: None,
-            server_key: None,
+            server_key: if is_ssr {
+                data.get("password")
+                    .or_else(|| data.get("passwd"))
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            } else {
+                None
+            },
+            network_settings: if is_ssr { Some(data.clone()) } else { None },
+            obfs: if is_ssr {
+                data.get("obfs").and_then(Value::as_str).map(String::from)
+            } else {
+                None
+            },
             short_ids: None,
             public_key: None,
             ..Default::default()
@@ -80,10 +99,13 @@ impl SSPanelClient {
             "{}/mod_mu/users?node_id={}&key={}",
             self.base_url, node_id, self.key
         );
-        let resp = self.client.get(&url).send().await?;
+        let resp = self.client.get(&url).send().await?.error_for_status()?;
         let val: Value = resp.json().await?;
         let user_list = val.get("data").and_then(|v| v.as_array());
 
+        if user_list.is_none() {
+            return Err("SSPanel user response has no users array".into());
+        }
         let mut users = Vec::new();
         if let Some(arr) = user_list {
             for item in arr {
@@ -94,10 +116,7 @@ impl SSPanelClient {
                         .and_then(|v| v.as_str())
                         .unwrap_or_default()
                         .to_string(),
-                    speed_limit: item
-                        .get("node_speedlimit")
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(0),
+                    speed_limit: crate::panel::types::speed_limit_bps(item.get("node_speedlimit"))?,
                     device_limit: item
                         .get("node_iplimit")
                         .and_then(|v| v.as_u64())
@@ -127,7 +146,12 @@ impl SSPanelClient {
             "{}/mod_mu/users/traffic?node_id={}&key={}",
             self.base_url, node_id, self.key
         );
-        let _ = self.client.post(&url).json(&traffic).send().await;
+        self.client
+            .post(&url)
+            .json(&traffic)
+            .send()
+            .await?
+            .error_for_status()?;
         Ok(())
     }
 

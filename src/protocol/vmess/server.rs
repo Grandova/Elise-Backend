@@ -1,10 +1,10 @@
-use crate::conn::{bind_tcp_listener, read_proxy_protocol, BoxedStream, ProxyProtocolMode};
-use crate::observability::AuditRecord;
-use crate::panel::types::{NodeInfo, User};
 use super::crypto::{
     create_vmess_response_header, decrypt_vmess_header, decrypt_vmess_header_length,
     VmessChunkDecrypter, VmessChunkEncrypter, VmessUserKeys, CMD_MUX, CMD_UDP,
 };
+use crate::conn::{bind_tcp_listener, read_proxy_protocol, BoxedStream, ProxyProtocolMode};
+use crate::observability::AuditRecord;
+use crate::panel::types::{NodeInfo, User};
 use crate::protocol::{Inbound, InboundContext};
 use crate::proxy::router::MatchContext;
 use crate::security::TLSManager;
@@ -109,8 +109,13 @@ impl Inbound for VmessInbound {
             ctx.defense.clone()
         };
 
+        let mut connections = tokio::task::JoinSet::new();
+        ctx.mark_ready();
         loop {
             tokio::select! {
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Connection task failed"); }
+                }
                 _ = shutdown_rx.recv() => {
                     info!("VMess inbound on port {} stopping", ctx.port);
                     break;
@@ -131,12 +136,14 @@ impl Inbound for VmessInbound {
                     let tls_manager = tls_manager.clone();
                     let sem = decrypt_semaphore.clone();
                     let def = vmess_defense.clone();
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let _ = handle_connection(stream, remote_addr, ctx, users, settings, tls_manager.as_deref(), force_md5, sem, def).await;
                     });
                 }
             }
         }
+        drop(listener);
+        crate::protocol::common::inbound::drain_connections(&mut connections).await;
         Ok(())
     }
 }
@@ -165,7 +172,10 @@ async fn handle_connection(
     let (src_opt, stream) = match read_proxy_protocol(stream, proxy_mode).await {
         Ok(res) => res,
         Err(e) => {
-            warn!("VMess: read_proxy_protocol failed from {}: {:?}", remote_addr, e);
+            warn!(
+                "VMess: read_proxy_protocol failed from {}: {:?}",
+                remote_addr, e
+            );
             return Ok(());
         }
     };
@@ -175,7 +185,10 @@ async fn handle_connection(
 
     let client_ip = remote_addr.ip();
     if vmess_defense.is_banned(client_ip) {
-        warn!("VMess: client_ip {} is banned by defense manager", client_ip);
+        warn!(
+            "VMess: client_ip {} is banned by defense manager",
+            client_ip
+        );
         return Ok(());
     }
 
@@ -195,8 +208,7 @@ async fn handle_connection(
         Err(e) => {
             warn!(
                 "VMess transport security handshake failed from {}: {:?}",
-                client_ip,
-                e
+                client_ip, e
             );
             return Ok(());
         }
@@ -208,30 +220,47 @@ async fn handle_connection(
         Err(e) => {
             warn!(
                 "VMess transport handshake failed from {}: {:?}",
-                client_ip,
-                e
+                client_ip, e
             );
             return Ok(());
         }
     };
 
-    info!("VMess: transport handshake completed successfully from {}", client_ip);
+    info!(
+        "VMess: transport handshake completed successfully from {}",
+        client_ip
+    );
 
     // 15-second handshake and outbound connection timeout
     let handshake_res = tokio::time::timeout(
         Duration::from_secs(15),
-        perform_vmess_handshake(stream, remote_addr, local_ip, &ctx, &users, force_md5, decrypt_semaphore, vmess_defense),
+        perform_vmess_handshake(
+            stream,
+            remote_addr,
+            local_ip,
+            &ctx,
+            &users,
+            force_md5,
+            decrypt_semaphore,
+            vmess_defense,
+        ),
     )
     .await;
 
     let handshake_data = match handshake_res {
         Ok(Ok(Some(data))) => data,
         Ok(Ok(None)) => {
-            warn!("VMess: perform_vmess_handshake returned None for {}", client_ip);
+            warn!(
+                "VMess: perform_vmess_handshake returned None for {}",
+                client_ip
+            );
             return Ok(());
         }
         Ok(Err(e)) => {
-            warn!("VMess: perform_vmess_handshake error from {}: {:?}", client_ip, e);
+            warn!(
+                "VMess: perform_vmess_handshake error from {}: {:?}",
+                client_ip, e
+            );
             return Ok(());
         }
         Err(_) => {
@@ -240,14 +269,22 @@ async fn handle_connection(
         }
     };
 
-    info!("VMess: handshake completed, entering forward_vmess_stream for {}", client_ip);
+    info!(
+        "VMess: handshake completed, entering forward_vmess_stream for {}",
+        client_ip
+    );
     // Forwarding phase: decoupled from 15-second handshake limit
     forward_vmess_stream(handshake_data, ctx).await
 }
 
+enum VmessOutbound {
+    Tcp(BoxedStream),
+    Udp(crate::proxy::router::outbound::UdpOutbound),
+}
+
 struct VmessHandshakeData {
     client_stream: BoxedStream,
-    out_stream: BoxedStream,
+    out_stream: VmessOutbound,
     user: User,
     client_ip: std::net::IpAddr,
     target_host: String,
@@ -282,7 +319,10 @@ async fn perform_vmess_handshake(
     // 1. Read VMess AEAD 16-byte Auth ID
     let mut auth_id = [0u8; 16];
     if let Err(e) = stream.read_exact(&mut auth_id).await {
-        warn!("VMess: failed to read 16-byte auth_id from {}: {:?}", client_ip, e);
+        warn!(
+            "VMess: failed to read 16-byte auth_id from {}: {:?}",
+            client_ip, e
+        );
         return Ok(None);
     }
     info!("VMess: read auth_id successfully from {}", client_ip);
@@ -307,13 +347,16 @@ async fn perform_vmess_handshake(
 
     // Slow path: acquire concurrency semaphore and scan remaining users
     if authed_entry.is_none() {
-        let _permit = decrypt_semaphore.acquire().await.map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::Interrupted, e)
-        })?;
+        let _permit = decrypt_semaphore
+            .acquire()
+            .await
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Interrupted, e))?;
         let guard = users.read();
         authed_entry = guard
             .iter()
-            .find(|(keys, u)| Some(u.id) != cached_user_id && keys.validate_auth_id(&auth_id, now_sec))
+            .find(|(keys, u)| {
+                Some(u.id) != cached_user_id && keys.validate_auth_id(&auth_id, now_sec)
+            })
             .map(|(keys, u)| (keys.cmd_key, u.clone()));
     }
 
@@ -325,14 +368,22 @@ async fn perform_vmess_handshake(
             (k, u)
         }
         None => {
-            warn!("VMess: user auth failed for client_ip {} (users count: {})", client_ip, users.read().len());
+            warn!(
+                "VMess: user auth failed for client_ip {} (users count: {})",
+                client_ip,
+                users.read().len()
+            );
             vmess_defense.record_failure(client_ip);
             return Ok(None);
         }
     };
 
     // Device limit check (async)
-    if !ctx.device_limiter.check_and_record_async(user.id, client_ip).await {
+    if !ctx
+        .device_limiter
+        .check_and_record_async(user.id, client_ip)
+        .await
+    {
         warn!("VMess: device limit rejected for user {}", user.id);
         return Ok(None);
     }
@@ -349,7 +400,10 @@ async fn perform_vmess_handshake(
     // 2. Read 18 bytes Encrypted Length + 8 bytes Connection Nonce
     let mut len_and_nonce = [0u8; 26];
     if let Err(e) = stream.read_exact(&mut len_and_nonce).await {
-        warn!("VMess: failed to read len_and_nonce from {}: {:?}", client_ip, e);
+        warn!(
+            "VMess: failed to read len_and_nonce from {}: {:?}",
+            client_ip, e
+        );
         return Ok(None);
     }
     let mut enc_len_block = [0u8; 18];
@@ -357,34 +411,39 @@ async fn perform_vmess_handshake(
     let mut conn_nonce = [0u8; 8];
     conn_nonce.copy_from_slice(&len_and_nonce[18..26]);
 
-    let header_len = match decrypt_vmess_header_length(&cmd_key, &auth_id, &conn_nonce, &enc_len_block) {
-        Ok(l) => l,
-        Err(e) => {
-            warn!("VMess: decrypt_vmess_header_length failed from {}: {:?}", client_ip, e);
-            return Ok(None);
-        }
-    };
+    let header_len =
+        match decrypt_vmess_header_length(&cmd_key, &auth_id, &conn_nonce, &enc_len_block) {
+            Ok(l) => l,
+            Err(e) => {
+                warn!(
+                    "VMess: decrypt_vmess_header_length failed from {}: {:?}",
+                    client_ip, e
+                );
+                return Ok(None);
+            }
+        };
     info!("VMess: decrypted header_len: {} bytes", header_len);
 
     let mut header_buf = vec![0u8; header_len + 16];
     if let Err(e) = stream.read_exact(&mut header_buf).await {
-        warn!("VMess: failed to read exact header_buf from {}: {:?}", client_ip, e);
+        warn!(
+            "VMess: failed to read exact header_buf from {}: {:?}",
+            client_ip, e
+        );
         return Ok(None);
     }
 
-    let req_header = match decrypt_vmess_header(
-        &cmd_key,
-        &auth_id,
-        &enc_len_block,
-        &conn_nonce,
-        &header_buf,
-    ) {
-        Ok(h) => h,
-        Err(e) => {
-            warn!("VMess: decrypt_vmess_header failed from {}: {:?}", client_ip, e);
-            return Ok(None);
-        }
-    };
+    let req_header =
+        match decrypt_vmess_header(&cmd_key, &auth_id, &enc_len_block, &conn_nonce, &header_buf) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    "VMess: decrypt_vmess_header failed from {}: {:?}",
+                    client_ip, e
+                );
+                return Ok(None);
+            }
+        };
 
     info!(
         "VMess: request header parsed: target={}:{}, cmd={}",
@@ -408,7 +467,10 @@ async fn perform_vmess_handshake(
     ) {
         Ok(r) => r,
         Err(e) => {
-            warn!("VMess: create_vmess_response_header failed from {}: {:?}", client_ip, e);
+            warn!(
+                "VMess: create_vmess_response_header failed from {}: {:?}",
+                client_ip, e
+            );
             return Ok(None);
         }
     };
@@ -423,7 +485,10 @@ async fn perform_vmess_handshake(
 
     // Audit check
     if ctx.audit.should_block(&target_host, target_ip, target_port) {
-        warn!("VMess: audit blocked target {}:{}", target_host, target_port);
+        warn!(
+            "VMess: audit blocked target {}:{}",
+            target_host, target_port
+        );
         return Ok(None);
     }
 
@@ -438,20 +503,21 @@ async fn perform_vmess_handshake(
     };
     let outbound = ctx.router.match_outbound(&mctx);
 
-    // Connect outbound
-    let out_stream = match ctx
-        .router
-        .dialer()
-        .dial(&outbound, &target_host, target_port, local_ip)
-        .await
-    {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("VMess: outbound dial failed to {}:{}: {:?}", target_host, target_port, e);
-            return Ok(None);
-        }
+    let out_stream = if is_udp {
+        VmessOutbound::Udp(
+            ctx.router
+                .dialer()
+                .dial_udp_outbound(&outbound, &target_host, target_port, local_ip)
+                .await?,
+        )
+    } else {
+        VmessOutbound::Tcp(Box::new(
+            ctx.router
+                .dialer()
+                .dial(&outbound, &target_host, target_port, local_ip)
+                .await?,
+        ))
     };
-    info!("VMess: outbound dial connected to {}:{}", target_host, target_port);
 
     let decrypter = match VmessChunkDecrypter::new(
         &req_header.request_body_key,
@@ -475,7 +541,7 @@ async fn perform_vmess_handshake(
 
     Ok(Some(VmessHandshakeData {
         client_stream: stream,
-        out_stream: Box::new(out_stream),
+        out_stream,
         user,
         client_ip,
         target_host,
@@ -507,111 +573,52 @@ async fn forward_vmess_stream(
     } = data;
 
     let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-    let (mut out_read, mut out_write) = tokio::io::split(out_stream);
+    let (tcp, udp) = match out_stream {
+        VmessOutbound::Tcp(stream) => (Some(tokio::io::split(stream)), None),
+        VmessOutbound::Udp(socket) => (None, Some(socket)),
+    };
+    let (mut out_read, mut out_write) = tcp.unzip();
 
     let start_time = Instant::now();
     let rate_limiter = ctx.rate_limiter.clone();
     let user_id = user.id;
 
-    info!("VMess: forward_vmess_stream active for user {} -> {}:{}", user_id, target_host, target_port);
+    info!(
+        "VMess: forward_vmess_stream active for user {} -> {}:{}",
+        user_id, target_host, target_port
+    );
 
     let is_auth_len = decrypter.is_authenticated_length();
-    let (down_tx, mut down_rx) = tokio::sync::oneshot::channel::<()>();
+    let idle = crate::conn::IdleTimeout::new(if is_udp {
+        ctx.global_config.udp_timeout
+    } else {
+        ctx.global_config.tcp_timeout
+    });
+
+    let traffic = crate::conn::TrafficGuard::new(user_id, ctx.on_traffic.clone());
+    let mut total_up = 0u64;
+    let mut total_down = 0u64;
 
     // Client -> Outbound (Decryption worker)
     let up_task = async {
         let mut len_block_18b = [0u8; 18];
         let mut len_block_2b = [0u8; 2];
         let mut payload_buf = vec![0u8; 65535];
-        let mut up = 0u64;
-        let mut down_finished = false;
 
         loop {
-            let chunk_len = if is_auth_len {
-                let read_timeout = if down_finished {
-                    Duration::from_millis(1000)
-                } else {
-                    Duration::from_secs(60)
-                };
-
-                let read_res: Option<std::io::Result<usize>> = if down_finished {
-                    tokio::time::timeout(read_timeout, client_read.read_exact(&mut len_block_18b)).await.ok()
-                } else {
-                    tokio::select! {
-                        biased;
-                        res = client_read.read_exact(&mut len_block_18b) => {
-                            Some(res)
-                        }
-                        _ = &mut down_rx => {
-                            down_finished = true;
-                            tokio::time::timeout(Duration::from_millis(1000), client_read.read_exact(&mut len_block_18b)).await.ok()
-                        }
-                        _ = tokio::time::sleep(read_timeout) => {
-                            None
-                        }
-                    }
-                };
-                match read_res {
-                    Some(Ok(_)) => {
-                        match decrypter.decrypt_length(&len_block_18b) {
-                            Ok(l) => l,
-                            Err(e) => {
-                                warn!("VMess: up_task decrypt_length error: {:?}", e);
-                                break;
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        info!("VMess: up_task client_read eof: {:?}", e);
-                        break;
-                    }
-                    None => {
-                        info!("VMess: up_task read timeout (down_finished={})", down_finished);
-                        break;
-                    }
-                }
+            let length = if is_auth_len {
+                &mut len_block_18b[..]
             } else {
-                let read_timeout = if down_finished {
-                    Duration::from_millis(1000)
-                } else {
-                    Duration::from_secs(60)
-                };
-
-                let read_res: Option<std::io::Result<usize>> = if down_finished {
-                    tokio::time::timeout(read_timeout, client_read.read_exact(&mut len_block_2b)).await.ok()
-                } else {
-                    tokio::select! {
-                        biased;
-                        res = client_read.read_exact(&mut len_block_2b) => {
-                            Some(res)
-                        }
-                        _ = &mut down_rx => {
-                            down_finished = true;
-                            tokio::time::timeout(Duration::from_millis(1000), client_read.read_exact(&mut len_block_2b)).await.ok()
-                        }
-                        _ = tokio::time::sleep(read_timeout) => {
-                            None
-                        }
-                    }
-                };
-                match read_res {
-                    Some(Ok(_)) => {
-                        match decrypter.decrypt_length(&len_block_2b) {
-                            Ok(l) => l,
-                            Err(e) => {
-                                warn!("VMess: up_task decrypt_length error: {:?}", e);
-                                break;
-                            }
-                        }
-                    }
-                    Some(Err(e)) => {
-                        info!("VMess: up_task client_read eof: {:?}", e);
-                        break;
-                    }
-                    None => {
-                        info!("VMess: up_task read timeout (down_finished={})", down_finished);
-                        break;
-                    }
+                &mut len_block_2b[..]
+            };
+            if idle.run(client_read.read_exact(length)).await.is_err() {
+                break;
+            }
+            let chunk_len = match decrypter.decrypt_length(length) {
+                Ok(length) => length,
+                Err(e) => {
+                    warn!(error = %e, "VMess invalid chunk length");
+                    break;
                 }
             };
 
@@ -621,11 +628,18 @@ async fn forward_vmess_stream(
                 break;
             }
             if chunk_len > payload_buf.len() {
-                warn!("VMess: up_task chunk_len {} exceeds payload_buf capacity {}", chunk_len, payload_buf.len());
+                warn!(
+                    "VMess: up_task chunk_len {} exceeds payload_buf capacity {}",
+                    chunk_len,
+                    payload_buf.len()
+                );
                 break;
             }
 
-            if let Err(e) = client_read.read_exact(&mut payload_buf[..chunk_len]).await {
+            if let Err(e) = idle
+                .run(client_read.read_exact(&mut payload_buf[..chunk_len]))
+                .await
+            {
                 warn!("VMess: up_task read_exact payload chunk failed: {:?}", e);
                 break;
             }
@@ -638,70 +652,95 @@ async fn forward_vmess_stream(
                 }
             };
 
+            if plain_len == 0 {
+                break;
+            }
             // Rate limiter enforcement
             rate_limiter.throttle(user_id, plain_len).await;
 
-            if let Err(e) = out_write.write_all(&payload_buf[..plain_len]).await {
+            let sent = match (&mut out_write, &udp) {
+                (Some(writer), _) => idle.run(writer.write_all(&payload_buf[..plain_len])).await,
+                (_, Some(socket)) => idle
+                    .run(socket.send(&payload_buf[..plain_len]))
+                    .await
+                    .map(|_| ()),
+                _ => unreachable!(),
+            };
+            if let Err(e) = sent {
                 warn!("VMess: up_task out_write failed: {:?}", e);
                 break;
             }
             let wire_header_len = if is_auth_len { 18 } else { 2 };
-            up += (wire_header_len + chunk_len) as u64;
+            total_up += (wire_header_len + chunk_len) as u64;
+            traffic.add((wire_header_len + chunk_len) as u64, 0);
         }
-        let _ = out_write.shutdown().await;
-        info!("VMess: up_task completed with {} bytes transferred", up);
-        up
+        if let Some(writer) = &mut out_write {
+            let _ = writer.shutdown().await;
+        }
+        info!(
+            "VMess: up_task completed with {} bytes transferred",
+            total_up
+        );
     };
 
     // Outbound -> Client (Encryption worker)
     let down_task = async {
-        let mut raw_buf = [0u8; 16384];
+        let mut raw_buf = vec![0u8; if is_udp { 65535 } else { 16384 }];
         let mut enc_buf = Vec::with_capacity(16384 + 128);
-        let mut down = 0u64;
         let mut chunk_count = 0u64;
 
         loop {
-            let read_res =
-                tokio::time::timeout(Duration::from_secs(60), out_read.read(&mut raw_buf)).await;
+            let read_res = idle
+                .run(async {
+                    match (&mut out_read, &udp) {
+                        (Some(reader), _) => reader.read(&mut raw_buf).await,
+                        (_, Some(socket)) => socket.recv(&mut raw_buf).await.map(|(n, _)| n),
+                        _ => unreachable!(),
+                    }
+                })
+                .await;
 
             let n = match read_res {
-                Ok(Ok(0)) => {
-                    info!("VMess: down_task target returned EOF after {} chunks", chunk_count);
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::debug!(error = %e,"VMess outbound read ended");
                     break;
                 }
-                Ok(Err(e)) => {
-                    warn!("VMess: down_task target read err after {} chunks: {:?}", chunk_count, e);
-                    break;
-                }
-                Err(_) => {
-                    warn!("VMess: down_task target read timeout 60s after {} chunks", chunk_count);
-                    break;
-                }
-                Ok(Ok(n)) => n,
             };
             chunk_count += 1;
 
             enc_buf.clear();
             if let Err(e) = encrypter.encrypt_chunk(&raw_buf[..n], &mut enc_buf) {
-                warn!("VMess: down_task encrypt_chunk err on chunk #{}: {:?}", chunk_count, e);
+                warn!(
+                    "VMess: down_task encrypt_chunk err on chunk #{}: {:?}",
+                    chunk_count, e
+                );
                 break;
             }
 
             // Rate limiter enforcement
             rate_limiter.throttle(user_id, enc_buf.len()).await;
 
-            if let Err(e) = client_write.write_all(&enc_buf).await {
-                warn!("VMess: down_task client_write err on chunk #{}: {:?}", chunk_count, e);
+            if let Err(e) = idle.run(client_write.write_all(&enc_buf)).await {
+                warn!(
+                    "VMess: down_task client_write err on chunk #{}: {:?}",
+                    chunk_count, e
+                );
                 break;
             }
-            down += enc_buf.len() as u64;
+            total_down += enc_buf.len() as u64;
+            traffic.add(0, enc_buf.len() as u64);
         }
 
         // Send VMess EOF chunk (0-byte payload) to signal stream termination
         enc_buf.clear();
         if let Ok(()) = encrypter.encrypt_chunk(&[], &mut enc_buf) {
-            info!("VMess: down_task writing VMess EOF chunk (len={})", enc_buf.len());
-            if let Err(e) = client_write.write_all(&enc_buf).await {
+            info!(
+                "VMess: down_task writing VMess EOF chunk (len={})",
+                enc_buf.len()
+            );
+            if let Err(e) = idle.run(client_write.write_all(&enc_buf)).await {
                 warn!("VMess: down_task write VMess EOF chunk failed: {:?}", e);
             } else {
                 info!("VMess: down_task write VMess EOF chunk succeeded");
@@ -722,12 +761,17 @@ async fn forward_vmess_stream(
             info!("VMess: down_task client_write.shutdown() succeeded");
         }
 
-        info!("VMess: down_task completed with {} bytes transferred in {} chunks", down, chunk_count);
-        let _ = down_tx.send(());
-        down
+        info!(
+            "VMess: down_task completed with {} bytes transferred in {} chunks",
+            total_down, chunk_count
+        );
     };
 
-    let (total_up, total_down) = tokio::join!(up_task, down_task);
+    if is_udp {
+        tokio::select! { _ = up_task => {}, _ = down_task => {} }
+    } else {
+        tokio::join!(up_task, down_task);
+    }
     info!(
         "VMess: stream forwarding ended for user {}, total_up={}, total_down={}",
         user_id, total_up, total_down
@@ -740,10 +784,6 @@ async fn forward_vmess_stream(
     }
 
     let duration = start_time.elapsed();
-
-    if total_up > 0 || total_down > 0 {
-        (ctx.on_traffic)(user.id, total_up, total_down);
-    }
 
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,

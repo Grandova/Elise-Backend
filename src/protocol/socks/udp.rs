@@ -23,7 +23,8 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
 ) -> io::Result<()> {
     info!(
         "SOCKS5 UDP ASSOCIATE: user={} client_ip={}",
-        user.id, meta.client_addr.ip()
+        user.id,
+        meta.client_addr.ip()
     );
 
     // 1. Allocate local UDP socket for client association
@@ -140,7 +141,10 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
             let target_port = u16::from_be_bytes([buf[port_idx], buf[port_idx + 1]]);
             let payload = buf[header_len..n].to_vec();
 
-            if in_ctx.audit.should_block(&target_host, target_ip, target_port) {
+            if in_ctx
+                .audit
+                .should_block(&target_host, target_ip, target_port)
+            {
                 continue;
             }
 
@@ -170,7 +174,10 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
                     {
                         Ok(s) => s,
                         Err(e) => {
-                            debug!("Failed to dial UDP outbound for SOCKS5 {}:{}: {:?}", target_host, target_port, e);
+                            debug!(
+                                "Failed to dial UDP outbound for SOCKS5 {}:{}: {:?}",
+                                target_host, target_port, e
+                            );
                             continue;
                         }
                     };
@@ -251,7 +258,10 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
 
     // TCP closed -> Immediately cancel UDP session and tear down sockets
     cancel_token.cancel();
-    debug!("SOCKS5 UDP ASSOCIATE TCP stream closed for client {}, association destroyed", meta.client_addr);
+    debug!(
+        "SOCKS5 UDP ASSOCIATE TCP stream closed for client {}, association destroyed",
+        meta.client_addr
+    );
 
     Ok(())
 }

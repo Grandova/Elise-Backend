@@ -52,7 +52,7 @@ impl EchKeyPair {
         contents.extend_from_slice(&1u16.to_be_bytes()); // AEAD: AES-128-GCM
         contents.extend_from_slice(&1u16.to_be_bytes()); // KDF: HKDF-SHA256
         contents.extend_from_slice(&3u16.to_be_bytes()); // AEAD: ChaCha20-Poly1305
-        // maximum_name_length: 0
+                                                         // maximum_name_length: 0
         contents.push(0);
         // public_name: 1 byte len + bytes
         let name_bytes = public_name.as_bytes();
@@ -173,8 +173,7 @@ impl EchKeyPair {
 
                     // Parse ECHConfig
                     if raw_ech_config.len() >= 4 {
-                        let version =
-                            u16::from_be_bytes([raw_ech_config[0], raw_ech_config[1]]);
+                        let version = u16::from_be_bytes([raw_ech_config[0], raw_ech_config[1]]);
                         if version != 0xfe0d {
                             return Err(format!(
                                 "unsupported ECH version 0x{version:04x}, expected 0xfe0d (draft-18)"
@@ -187,8 +186,7 @@ impl EchKeyPair {
                             let contents = &raw_ech_config[4..4 + content_len];
                             if contents.len() >= 7 {
                                 let config_id = contents[0];
-                                let kem_id =
-                                    u16::from_be_bytes([contents[1], contents[2]]);
+                                let kem_id = u16::from_be_bytes([contents[1], contents[2]]);
                                 if kem_id != 0x0020 {
                                     return Err(format!(
                                         "unsupported ECH KEM 0x{kem_id:04x}, expected 0x0020 (X25519)"
@@ -213,9 +211,7 @@ impl EchKeyPair {
                                         let public_name = std::str::from_utf8(
                                             &contents[offset + 2..offset + 2 + name_len],
                                         )
-                                        .map_err(|e| {
-                                            format!("invalid UTF-8 in public name: {e}")
-                                        })?
+                                        .map_err(|e| format!("invalid UTF-8 in public name: {e}"))?
                                         .to_string();
 
                                         let mut ech_config_list = Vec::new();

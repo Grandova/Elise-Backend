@@ -327,7 +327,9 @@ impl AuditController {
                     || v4.is_unspecified()
             }
             IpAddr::V6(v6) => {
-                v6.is_loopback()
+                v6.to_ipv4_mapped()
+                    .is_some_and(|v4| Self::is_private_ip(IpAddr::V4(v4)))
+                    || v6.is_loopback()
                     || v6.is_unspecified()
                     || (v6.segments()[0] & 0xfe00) == 0xfc00
                     || (v6.segments()[0] & 0xffc0) == 0xfe80
@@ -417,6 +419,24 @@ mod tests {
             true, // forbidden_bit_torrent
         );
 
+        for address in [
+            "127.2.3.4",
+            "10.1.2.3",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.1.1",
+            "::1",
+            "fe80::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+            "::ffff:10.1.2.3",
+        ] {
+            assert!(
+                controller.should_block("private.test", Some(address.parse().unwrap()), 80),
+                "{address}"
+            );
+        }
+
         // Test private IP
         let lan_ip = "192.168.1.1".parse::<IpAddr>().unwrap();
         assert!(controller.should_block("internal.local", Some(lan_ip), 80));
@@ -463,6 +483,8 @@ mod tests {
         assert!(controller.should_block_payload(b"GET /bad_path HTTP/1.1\r\n"));
 
         // Whitelist exempt priority: evil_exempt contains "evil", but matches whitelist
-        assert!(!controller.should_block_payload(b"POST /api HTTP/1.1\r\nHost: evil_exempt.com\r\n"));
+        assert!(
+            !controller.should_block_payload(b"POST /api HTTP/1.1\r\nHost: evil_exempt.com\r\n")
+        );
     }
 }

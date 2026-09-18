@@ -1,5 +1,25 @@
 use serde::{Deserialize, Serialize};
 
+pub(crate) fn speed_limit_bps(value: Option<&serde_json::Value>) -> std::io::Result<u64> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(0);
+    };
+    let mbps = value
+        .as_f64()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid panel speed limit")
+        })?;
+    let bytes = mbps * 125_000.0;
+    if !bytes.is_finite() || bytes >= u64::MAX as f64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Panel speed limit exceeds supported range",
+        ));
+    }
+    Ok(bytes.ceil() as u64)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct User {
     pub id: u32,
@@ -57,7 +77,12 @@ pub struct NodeInfo {
     pub custom_routes: Option<Vec<serde_json::Value>>,
     #[serde(default)]
     pub cert_config: Option<serde_json::Value>,
-    #[serde(default, alias = "networkSettings", alias = "transportSettings", alias = "transport_settings")]
+    #[serde(
+        default,
+        alias = "networkSettings",
+        alias = "transportSettings",
+        alias = "transport_settings"
+    )]
     pub network_settings: Option<serde_json::Value>,
     #[serde(default)]
     pub obfs: Option<String>,
@@ -139,4 +164,3 @@ pub struct NodeStatusReport {
     pub tasks_count: u32,
     pub kernel_status: bool,
 }
-

@@ -150,8 +150,9 @@ pub fn build_server_config(
             match &ech.server_keys {
                 Some(keys) if !keys.is_empty() => {
                     let outer_sni = config.server_name.as_deref().unwrap_or(default_sni);
-                    let ech_keypair = crate::security::EchKeyPair::from_pem_or_bytes(keys, outer_sni)
-                        .map_err(|e| format!("invalid ECH server_keys: {e}"))?;
+                    let ech_keypair =
+                        crate::security::EchKeyPair::from_pem_or_bytes(keys, outer_sni)
+                            .map_err(|e| format!("invalid ECH server_keys: {e}"))?;
                     tracing::info!(
                         "TLS Server ECH enabled: public_name='{}', config_id={}",
                         ech_keypair.public_name,

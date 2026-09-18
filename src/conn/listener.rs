@@ -18,7 +18,10 @@ pub async fn bind_tcp_listener(addr_str: &str, mptcp: bool) -> io::Result<TcpLis
     } else {
         let mut addrs = lookup_host(addr_str).await?;
         addrs.next().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::AddrNotAvailable, "Failed to resolve bind address")
+            io::Error::new(
+                io::ErrorKind::AddrNotAvailable,
+                "Failed to resolve bind address",
+            )
         })?
     };
 

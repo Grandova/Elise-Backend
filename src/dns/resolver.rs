@@ -72,7 +72,12 @@ impl DNSResolver {
         *self.rules_table.write() = table;
     }
 
-    pub fn update_config(&self, strategy: &str, cache_time_minutes: u64, default_dns: Option<&str>) {
+    pub fn update_config(
+        &self,
+        strategy: &str,
+        cache_time_minutes: u64,
+        default_dns: Option<&str>,
+    ) {
         *self.strategy.write() = strategy.to_string();
         *self.cache_ttl.write() = Duration::from_secs(cache_time_minutes.max(1) * 60);
         if let Some(d) = default_dns {
@@ -176,7 +181,8 @@ impl DNSResolver {
         // Level 2: dns.yml rule matching (with short-circuit behavior)
         let matched_servers = {
             let lock = self.rules_table.read();
-            lock.as_ref().and_then(|t| t.match_servers(host).map(|s| s.to_vec()))
+            lock.as_ref()
+                .and_then(|t| t.match_servers(host).map(|s| s.to_vec()))
         };
 
         if let Some(servers) = matched_servers {
@@ -198,7 +204,10 @@ impl DNSResolver {
         // Level 3: default_dns
         let default_servers = self.default_dns.read().clone();
         if !default_servers.is_empty() {
-            if let Ok(ips) = self.resolve_with_servers(&default_servers, host, &strategy).await {
+            if let Ok(ips) = self
+                .resolve_with_servers(&default_servers, host, &strategy)
+                .await
+            {
                 if !ips.is_empty() {
                     return Ok(ips);
                 }
@@ -297,4 +306,3 @@ impl DNSResolver {
         }
     }
 }
-

@@ -40,29 +40,11 @@ impl TokenBucket {
             false
         }
     }
-
-    fn compute_wait_time(&mut self, amount: usize) -> Option<Duration> {
-        let now = Instant::now();
-        self.replenish(now);
-
-        if self.tokens >= amount as f64 {
-            self.tokens -= amount as f64;
-            None
-        } else {
-            let deficit = (amount as f64) - self.tokens;
-            self.tokens = 0.0;
-            if self.rate_per_sec > 0.0 {
-                let secs = (deficit / self.rate_per_sec).min(5.0); // max 5s throttle sleep
-                Some(Duration::from_secs_f64(secs))
-            } else {
-                None
-            }
-        }
-    }
 }
 
 pub struct RateLimiter {
-    shards: [Mutex<HashMap<u32, TokenBucket>>; NUM_SHARDS],
+    shards: std::sync::Arc<[Mutex<HashMap<u32, TokenBucket>>; NUM_SHARDS]>,
+    changed: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl Default for RateLimiter {
@@ -74,7 +56,8 @@ impl Default for RateLimiter {
 impl RateLimiter {
     pub fn new() -> Self {
         Self {
-            shards: std::array::from_fn(|_| Mutex::new(HashMap::new())),
+            shards: std::sync::Arc::new(std::array::from_fn(|_| Mutex::new(HashMap::new()))),
+            changed: std::sync::Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -87,10 +70,20 @@ impl RateLimiter {
         let idx = self.shard_idx(user_id);
         let mut shard = self.shards[idx].lock();
         if speed_limit_bps > 0 {
-            shard.insert(user_id, TokenBucket::new(speed_limit_bps));
+            shard
+                .entry(user_id)
+                .and_modify(|bucket| {
+                    bucket.replenish(Instant::now());
+                    bucket.rate_per_sec = speed_limit_bps as f64;
+                    bucket.capacity = (bucket.rate_per_sec * 2.0).max(65536.0);
+                    bucket.tokens = bucket.tokens.min(bucket.capacity);
+                })
+                .or_insert_with(|| TokenBucket::new(speed_limit_bps));
         } else {
             shard.remove(&user_id);
         }
+        drop(shard);
+        self.changed.notify_waiters();
     }
 
     pub fn is_limited(&self, user_id: u32) -> bool {
@@ -109,24 +102,41 @@ impl RateLimiter {
     }
 
     pub async fn throttle(&self, user_id: u32, bytes: usize) {
-        let wait_opt = {
-            let idx = self.shard_idx(user_id);
-            let mut shard = self.shards[idx].lock();
-            shard
-                .get_mut(&user_id)
-                .and_then(|b| b.compute_wait_time(bytes))
-        };
-
-        if let Some(wait) = wait_opt {
-            tokio::time::sleep(wait).await;
+        let mut remaining = bytes;
+        while remaining > 0 {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            let wait = {
+                let mut shard = self.shards[self.shard_idx(user_id)].lock();
+                let Some(bucket) = shard.get_mut(&user_id) else {
+                    break;
+                };
+                let amount = remaining.min(bucket.capacity as usize);
+                if bucket.try_consume(amount) {
+                    remaining -= amount;
+                    None
+                } else {
+                    Some(Duration::from_secs_f64(
+                        (amount as f64 - bucket.tokens) / bucket.rate_per_sec,
+                    ))
+                }
+            };
+            if let Some(wait) = wait {
+                tokio::select! {
+                    _ = tokio::time::sleep(wait) => {},
+                    _ = &mut changed => {},
+                }
+            }
         }
     }
 
     pub fn prune_idle(&self) {
         let now = Instant::now();
-        for shard in &self.shards {
-            let mut map = shard.lock();
-            map.retain(|_, b| now.duration_since(b.last_update).as_secs() < 3600);
+        for shard in self.shards.iter() {
+            for bucket in shard.lock().values_mut() {
+                bucket.replenish(now);
+            }
         }
     }
 }
@@ -134,6 +144,52 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn concurrent_waiters_share_one_budget() {
+        let limiter = std::sync::Arc::new(RateLimiter::new());
+        limiter.set_user_limit(1, 8192);
+        assert!(limiter.allow(1, 65536));
+        let started = Instant::now();
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..4 {
+            let limiter = limiter.clone();
+            tasks.spawn(async move {
+                limiter.throttle(1, 16384).await;
+            });
+        }
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+        assert!(started.elapsed() >= Duration::from_millis(7900));
+    }
+
+    #[tokio::test]
+    async fn update_keeps_budget_and_removing_limit_wakes_waiters() {
+        let limiter = std::sync::Arc::new(RateLimiter::new());
+        limiter.set_user_limit(1, 1);
+        assert!(limiter.allow(1, 65536));
+        limiter.set_user_limit(1, 1);
+        assert!(!limiter.allow(1, 1));
+        let l = limiter.clone();
+        let task = tokio::spawn(async move {
+            l.throttle(1, 16).await;
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!task.is_finished());
+        limiter.set_user_limit(1, 0);
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        limiter.set_user_limit(1, 1);
+        {
+            let mut shard = limiter.shards[limiter.shard_idx(1)].lock();
+            shard.get_mut(&1).unwrap().last_update -= Duration::from_secs(7200);
+        }
+        limiter.prune_idle();
+        assert!(limiter.is_limited(1));
+    }
 
     #[tokio::test]
     async fn test_rate_limiter_sharded() {

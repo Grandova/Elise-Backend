@@ -764,11 +764,13 @@ impl Config {
             id: 0,
         };
         match state.try_handshake(&mut decoy, &mut inbound).await {
-            Ok(()) => Ok(crate::protocol::shadowsocks::transport::Accepted::Restls(Box::new(Session {
-                state,
-                inbound,
-                decoy,
-            }))),
+            Ok(()) => Ok(crate::protocol::shadowsocks::transport::Accepted::Restls(
+                Box::new(Session {
+                    state,
+                    inbound,
+                    decoy,
+                }),
+            )),
             Err(_) => {
                 // Replay only bytes still buffered locally; relayed batches were reset.
                 fn buffered(stream: TLSStream) -> crate::conn::BoxedStream {

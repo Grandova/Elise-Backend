@@ -16,7 +16,6 @@ use rand::RngCore;
 use std::collections::HashMap;
 use std::io::{self, Error, ErrorKind};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -33,7 +32,7 @@ struct ActiveUdpSession {
     key: [u8; 32],
     _state: Arc<Mutex<MieruSessionState>>,
     packet_tx: mpsc::Sender<Vec<u8>>,
-    last_activity: AtomicU64,
+    last_activity: Arc<parking_lot::Mutex<Instant>>,
 }
 
 pub async fn start_udp_server(
@@ -49,20 +48,18 @@ pub async fn start_udp_server(
     let active_sessions: Arc<RwLock<HashMap<(SocketAddr, u32), Arc<ActiveUdpSession>>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
-    // Periodic session cleanup task (removes inactive sessions > 60s)
+    let mut tasks = tokio::task::JoinSet::new();
+    let idle_timeout = ctx.global_config.udp_timeout;
     let cleaner_sessions = active_sessions.clone();
     let mut cleaner_shutdown = shutdown_rx.resubscribe();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(10));
         loop {
             tokio::select! {
                 _ = cleaner_shutdown.recv() => break,
                 _ = interval.tick() => {
-                    let now = Instant::now().elapsed().as_secs();
-                    let mut lock = cleaner_sessions.write();
-                    lock.retain(|_, s| {
-                        let last = s.last_activity.load(Ordering::Relaxed);
-                        now.saturating_sub(last) < 60
+                    cleaner_sessions.write().retain(|_, s| {
+                        idle_timeout == 0 || s.last_activity.lock().elapsed() < Duration::from_secs(idle_timeout)
                     });
                 }
             }
@@ -71,8 +68,12 @@ pub async fn start_udp_server(
 
     let mut recv_buf = vec![0u8; 65536];
 
+    ctx.mark_ready();
     loop {
         tokio::select! {
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(e)) = result { warn!(error = %e, "Mieru UDP task failed"); }
+            }
             _ = shutdown_rx.recv() => {
                 info!("Mieru UDP inbound on port {} stopping", ctx.port);
                 break;
@@ -97,7 +98,7 @@ pub async fn start_udp_server(
                 let pattern_clone = pattern.clone();
                 let sessions_clone = active_sessions.clone();
 
-                tokio::spawn(async move {
+                tasks.spawn(async move {
                     let _ = handle_udp_packet(
                         packet,
                         remote_addr,
@@ -112,6 +113,8 @@ pub async fn start_udp_server(
         }
     }
 
+    active_sessions.write().clear();
+    crate::protocol::common::inbound::drain_connections(&mut tasks).await;
     Ok(())
 }
 
@@ -158,7 +161,7 @@ async fn handle_udp_packet(
             {
                 let session_id = u32::from_be_bytes(meta_buf[6..10].try_into().unwrap());
                 if session_id == session.session_id {
-                    session.last_activity.store(Instant::now().elapsed().as_secs(), Ordering::Relaxed);
+                    *session.last_activity.lock() = Instant::now();
                     let _ = session.packet_tx.send(packet).await;
                     return Ok(());
                 }
@@ -215,7 +218,11 @@ async fn handle_udp_packet(
     }
 
     // Check device and conn limits
-    if !ctx.device_limiter.check_and_record_async(user.panel_user.id, client_ip).await {
+    if !ctx
+        .device_limiter
+        .check_and_record_async(user.panel_user.id, client_ip)
+        .await
+    {
         return Ok(());
     }
     let conn_guard = match ctx.conn_limiter.try_acquire(user.panel_user.id) {
@@ -243,7 +250,12 @@ async fn handle_udp_packet(
     let mut resp_buf = resp_meta.to_vec();
     let resp_tag = cipher
         .encrypt_in_place_detached(XNonce::from_slice(&send_nonce), b"", &mut resp_buf)
-        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Meta encrypt failed: {:?}", e)))?;
+        .map_err(|e| {
+            Error::new(
+                ErrorKind::InvalidData,
+                format!("Meta encrypt failed: {:?}", e),
+            )
+        })?;
 
     let mut resp_pkt = Vec::with_capacity(24 + 32 + 16);
     resp_pkt.extend_from_slice(&send_nonce);
@@ -262,10 +274,12 @@ async fn handle_udp_packet(
         key,
         _state: shared_state.clone(),
         packet_tx,
-        last_activity: AtomicU64::new(Instant::now().elapsed().as_secs()),
+        last_activity: Arc::new(parking_lot::Mutex::new(Instant::now())),
     });
 
-    sessions.write().insert((remote_addr, session_id), active_session.clone());
+    sessions
+        .write()
+        .insert((remote_addr, session_id), active_session.clone());
 
     // 5. Connect session to relay using duplex virtual stream
     let (duplex_client, duplex_server) = tokio::io::duplex(65536);
@@ -277,36 +291,39 @@ async fn handle_udp_packet(
         client_tx.flush().await?;
     }
 
-    // Spawn SOCKS5 relay task
-    let user_panel = user.panel_user.clone();
-    let ctx_relay = ctx.clone();
-    tokio::spawn(async move {
-        let _ = handle_socks5_session(server_rx, server_tx, user_panel, client_ip, ctx_relay, conn_guard).await;
-    });
-
-    // Bridge duplex stream to UDP packets
-    let socket_send = socket.clone();
-    let pattern_runner = (*pattern).clone();
-    let sessions_clean = sessions.clone();
+    let activity = active_session.last_activity.clone();
+    let identity = Arc::downgrade(&active_session);
+    drop(active_session);
+    let relay = handle_socks5_session(
+        server_rx,
+        server_tx,
+        user.panel_user.clone(),
+        client_ip,
+        ctx,
+        conn_guard,
+    );
+    let bridge = run_udp_session_bridge(
+        packet_rx,
+        client_rx,
+        client_tx,
+        socket,
+        remote_addr,
+        session_id,
+        key,
+        shared_state,
+        (*pattern).clone(),
+        activity,
+    );
+    let _ = tokio::join!(relay, bridge);
     let session_key = (remote_addr, session_id);
-
-    tokio::spawn(async move {
-        let _ = run_udp_session_bridge(
-            packet_rx,
-            client_rx,
-            client_tx,
-            socket_send,
-            remote_addr,
-            session_id,
-            key,
-            shared_state,
-            pattern_runner,
-        )
-        .await;
-
-        sessions_clean.write().remove(&session_key);
-        debug!("Mieru UDP session {} closed", session_id);
-    });
+    let mut sessions = sessions.write();
+    if sessions
+        .get(&session_key)
+        .is_some_and(|s| identity.ptr_eq(&Arc::downgrade(s)))
+    {
+        sessions.remove(&session_key);
+    }
+    debug!("Mieru UDP session {} closed", session_id);
 
     Ok(())
 }
@@ -321,6 +338,7 @@ async fn run_udp_session_bridge(
     key: [u8; 32],
     state: Arc<Mutex<MieruSessionState>>,
     pattern: TrafficPatternExecutor,
+    activity: Arc<parking_lot::Mutex<Instant>>,
 ) -> io::Result<()> {
     let cipher = XChaCha20Poly1305::new_from_slice(&key)
         .map_err(|_| Error::new(ErrorKind::InvalidData, "Cipher init failed"))?;
@@ -332,7 +350,11 @@ async fn run_udp_session_bridge(
     let state_down = state.clone();
     let cipher_down = cipher.clone();
     let down_task = async move {
-        while let Some(packet) = packet_rx.recv().await {
+        loop {
+            let packet = tokio::select! {
+                _ = down_cancel.cancelled() => break,
+                packet = packet_rx.recv() => match packet { Some(packet) => packet, None => break },
+            };
             if packet.len() < 72 {
                 continue;
             }
@@ -358,17 +380,27 @@ async fn run_udp_session_bridge(
             match proto {
                 PROTOCOL_DATA_C2S => {
                     let prefix_len = meta_buf[21] as usize;
-                    let payload_len = u16::from_be_bytes(meta_buf[22..24].try_into().unwrap()) as usize;
+                    let payload_len =
+                        u16::from_be_bytes(meta_buf[22..24].try_into().unwrap()) as usize;
                     let payload_offset = 72 + prefix_len;
 
                     if payload_len > 0 && packet.len() >= payload_offset + payload_len + OVERHEAD {
-                        let mut p_buf = packet[payload_offset..payload_offset + payload_len].to_vec();
-                        let p_tag = XTag::from_slice(&packet[payload_offset + payload_len..payload_offset + payload_len + OVERHEAD]);
+                        let mut p_buf =
+                            packet[payload_offset..payload_offset + payload_len].to_vec();
+                        let p_tag = XTag::from_slice(
+                            &packet[payload_offset + payload_len
+                                ..payload_offset + payload_len + OVERHEAD],
+                        );
                         let mut p_nonce = nonce;
                         increment_nonce(&mut p_nonce);
 
                         if cipher_down
-                            .decrypt_in_place_detached(XNonce::from_slice(&p_nonce), b"", &mut p_buf, p_tag)
+                            .decrypt_in_place_detached(
+                                XNonce::from_slice(&p_nonce),
+                                b"",
+                                &mut p_buf,
+                                p_tag,
+                            )
                             .is_ok()
                         {
                             if client_tx.write_all(&p_buf).await.is_err() {
@@ -381,23 +413,36 @@ async fn run_udp_session_bridge(
                 PROTOCOL_DATA_C2S_LOW_ENTROPY => {
                     let mode = meta_buf[1] as i32;
                     let prefix_len = meta_buf[21] as usize;
-                    let payload_len = u16::from_be_bytes(meta_buf[22..24].try_into().unwrap()) as usize;
+                    let payload_len =
+                        u16::from_be_bytes(meta_buf[22..24].try_into().unwrap()) as usize;
                     let half_mask = u32::from_be_bytes(meta_buf[25..29].try_into().unwrap());
-                    let extracted_len = u16::from_be_bytes(meta_buf[29..31].try_into().unwrap()) as usize;
+                    let extracted_len =
+                        u16::from_be_bytes(meta_buf[29..31].try_into().unwrap()) as usize;
                     let rotation = meta_buf[31] as i32;
                     let payload_offset = 72 + prefix_len;
 
                     if payload_len > 0 && packet.len() >= payload_offset + payload_len + OVERHEAD {
-                        let mut p_buf = packet[payload_offset..payload_offset + payload_len].to_vec();
-                        let p_tag = XTag::from_slice(&packet[payload_offset + payload_len..payload_offset + payload_len + OVERHEAD]);
+                        let mut p_buf =
+                            packet[payload_offset..payload_offset + payload_len].to_vec();
+                        let p_tag = XTag::from_slice(
+                            &packet[payload_offset + payload_len
+                                ..payload_offset + payload_len + OVERHEAD],
+                        );
                         let mut p_nonce = nonce;
                         increment_nonce(&mut p_nonce);
 
                         if cipher_down
-                            .decrypt_in_place_detached(XNonce::from_slice(&p_nonce), b"", &mut p_buf, p_tag)
+                            .decrypt_in_place_detached(
+                                XNonce::from_slice(&p_nonce),
+                                b"",
+                                &mut p_buf,
+                                p_tag,
+                            )
                             .is_ok()
                         {
-                            if let Ok(raw) = decode_low_entropy(&p_buf, extracted_len, mode, half_mask, rotation) {
+                            if let Ok(raw) =
+                                decode_low_entropy(&p_buf, extracted_len, mode, half_mask, rotation)
+                            {
                                 if client_tx.write_all(&raw).await.is_err() {
                                     break;
                                 }
@@ -495,6 +540,7 @@ async fn run_udp_session_bridge(
                     if socket.send_to(&pkt, remote_addr).await.is_err() {
                         break;
                     }
+                    *activity.lock() = Instant::now();
                     tokio::time::sleep(Duration::from_micros(150)).await;
                 }
             }

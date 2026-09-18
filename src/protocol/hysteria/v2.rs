@@ -12,7 +12,6 @@ use super::qpack::{
 };
 use super::transport::{build_hysteria_tls_config, create_hysteria_endpoint, QuicStream};
 use crate::conn::MonitoredStream;
-use crate::limiter::ConnGuard;
 use crate::observability::AuditRecord;
 use crate::panel::types::{NodeInfo, User};
 use crate::protocol::{Inbound, InboundContext};
@@ -282,9 +281,14 @@ impl Inbound for Hysteria2Inbound {
 
         let users = self.users.clone();
         let cancel_token = CancellationToken::new();
+        let mut connections = tokio::task::JoinSet::new();
 
+        ctx.mark_ready();
         loop {
             tokio::select! {
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Hysteria2 connection task failed"); }
+                }
                 _ = shutdown_rx.recv() => {
                     info!("Hysteria v2 inbound on port {} shutting down", port);
                     cancel_token.cancel();
@@ -298,7 +302,7 @@ impl Inbound for Hysteria2Inbound {
                     let node_info = node_info.clone();
                     let cancel = cancel_token.clone();
 
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         if let Err(e) = handle_hy2_connection(incoming, users, ctx, node_info, cancel).await {
                             debug!("Hysteria v2 connection finished: {:?}", e);
                         }
@@ -307,6 +311,9 @@ impl Inbound for Hysteria2Inbound {
             }
         }
 
+        cancel_token.cancel();
+        endpoint.close(0u32.into(), b"server shutdown");
+        crate::protocol::common::inbound::drain_connections(&mut connections).await;
         Ok(())
     }
 }
@@ -335,7 +342,9 @@ async fn handle_hy2_connection(
     let _server_send_bps = node_info.up_mbps.unwrap_or(0) as u64 * 1_000_000;
     let server_recv_bps = node_info.down_mbps.unwrap_or(0) as u64 * 1_000_000;
 
-    let conn_cancel = CancellationToken::new();
+    let conn_cancel = global_cancel.child_token();
+    let _cancel = conn_cancel.clone().drop_guard();
+    let mut tasks = tokio::task::JoinSet::new();
 
     // Send HTTP/3 Server Control Stream (Uni-stream 0x00 + SETTINGS 0x04)
     // RFC 9114 Section 6.2.1: Control Stream MUST NOT be closed at any point during connection.
@@ -344,7 +353,7 @@ async fn handle_hy2_connection(
         let _ = uni.flush().await;
         let ctrl_cancel = conn_cancel.clone();
         let ctrl_global = global_cancel.clone();
-        tokio::spawn(async move {
+        tasks.spawn(async move {
             tokio::select! {
                 _ = ctrl_cancel.cancelled() => {},
                 _ = ctrl_global.cancelled() => {},
@@ -357,26 +366,31 @@ async fn handle_hy2_connection(
     let uni_conn = conn.clone();
     let uni_cancel = conn_cancel.clone();
     let uni_global_cancel = global_cancel.clone();
-    tokio::spawn(async move {
+    tasks.spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Hysteria2 stream task failed"); }
+                }
                 _ = uni_cancel.cancelled() => break,
                 _ = uni_global_cancel.cancelled() => break,
                 res = uni_conn.accept_uni() => {
                     let Ok(mut stream) = res else { break; };
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         let mut buf = [0u8; 1024];
                         while let Ok(Some(_)) = stream.read(&mut buf).await {}
                     });
                 }
             }
         }
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
     });
 
     let auth_done = Arc::new(Notify::new());
     let auth_ok = Arc::new(AtomicBool::new(false));
     let authenticated_user: Arc<Mutex<Option<User>>> = Arc::new(Mutex::new(None));
-    let conn_guard: Arc<Mutex<Option<ConnGuard>>> = Arc::new(Mutex::new(None));
 
     let udp_sessions: Arc<Mutex<HashMap<u32, mpsc::Sender<(String, Vec<u8>)>>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -393,9 +407,13 @@ async fn handle_hy2_connection(
     let dg_remote = remote_addr;
     let dg_global_cancel = global_cancel.clone();
 
-    tokio::spawn(async move {
+    tasks.spawn(async move {
+        let mut tasks = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                result = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Hysteria2 UDP task failed"); }
+                }
                 _ = dg_cancel.cancelled() => break,
                 _ = dg_global_cancel.cancelled() => break,
                 dg_res = dg_conn.read_datagram() => {
@@ -450,9 +468,9 @@ async fn handle_hy2_connection(
                             let s_ctx = dg_ctx.clone();
                             let s_conn = dg_conn.clone();
                             let s_sessions = dg_sessions.clone();
-                            let s_cancel = dg_cancel.clone();
+                            let s_cancel = dg_cancel.child_token();
 
-                            tokio::spawn(async move {
+                            tasks.spawn(async move {
                                 handle_hy2_udp_session(
                                     session_id,
                                     rx,
@@ -469,11 +487,16 @@ async fn handle_hy2_connection(
                 }
             }
         }
+        dg_cancel.cancel();
+        crate::protocol::common::inbound::drain_connections(&mut tasks).await;
     });
 
     // Accept Bidi Streams (HTTP/3 Request Streams OR Hysteria2 0x401 TCP Proxy Streams)
-    loop {
+    let result = loop {
         tokio::select! {
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(e)) = result { tracing::warn!(error = %e, "Hysteria2 session task failed"); }
+            }
             _ = conn_cancel.cancelled() => break Ok(()),
             _ = global_cancel.cancelled() => break Ok(()),
             bi_res = conn.accept_bi() => {
@@ -493,10 +516,13 @@ async fn handle_hy2_connection(
                     let c_ctx = ctx.clone();
                     let c_remote = remote_addr;
 
-                    tokio::spawn(async move {
+                    tasks.spawn(async move {
                         // Wait for authentication if not yet complete (timeout 10s)
+                        let notified = a_done.notified();
+                        tokio::pin!(notified);
+                        notified.as_mut().enable();
                         if !a_ok.load(Ordering::Acquire) {
-                            let wait_res = tokio::time::timeout(Duration::from_secs(10), a_done.notified()).await;
+                            let wait_res = tokio::time::timeout(Duration::from_secs(10), notified).await;
                             if wait_res.is_err() || !a_ok.load(Ordering::Acquire) {
                                 let _ = send.finish();
                                 return;
@@ -613,15 +639,6 @@ async fn handle_hy2_connection(
                             continue;
                         }
 
-                        let guard = match ctx.conn_limiter.try_acquire(user.id) {
-                            Some(g) => g,
-                            None => {
-                                conn.close(1u32.into(), b"connection limit reached");
-                                continue;
-                            }
-                        };
-
-                        *conn_guard.lock() = Some(guard);
                         *authenticated_user.lock() = Some(user);
                         auth_ok.store(true, Ordering::Release);
                         auth_done.notify_waiters();
@@ -646,7 +663,11 @@ async fn handle_hy2_connection(
                 }
             }
         }
-    }
+    };
+    conn_cancel.cancel();
+    conn.close(0u32.into(), b"session closed");
+    crate::protocol::common::inbound::drain_connections(&mut tasks).await;
+    result
 }
 
 async fn send_masquerade_404(send: &mut quinn::SendStream, _conn: &quinn::Connection) {
@@ -679,6 +700,9 @@ async fn handle_hy2_tcp_stream(
     target_host: String,
     target_port: u16,
 ) -> io::Result<()> {
+    let _guard = ctx.conn_limiter.try_acquire(user.id).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::PermissionDenied, "Connection limit reached")
+    })?;
     let client_ip = remote_addr.ip();
     let target_ip: Option<IpAddr> = target_host.parse().ok();
 
@@ -751,6 +775,7 @@ async fn handle_hy2_tcp_stream(
     stream.write_all(&ok_resp).await?;
 
     let mut client_conn = MonitoredStream::new(stream, user.id, remote_addr);
+    let _traffic = client_conn.traffic_guard(ctx.on_traffic.clone());
     let start_time = Instant::now();
 
     let _ = crate::conn::copy_bidirectional_throttled(
@@ -758,15 +783,12 @@ async fn handle_hy2_tcp_stream(
         &mut out_stream,
         user.id,
         Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
     )
     .await;
 
     let duration = start_time.elapsed();
     let (up, down) = client_conn.stats();
-
-    if up > 0 || down > 0 {
-        (ctx.on_traffic)(user.id, up, down);
-    }
 
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,
@@ -799,140 +821,88 @@ async fn handle_hy2_udp_session(
     remote_addr: SocketAddr,
     session_cancel: CancellationToken,
 ) {
-    let start_time = Instant::now();
-    let client_ip = remote_addr.ip();
-    let mut total_up = 0u64;
-    let mut total_down = 0u64;
-
-    // Allocate dedicated unconnected UDP socket for Full Cone NAT
-    let socket = match tokio::net::UdpSocket::bind("0.0.0.0:0").await {
-        Ok(s) => Arc::new(s),
-        Err(e) => {
-            debug!("Hysteria v2 failed to bind dedicated UDP socket: {:?}", e);
-            return;
-        }
-    };
-
-    let resp_socket = socket.clone();
-    let resp_conn = conn.clone();
-    let resp_cancel = session_cancel.clone();
-    let (down_tx, mut down_rx) = mpsc::channel::<usize>(128);
-
-    // Downlink task: recv_from -> package Hysteria 2 Datagram -> send to client
-    tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
-        let mut packet_id: u16 = 1;
-        let max_dg_size = resp_conn.max_datagram_size().unwrap_or(1200);
-
-        loop {
-            tokio::select! {
-                _ = resp_cancel.cancelled() => break,
-                recv_res = resp_socket.recv_from(&mut buf) => {
-                    let Ok((n, src_addr)) = recv_res else { break; };
-                    if n == 0 { continue; }
-
-                    let data = &buf[..n];
-                    let pkt_id = packet_id;
-                    packet_id = packet_id.wrapping_add(1);
-
-                    // True source address!
-                    let resp_dest = src_addr.to_string();
-                    let dest_bytes = resp_dest.as_bytes();
-                    let header_len = 8 + quic_varint_len(dest_bytes.len() as u64) + dest_bytes.len();
-
-                    if n + header_len <= max_dg_size {
-                        // Single datagram
-                        let mut dg = Vec::with_capacity(header_len + n);
-                        dg.extend_from_slice(&session_id.to_be_bytes());
-                        dg.extend_from_slice(&pkt_id.to_be_bytes());
-                        dg.push(0); // frag_id = 0
-                        dg.push(1); // frag_total = 1
-                        let _ = write_quic_varint(&mut dg, dest_bytes.len() as u64);
-                        dg.extend_from_slice(dest_bytes);
-                        dg.extend_from_slice(data);
-
-                        let _ = resp_conn.send_datagram(dg.into());
-                        let _ = down_tx.send(n).await;
-                    } else {
-                        // Fragmented datagrams
-                        let max_chunk = max_dg_size.saturating_sub(header_len);
-                        if max_chunk == 0 { continue; }
-                        let chunks: Vec<&[u8]> = data.chunks(max_chunk).collect();
-                        let total_frags = chunks.len() as u8;
-
-                        for (i, chunk) in chunks.into_iter().enumerate() {
-                            let mut dg = Vec::with_capacity(header_len + chunk.len());
-                            dg.extend_from_slice(&session_id.to_be_bytes());
-                            dg.extend_from_slice(&pkt_id.to_be_bytes());
-                            dg.push(i as u8);
-                            dg.push(total_frags);
-                            let _ = write_quic_varint(&mut dg, dest_bytes.len() as u64);
-                            dg.extend_from_slice(dest_bytes);
-                            dg.extend_from_slice(chunk);
-
-                            if resp_conn.send_datagram(dg.into()).is_err() {
-                                break;
-                            }
-                        }
-                        let _ = down_tx.send(n).await;
-                    }
-                }
-            }
-        }
+    let _cancel = session_cancel.clone().drop_guard();
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut sessions: HashMap<(String, u16), mpsc::Sender<Vec<u8>>> = HashMap::new();
+    let (responses, mut response_rx) = mpsc::channel::<(
+        Vec<u8>,
+        shadowsocks::relay::socks5::Address,
+        tokio::sync::oneshot::Sender<()>,
+    )>(256);
+    let idle_timeout = Duration::from_secs(if ctx.global_config.udp_timeout == 0 {
+        u32::MAX as u64
+    } else {
+        ctx.global_config.udp_timeout
     });
-
-    // Uplink loop: receive from client datagram channel -> dynamic route -> sendto
-    let idle_timeout = Duration::from_secs(60);
+    let idle = tokio::time::sleep(idle_timeout);
+    tokio::pin!(idle);
+    let mut packet_id = 0u16;
     loop {
         tokio::select! {
             _ = session_cancel.cancelled() => break,
-            _ = tokio::time::sleep(idle_timeout) => break,
-            Some(down_n) = down_rx.recv() => {
-                total_down += down_n as u64;
+            _ = &mut idle => break,
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(e)) = result { tracing::warn!(error = %e, "Hysteria2 UDP outbound task failed"); }
+            }
+            response = response_rx.recv() => {
+                let Some((data, address, ack)) = response else { break; };
+                let destination = address.to_string();
+                let dest_bytes = destination.as_bytes();
+                let header_len = 8 + quic_varint_len(dest_bytes.len() as u64) + dest_bytes.len();
+                let max_chunk = conn.max_datagram_size().unwrap_or(1200).saturating_sub(header_len);
+                if max_chunk == 0 { continue; }
+                let count = data.len().max(1).div_ceil(max_chunk);
+                if count > u8::MAX as usize { continue; }
+                packet_id = packet_id.wrapping_add(1);
+                let mut sent_all = true;
+                for i in 0..count {
+                    let start = i * max_chunk;
+                    let chunk = &data[start..(start + max_chunk).min(data.len())];
+                    let mut packet = Vec::with_capacity(header_len + chunk.len());
+                    packet.extend_from_slice(&session_id.to_be_bytes());
+                    packet.extend_from_slice(&packet_id.to_be_bytes());
+                    packet.push(i as u8);
+                    packet.push(count as u8);
+                    let _ = write_quic_varint(&mut packet, dest_bytes.len() as u64);
+                    packet.extend_from_slice(dest_bytes);
+                    packet.extend_from_slice(chunk);
+                    if conn.send_datagram(packet.into()).is_err() { sent_all = false; break; }
+                }
+                if sent_all {
+                    let _ = ack.send(());
+                    idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
+                }
             }
             packet = packet_rx.recv() => {
-                let Some((dest, data)) = packet else { break; };
-                let (host, port) = parse_host_port(&dest);
-                let target_ip = host.parse().ok();
-
-                if ctx.audit.should_block(&host, target_ip, port) {
-                    continue;
+                let Some((destination, data)) = packet else { break; };
+                let key = parse_host_port(&destination);
+                if key.1 == 0 { continue; }
+                if sessions.get(&key).is_none_or(|tx| tx.is_closed()) {
+                    let session = match crate::conn::udp::UdpSession::connect(
+                        ctx.clone(), user.id, remote_addr, key.0.clone(), key.1, None, "hysteria2",
+                    ).await {
+                        Ok(session) => session,
+                        Err(e) => { debug!(error = %e, "Hysteria2 UDP rejected"); continue; }
+                    };
+                    let (tx, requests) = mpsc::channel(256);
+                    sessions.insert(key.clone(), tx);
+                    let responses = responses.clone();
+                    let cancel = session_cancel.clone();
+                    tasks.spawn(async move { let _ = session.relay(requests, responses, cancel).await; });
                 }
-
-                ctx.rate_limiter.throttle(user.id, data.len()).await;
-
-                if let Ok(mut resolved) = tokio::net::lookup_host(format!("{}:{}", host, port)).await {
-                    if let Some(target_sock) = resolved.next() {
-                        if socket.send_to(&data, target_sock).await.is_ok() {
-                            total_up += data.len() as u64;
-                        }
+                if let Some(tx) = sessions.get(&key) {
+                    tokio::select! {
+                        _ = session_cancel.cancelled() => break,
+                        _ = &mut idle => break,
+                        _ = tx.send(data) => {},
                     }
                 }
+                idle.as_mut().reset(tokio::time::Instant::now() + idle_timeout);
             }
         }
     }
-
     session_cancel.cancel();
-    let duration = start_time.elapsed();
-
-    if total_up > 0 || total_down > 0 {
-        (ctx.on_traffic)(user.id, total_up, total_down);
-    }
-
-    ctx.audit_logger.record(AuditRecord::new(
-        ctx.node_id,
-        user.id,
-        "hysteria2",
-        "udp",
-        &client_ip.to_string(),
-        "dynamic",
-        0,
-        total_up,
-        total_down,
-        duration.as_millis() as i64,
-        "direct",
-        "connected",
-    ));
+    while tasks.join_next().await.is_some() {}
 }
 
 // ============================================================================

@@ -98,6 +98,8 @@ impl MasterServer {
             self.global_config.forbidden_bit_torrent,
         ));
 
+        router.dialer().set_audit(audit.clone());
+
         let defense = Arc::new(AttackDefenseManager::default());
 
         let tls_manager = Arc::new(TLSManager::new(
@@ -159,11 +161,19 @@ impl MasterServer {
             self.shutdown_tx.subscribe(),
         );
 
-        // Wait for OS termination signal
+        let mut shutdown = self.shutdown_tx.subscribe();
+        #[cfg(unix)]
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                info!("Ctrl+C received, shutting down Elise MasterServer...");
-            }
+            _ = tokio::signal::ctrl_c() => info!("SIGINT received, shutting down Elise MasterServer..."),
+            _ = shutdown.recv() => {},
+            _ = async {
+                #[cfg(unix)]
+                terminate.recv().await;
+                #[cfg(not(unix))]
+                std::future::pending::<()>().await;
+            } => info!("SIGTERM received, shutting down Elise MasterServer..."),
         }
 
         let _ = self.shutdown_tx.send(());
@@ -197,4 +207,3 @@ fn find_nodes_dir() -> std::path::PathBuf {
     }
     standard
 }
-

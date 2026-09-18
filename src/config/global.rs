@@ -416,21 +416,35 @@ impl GlobalConfig {
             }
 
             "out_ip_ipv4" => {
-                self.out_ip_ipv4 = if val.is_empty() { None } else { Some(val.to_string()) }
+                self.out_ip_ipv4 = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                }
             }
             "out_ip_ipv6" => {
-                self.out_ip_ipv6 = if val.is_empty() { None } else { Some(val.to_string()) }
+                self.out_ip_ipv6 = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                }
             }
-            "auto_out_ip" => {
-                self.auto_out_ip = val.eq_ignore_ascii_case("true") || val == "1"
-            }
+            "auto_out_ip" => self.auto_out_ip = val.eq_ignore_ascii_case("true") || val == "1",
             "dns_strategy" => self.dns_strategy = val.to_lowercase(),
 
             "redis_url" => {
-                self.redis_url = if val.is_empty() { None } else { Some(val.to_string()) }
+                self.redis_url = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                }
             }
             "redis_addr" => {
-                self.redis_addr = if val.is_empty() { None } else { Some(val.to_string()) };
+                self.redis_addr = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
             }
             "device_limit_window" => {
                 if let Ok(n) = val.parse::<u64>() {
@@ -518,7 +532,11 @@ impl GlobalConfig {
                 self.mptcp = val.eq_ignore_ascii_case("true") || val == "1";
             }
             "default_dns" => {
-                self.default_dns = if val.is_empty() { None } else { Some(val.to_string()) };
+                self.default_dns = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
             }
             "dns_cache_time" => {
                 if let Ok(n) = val.parse::<u64>() {
@@ -622,7 +640,11 @@ impl GlobalConfig {
                 self.redis_enable = val.eq_ignore_ascii_case("true") || val == "1";
             }
             "redis_password" | "redis_pass" => {
-                self.redis_password = if val.is_empty() { None } else { Some(val.to_string()) };
+                self.redis_password = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
             }
             "redis_db" => {
                 if let Ok(n) = val.parse::<u8>() {
@@ -697,7 +719,8 @@ impl GlobalConfig {
                 self.force_vmess_md5 = val.eq_ignore_ascii_case("true") || val == "1";
             }
             "vmess_aead_invalid_access_enable" => {
-                self.vmess_aead_invalid_access_enable = val.eq_ignore_ascii_case("true") || val == "1";
+                self.vmess_aead_invalid_access_enable =
+                    val.eq_ignore_ascii_case("true") || val == "1";
             }
             "vmess_aead_invalid_access_count" => {
                 if let Ok(n) = val.parse::<u32>() {
@@ -763,7 +786,10 @@ impl GlobalConfig {
             } else {
                 "".to_string()
             };
-            return Some(format!("{}://{}{}/{}", scheme, auth, clean_addr, self.redis_db));
+            return Some(format!(
+                "{}://{}{}/{}",
+                scheme, auth, clean_addr, self.redis_db
+            ));
         }
         None
     }

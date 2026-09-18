@@ -1,4 +1,5 @@
 use base64::prelude::*;
+use prost::encoding::{decode_key, skip_field, DecodeContext, WireType};
 use prost::Message;
 use std::io::{self, Error, ErrorKind};
 
@@ -86,7 +87,28 @@ impl TrafficPattern {
             )
         })?;
 
-        let pattern = Self::decode(&bytes[..]).map_err(|e| {
+        let mut pattern = Self::default();
+        let result = (|| -> Result<(), prost::DecodeError> {
+            let mut input = bytes.as_slice();
+            while !input.is_empty() {
+                let (tag, wire_type) = decode_key(&mut input)?;
+                let expected = match tag {
+                    1 | 2 => Some(WireType::Varint),
+                    3..=6 => Some(WireType::LengthDelimited),
+                    _ => None,
+                };
+                // Go protobuf treats a known tag with a different wire type as unknown.
+                // XBoard can supply such fields; never reinterpret them as a traffic mode.
+                if expected.is_none() || expected != Some(wire_type) {
+                    skip_field(wire_type, tag, &mut input, DecodeContext::default())?;
+                    tracing::warn!(tag, ?wire_type, "Ignoring unknown Mieru TrafficPattern field, matching upstream protobuf behavior");
+                } else {
+                    pattern.merge_field(tag, wire_type, &mut input, DecodeContext::default())?;
+                }
+            }
+            Ok(())
+        })();
+        result.map_err(|e| {
             Error::new(
                 ErrorKind::InvalidData,
                 format!("Failed to protobuf decode traffic_pattern: {}", e),
@@ -140,13 +162,19 @@ impl TrafficPattern {
                 if hex_str.len() > 24 {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
-                        format!("custom hex string {} exceeds 24 characters (12 bytes)", hex_str),
+                        format!(
+                            "custom hex string {} exceeds 24 characters (12 bytes)",
+                            hex_str
+                        ),
                     ));
                 }
                 if hex::decode(hex_str).is_err() {
                     return Err(Error::new(
                         ErrorKind::InvalidData,
-                        format!("custom hex string {} contains invalid hex characters", hex_str),
+                        format!(
+                            "custom hex string {} contains invalid hex characters",
+                            hex_str
+                        ),
                     ));
                 }
             }
@@ -183,5 +211,58 @@ impl TrafficPattern {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn traffic_pattern_fields_and_unknown_wire_types() {
+        // A known field with the wrong wire type is skipped, as in Go protobuf.
+        let unknown = [0x0a, 0x02, 0x08, 0x01];
+        assert_eq!(
+            TrafficPattern::from_base64(&BASE64_STANDARD.encode(unknown)).unwrap(),
+            Some(TrafficPattern::default())
+        );
+        for enable in [false, true] {
+            let expected = TrafficPattern {
+                tcp_fragment: Some(TcpFragment {
+                    enable: Some(enable),
+                    max_sleep_ms: Some(5),
+                }),
+                ..Default::default()
+            };
+            let mut bytes = unknown.to_vec();
+            bytes.extend(expected.encode_to_vec());
+            assert_eq!(
+                TrafficPattern::from_base64(&BASE64_STANDARD.encode(bytes)).unwrap(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_patterns_without_fallback() {
+        assert!(TrafficPattern::from_base64("not-base64").is_err());
+        for bytes in [
+            vec![0x0a, 0x02, 0x08],
+            vec![0x00],
+            vec![0x0e],
+            vec![0x1a, 0x02, 0x08],
+            TrafficPattern {
+                tcp_fragment: Some(TcpFragment {
+                    enable: None,
+                    max_sleep_ms: Some(128),
+                }),
+                ..Default::default()
+            }
+            .encode_to_vec(),
+        ] {
+            let input = BASE64_STANDARD.encode(bytes);
+            assert!(TrafficPattern::from_base64(&input).is_err(), "{input}");
+        }
+        assert_eq!(TrafficPattern::from_base64("  ").unwrap(), None);
     }
 }

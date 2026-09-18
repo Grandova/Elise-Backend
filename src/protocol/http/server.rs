@@ -84,8 +84,13 @@ pub async fn run_http_server(
         None
     };
 
+    ctx.mark_ready();
+    let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Connection task failed"); }
+                }
             _ = shutdown_rx.recv() => {
                 info!("[HTTP Proxy] Inbound on port {} shutting down", ctx.port);
                 break;
@@ -103,7 +108,7 @@ pub async fn run_http_server(
                 let ctx = ctx.clone();
                 let users = users.clone();
                 let tls_manager = tls_manager.clone();
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let conn_id = NEXT_CONN_ID.fetch_add(1, Ordering::Relaxed);
                     let boxed_stream: BoxedStream = if let Some(mgr) = tls_manager {
                         match mgr.accept_with_timeout(Box::new(tcp_stream), Duration::from_secs(15)).await {
@@ -124,6 +129,8 @@ pub async fn run_http_server(
             }
         }
     }
+    drop(listener);
+    crate::protocol::common::inbound::drain_connections(&mut connections).await;
     Ok(())
 }
 
@@ -138,9 +145,14 @@ async fn handle_http_connection(
     let mut buf = Vec::with_capacity(4096);
     let mut header_end_idx = None;
 
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
     let mut temp = [0u8; 2048];
     while buf.len() < 65536 {
-        let n = stream.read(&mut temp).await?;
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut temp))
+            .await
+            .map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "HTTP header timeout")
+            })??;
         if n == 0 {
             return Ok(()); // Client closed connection cleanly
         }
@@ -171,7 +183,10 @@ async fn handle_http_connection(
     let header_str = match std::str::from_utf8(header_bytes) {
         Ok(s) => s,
         Err(_) => {
-            warn!("[HTTP Proxy] conn={} invalid UTF-8 in HTTP headers", conn_id);
+            warn!(
+                "[HTTP Proxy] conn={} invalid UTF-8 in HTTP headers",
+                conn_id
+            );
             let _ = stream.write_all(RESP_400_BAD_REQUEST).await;
             let _ = stream.flush().await;
             return Err(std::io::Error::new(
@@ -189,7 +204,10 @@ async fn handle_http_connection(
     let version = req_parts.next().unwrap_or("HTTP/1.1");
 
     if method.is_empty() || target.is_empty() {
-        warn!("[HTTP Proxy] conn={} malformed request line: '{}'", conn_id, request_line);
+        warn!(
+            "[HTTP Proxy] conn={} malformed request line: '{}'",
+            conn_id, request_line
+        );
         let _ = stream.write_all(RESP_400_BAD_REQUEST).await;
         let _ = stream.flush().await;
         return Ok(());
@@ -217,8 +235,8 @@ async fn handle_http_connection(
         Ok(u) => u,
         Err(err) => {
             warn!(
-                "[HTTP Proxy] conn={} peer={} auth failed: {:?} (header: {:?})",
-                conn_id, remote_addr, err, proxy_auth
+                "[HTTP Proxy] conn={} peer={} auth failed: {:?}",
+                conn_id, remote_addr, err
             );
             let _ = stream.write_all(RESP_407_AUTH_REQUIRED).await;
             let _ = stream.flush().await;
@@ -231,12 +249,27 @@ async fn handle_http_connection(
         conn_id, remote_addr, user.id, method, target
     );
 
+    if !ctx
+        .device_limiter
+        .check_and_record_async(user.id, remote_addr.ip())
+        .await
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Device limit exceeded",
+        ));
+    }
+    let _conn_guard = ctx.conn_limiter.try_acquire(user.id).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Connection limit exceeded",
+        )
+    })?;
+
     // Route based on HTTP method
     if method.eq_ignore_ascii_case("CONNECT") {
-        match handle_connect(stream, target, leftover, &user, conn_id).await {
-            Ok((up, down)) => {
-                (ctx.on_traffic)(user.id, up, down);
-            }
+        match handle_connect(stream, target, leftover, &user, remote_addr, &ctx).await {
+            Ok(_) => {}
             Err(e) => {
                 warn!("[HTTP Proxy] conn={} CONNECT failed: {}", conn_id, e);
             }
@@ -246,19 +279,29 @@ async fn handle_http_connection(
         "GET" | "POST" | "HEAD" | "PUT" | "DELETE" | "OPTIONS" | "PATCH" | "TRACE"
     ) {
         match handle_forward(
-            stream, method, target, version, &headers, leftover, &user, conn_id,
+            stream,
+            method,
+            target,
+            version,
+            &headers,
+            leftover,
+            &user,
+            conn_id,
+            remote_addr,
+            &ctx,
         )
         .await
         {
-            Ok((up, down)) => {
-                (ctx.on_traffic)(user.id, up, down);
-            }
+            Ok(_) => {}
             Err(e) => {
                 warn!("[HTTP Proxy] conn={} forward failed: {}", conn_id, e);
             }
         }
     } else {
-        warn!("[HTTP Proxy] conn={} unsupported HTTP method: {}", conn_id, method);
+        warn!(
+            "[HTTP Proxy] conn={} unsupported HTTP method: {}",
+            conn_id, method
+        );
         let _ = stream.write_all(RESP_400_BAD_REQUEST).await;
         let _ = stream.flush().await;
     }

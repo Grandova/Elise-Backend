@@ -119,6 +119,7 @@ impl Inbound for AnytlsInbound {
         let top_cancel = CancellationToken::new();
         let mut connection_tasks = JoinSet::new();
 
+        ctx.mark_ready();
         loop {
             // Clean up completed connection tasks
             while connection_tasks.try_join_next().is_some() {}
@@ -285,7 +286,11 @@ async fn perform_handshake(
     };
 
     // 4. Device limit
-    if !ctx.device_limiter.check_and_record_async(user.id, client_ip).await {
+    if !ctx
+        .device_limiter
+        .check_and_record_async(user.id, client_ip)
+        .await
+    {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "Device limit reached",

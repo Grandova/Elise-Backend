@@ -19,8 +19,7 @@ pub struct XiaoV2BoardClient {
     client: Client,
     base_url: String,
     token: String,
-    etag: Arc<RwLock<Option<String>>>,
-    cached_users: Arc<RwLock<Vec<User>>>,
+    cached_users: RwLock<HashMap<u32, Arc<tokio::sync::Mutex<(Option<String>, Vec<User>)>>>>,
 }
 
 impl XiaoV2BoardClient {
@@ -34,8 +33,7 @@ impl XiaoV2BoardClient {
             client,
             base_url: base_url.trim_end_matches('/').to_string(),
             token,
-            etag: Arc::new(RwLock::new(None)),
-            cached_users: Arc::new(RwLock::new(Vec::new())),
+            cached_users: RwLock::new(HashMap::new()),
         }
     }
 
@@ -53,7 +51,11 @@ impl XiaoV2BoardClient {
             if resp.status().is_success() {
                 if let Ok(val) = resp.json::<Value>().await {
                     let data = val.get("data").unwrap_or(&val);
-                    if data.is_object() && (data.get("protocol").is_some() || data.get("server_type").is_some() || data.get("server_port").is_some()) {
+                    if data.is_object()
+                        && (data.get("protocol").is_some()
+                            || data.get("server_type").is_some()
+                            || data.get("server_port").is_some())
+                    {
                         return Ok(self.parse_v2_node_info(node_id, data));
                     }
                 }
@@ -97,14 +99,12 @@ impl XiaoV2BoardClient {
 
         let server_name = tls_val
             .and_then(|t| {
-                t.get("server_name")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| {
-                        t.get("server_names")
-                            .and_then(|arr| arr.as_array())
-                            .and_then(|a| a.first())
-                            .and_then(|v| v.as_str())
-                    })
+                t.get("server_name").and_then(|v| v.as_str()).or_else(|| {
+                    t.get("server_names")
+                        .and_then(|arr| arr.as_array())
+                        .and_then(|a| a.first())
+                        .and_then(|v| v.as_str())
+                })
             })
             .or_else(|| data.get("server_name").and_then(|v| v.as_str()))
             .map(String::from);
@@ -476,24 +476,40 @@ impl XiaoV2BoardClient {
             self.base_url, node_id, self.token
         );
 
+        let cache = self
+            .cached_users
+            .write()
+            .entry(node_id)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new((None, Vec::new()))))
+            .clone();
+        let mut cache = cache.lock().await;
         let mut req = self.client.get(&url);
-        if let Some(etag) = self.etag.read().as_ref() {
+        if let Some(etag) = cache.0.as_ref() {
             req = req.header(IF_NONE_MATCH, etag);
         }
 
         let resp = req.send().await?;
 
         if resp.status() == reqwest::StatusCode::NOT_MODIFIED {
-            return Ok(self.cached_users.read().clone());
+            if cache.0.is_none() {
+                return Err("Panel returned 304 without a cached ETag".into());
+            }
+            return Ok(cache.1.clone());
         }
 
         if !resp.status().is_success() {
-            return Err(format!("XiaoV2Board API user sync returned status {}", resp.status()).into());
+            return Err(format!(
+                "XiaoV2Board API user sync returned status {}",
+                resp.status()
+            )
+            .into());
         }
 
-        if let Some(new_etag) = resp.headers().get("ETag").and_then(|h| h.to_str().ok()) {
-            *self.etag.write() = Some(new_etag.to_string());
-        }
+        let new_etag = resp
+            .headers()
+            .get("ETag")
+            .and_then(|h| h.to_str().ok())
+            .map(str::to_owned);
 
         let val: Value = resp.json().await?;
         let user_list = val
@@ -501,6 +517,9 @@ impl XiaoV2BoardClient {
             .or_else(|| val.get("data"))
             .and_then(|v| v.as_array());
 
+        if user_list.is_none() {
+            return Err("Panel user response has no users array".into());
+        }
         let mut users = Vec::new();
         if let Some(arr) = user_list {
             for item in arr {
@@ -510,10 +529,7 @@ impl XiaoV2BoardClient {
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let speed_limit = item
-                    .get("speed_limit")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                let speed_limit = crate::panel::types::speed_limit_bps(item.get("speed_limit"))?;
                 let device_limit = item
                     .get("device_limit")
                     .and_then(|v| v.as_u64())
@@ -538,7 +554,7 @@ impl XiaoV2BoardClient {
             }
         }
 
-        *self.cached_users.write() = users.clone();
+        *cache = (new_etag, users.clone());
         Ok(users)
     }
 
@@ -638,4 +654,3 @@ impl XiaoV2BoardClient {
         Ok(res)
     }
 }
-

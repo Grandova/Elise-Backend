@@ -18,6 +18,4 @@ pub use vmess::crypto as vmess_crypto;
 pub mod common;
 pub use common::{Inbound, InboundContext, TrafficCallback};
 
-
 mod restls;
-

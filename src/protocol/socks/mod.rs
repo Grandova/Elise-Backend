@@ -61,8 +61,13 @@ impl Inbound for SocksInbound {
 
         let users = self.users.clone();
 
+        let mut connections = tokio::task::JoinSet::new();
+        ctx.mark_ready();
         loop {
             tokio::select! {
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Connection task failed"); }
+                }
                 _ = shutdown_rx.recv() => {
                     info!("SOCKS5 inbound on port {} stopping", ctx.port);
                     break;
@@ -79,7 +84,7 @@ impl Inbound for SocksInbound {
 
                     let ctx = ctx.clone();
                     let users = users.clone();
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         if let Err(e) = handle_connection(stream, peer_addr, ctx, users).await {
                             tracing::debug!("SOCKS5 connection from {} closed: {:?}", peer_addr, e);
                         }
@@ -87,6 +92,8 @@ impl Inbound for SocksInbound {
                 }
             }
         }
+        drop(listener);
+        crate::protocol::common::inbound::drain_connections(&mut connections).await;
         Ok(())
     }
 }

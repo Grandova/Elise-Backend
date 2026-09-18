@@ -21,6 +21,47 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
+pub struct IdleTimeout {
+    timeout: Duration,
+    activity: tokio::sync::watch::Sender<tokio::time::Instant>,
+}
+
+impl IdleTimeout {
+    pub fn new(seconds: u64) -> Self {
+        let (activity, _) = tokio::sync::watch::channel(tokio::time::Instant::now());
+        Self {
+            timeout: Duration::from_secs(seconds),
+            activity,
+        }
+    }
+
+    pub async fn run<T>(
+        &self,
+        future: impl std::future::Future<Output = io::Result<T>>,
+    ) -> io::Result<T> {
+        let mut activity = self.activity.subscribe();
+        let expired = async {
+            if self.timeout.is_zero() {
+                std::future::pending::<()>().await;
+            }
+            loop {
+                let deadline = *activity.borrow_and_update() + self.timeout;
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    _ = activity.changed() => {},
+                }
+            }
+        };
+        tokio::select! {
+            result = future => {
+                if result.is_ok() { self.activity.send_replace(tokio::time::Instant::now()); }
+                result
+            },
+            _ = expired => Err(io::Error::new(io::ErrorKind::TimedOut,"Session idle timeout")),
+        }
+    }
+}
+
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
 pub type BoxedStream = Box<dyn AsyncStream>;
@@ -34,6 +75,43 @@ pub struct MonitoredStream<S> {
     pub client_addr: SocketAddr,
     upload: Arc<AtomicU64>,
     download: Arc<AtomicU64>,
+}
+
+pub struct TrafficGuard {
+    user_id: u32,
+    upload: Arc<AtomicU64>,
+    download: Arc<AtomicU64>,
+    on_traffic: crate::protocol::TrafficCallback,
+}
+
+impl TrafficGuard {
+    pub fn new(user_id: u32, on_traffic: crate::protocol::TrafficCallback) -> Self {
+        Self {
+            user_id,
+            upload: Arc::new(AtomicU64::new(0)),
+            download: Arc::new(AtomicU64::new(0)),
+            on_traffic,
+        }
+    }
+
+    pub fn add(&self, up: u64, down: u64) {
+        if up > 0 {
+            self.upload.fetch_add(up, Ordering::Relaxed);
+        }
+        if down > 0 {
+            self.download.fetch_add(down, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for TrafficGuard {
+    fn drop(&mut self) {
+        let up = self.upload.load(Ordering::Relaxed);
+        let down = self.download.load(Ordering::Relaxed);
+        if up > 0 || down > 0 {
+            (self.on_traffic)(self.user_id, up, down);
+        }
+    }
 }
 
 impl<S> MonitoredStream<S> {
@@ -52,6 +130,15 @@ impl<S> MonitoredStream<S> {
             self.upload.load(Ordering::Relaxed),
             self.download.load(Ordering::Relaxed),
         )
+    }
+
+    pub fn traffic_guard(&self, on_traffic: crate::protocol::TrafficCallback) -> TrafficGuard {
+        TrafficGuard {
+            user_id: self.user_id,
+            upload: self.upload.clone(),
+            download: self.download.clone(),
+            on_traffic,
+        }
     }
 
     pub fn upload_handle(&self) -> Arc<AtomicU64> {
@@ -107,14 +194,13 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for MonitoredStream<S> {
     }
 }
 
-/// Native ultra-optimized bidirectional stream copy with 32KB buffer and integrated rate limiting.
-/// When user has no speed limit active, utilizes Tokio's zero-lock poll-driven bidirectional engine
-/// directly, avoiding split locks and reducing memory usage by 50%.
+/// Bidirectional copy with dynamic rate limits and a shared idle deadline.
 pub async fn copy_bidirectional_throttled<A, B>(
     a: &mut A,
     b: &mut B,
     user_id: u32,
     rate_limiter: Option<&RateLimiter>,
+    timeout: u64,
 ) -> io::Result<(u64, u64)>
 where
     A: AsyncRead + AsyncWrite + Unpin,
@@ -122,10 +208,7 @@ where
 {
     const BUFFER_SIZE: usize = 32768; // 32KB optimal socket buffer size
 
-    // Fast-path: if no speed limit is configured for this user, execute zero-lock poll copy directly
-    if !rate_limiter.is_some_and(|r| r.is_limited(user_id)) {
-        return tokio::io::copy_bidirectional_with_sizes(a, b, BUFFER_SIZE, BUFFER_SIZE).await;
-    }
+    let idle = IdleTimeout::new(timeout);
 
     let (mut a_read, mut a_write) = tokio::io::split(a);
     let (mut b_read, mut b_write) = tokio::io::split(b);
@@ -134,18 +217,21 @@ where
         let mut buf = vec![0u8; BUFFER_SIZE];
         let mut total = 0u64;
         loop {
-            let n = a_read.read(&mut buf).await?;
+            let n = idle.run(a_read.read(&mut buf)).await?;
             if n == 0 {
                 break;
             }
-            if let Some(limiter) = rate_limiter {
-                limiter.throttle(user_id, n).await;
-            }
-            b_write.write_all(&buf[..n]).await?;
-            b_write.flush().await?;
+            idle.run(async {
+                if let Some(limiter) = rate_limiter {
+                    limiter.throttle(user_id, n).await;
+                }
+                b_write.write_all(&buf[..n]).await
+            })
+            .await?;
+            idle.run(b_write.flush()).await?;
             total += n as u64;
         }
-        b_write.shutdown().await?;
+        idle.run(b_write.shutdown()).await?;
         Ok::<u64, io::Error>(total)
     };
 
@@ -153,18 +239,21 @@ where
         let mut buf = vec![0u8; BUFFER_SIZE];
         let mut total = 0u64;
         loop {
-            let n = b_read.read(&mut buf).await?;
+            let n = idle.run(b_read.read(&mut buf)).await?;
             if n == 0 {
                 break;
             }
-            if let Some(limiter) = rate_limiter {
-                limiter.throttle(user_id, n).await;
-            }
-            a_write.write_all(&buf[..n]).await?;
-            a_write.flush().await?;
+            idle.run(async {
+                if let Some(limiter) = rate_limiter {
+                    limiter.throttle(user_id, n).await;
+                }
+                a_write.write_all(&buf[..n]).await
+            })
+            .await?;
+            idle.run(a_write.flush()).await?;
             total += n as u64;
         }
-        a_write.shutdown().await?;
+        idle.run(a_write.shutdown()).await?;
         Ok::<u64, io::Error>(total)
     };
 
@@ -173,4 +262,52 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     Ok((res_a, res_b))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn traffic_is_reported_once_when_connection_task_is_aborted() {
+        let reports = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let captured = reports.clone();
+        let (mut client, server) = tokio::io::duplex(64);
+        let (ready, received) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut stream = MonitoredStream::new(server, 42, "127.0.0.1:1234".parse().unwrap());
+            let _traffic = stream.traffic_guard(Arc::new(move |id, up, down| {
+                captured.lock().push((id, up, down))
+            }));
+            let mut data = [0; 4];
+            stream.read_exact(&mut data).await.unwrap();
+            stream.write_all(b"answer").await.unwrap();
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        client.write_all(b"data").await.unwrap();
+        let mut answer = [0; 6];
+        client.read_exact(&mut answer).await.unwrap();
+        received.await.unwrap();
+        assert!(reports.lock().is_empty());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert_eq!(*reports.lock(), vec![(42, 4, 6)]);
+    }
+
+    #[tokio::test]
+    async fn activity_in_either_direction_extends_idle_deadline() {
+        let idle = IdleTimeout::new(1);
+        let start = std::time::Instant::now();
+        let waiting = idle.run(std::future::pending::<io::Result<()>>());
+        let active = async {
+            for _ in 0..3 {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                idle.run(async { Ok(()) }).await.unwrap();
+            }
+        };
+        let (result, _) = tokio::join!(waiting, active);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(start.elapsed() >= Duration::from_millis(2700));
+    }
 }

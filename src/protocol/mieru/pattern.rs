@@ -65,11 +65,26 @@ struct LowEntropyParams {
 
 fn get_low_entropy_params(mode: i32) -> io::Result<LowEntropyParams> {
     match mode {
-        1 => Ok(LowEntropyParams { source_bytes_per_chunk: 4, _half_mask_ones: 16 }),
-        2 => Ok(LowEntropyParams { source_bytes_per_chunk: 5, _half_mask_ones: 20 }),
-        3 => Ok(LowEntropyParams { source_bytes_per_chunk: 6, _half_mask_ones: 24 }),
-        4 => Ok(LowEntropyParams { source_bytes_per_chunk: 7, _half_mask_ones: 28 }),
-        _ => Err(Error::new(ErrorKind::InvalidData, format!("Invalid low entropy mode {}", mode))),
+        1 => Ok(LowEntropyParams {
+            source_bytes_per_chunk: 4,
+            _half_mask_ones: 16,
+        }),
+        2 => Ok(LowEntropyParams {
+            source_bytes_per_chunk: 5,
+            _half_mask_ones: 20,
+        }),
+        3 => Ok(LowEntropyParams {
+            source_bytes_per_chunk: 6,
+            _half_mask_ones: 24,
+        }),
+        4 => Ok(LowEntropyParams {
+            source_bytes_per_chunk: 7,
+            _half_mask_ones: 28,
+        }),
+        _ => Err(Error::new(
+            ErrorKind::InvalidData,
+            format!("Invalid low entropy mode {}", mode),
+        )),
     }
 }
 
@@ -88,14 +103,20 @@ pub fn generate_half_mask(mode: i32) -> u32 {
 pub fn low_entropy_encoded_len(extracted_len: usize, mode: i32) -> io::Result<usize> {
     let params = get_low_entropy_params(mode)?;
     if extracted_len == 0 {
-        return Err(Error::new(ErrorKind::InvalidData, "Invalid extracted payload len 0"));
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Invalid extracted payload len 0",
+        ));
     }
     let mut chunk_count = extracted_len / params.source_bytes_per_chunk;
     if extracted_len % params.source_bytes_per_chunk != 0 {
         chunk_count += 1;
     }
     if chunk_count > (u16::MAX as usize / LOW_ENTROPY_CHUNK_LEN) {
-        return Err(Error::new(ErrorKind::InvalidData, "Encoded payload length exceeds u16 limit"));
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Encoded payload length exceeds u16 limit",
+        ));
     }
     Ok(chunk_count * LOW_ENTROPY_CHUNK_LEN)
 }
@@ -154,7 +175,11 @@ pub fn decode_low_entropy(
     if encoded.len() != expected_len {
         return Err(Error::new(
             ErrorKind::InvalidData,
-            format!("Encoded payload len is {}, expected {}", encoded.len(), expected_len),
+            format!(
+                "Encoded payload len is {}, expected {}",
+                encoded.len(),
+                expected_len
+            ),
         ));
     }
 
@@ -186,7 +211,10 @@ pub fn decode_low_entropy(
             } else if padding == padding_mask {
                 inferred_padding_bit = Some(1);
             } else {
-                return Err(Error::new(ErrorKind::InvalidData, "Mixed padding bits in chunk 0"));
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "Mixed padding bits in chunk 0",
+                ));
             }
         } else {
             let p_bit = inferred_padding_bit.unwrap_or(0);
@@ -314,7 +342,8 @@ impl TrafficPatternExecutor {
             }
             2 => {
                 // Printable ASCII subset: digits and ASCII letters
-                const SUBSET: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+                const SUBSET: &[u8] =
+                    b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
                 for b in nonce[..len].iter_mut() {
                     *b = SUBSET[rng.gen_range(0..SUBSET.len())];
                 }

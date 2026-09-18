@@ -59,12 +59,23 @@ impl Inbound for MieruInbound {
         shutdown_rx: broadcast::Receiver<()>,
     ) -> io::Result<()> {
         // 1. Parse TrafficPattern if configured
-        let pattern_opt = if let Some(ref tp_str) = node_info.traffic_pattern {
+        let local_pattern = ctx
+            .global_config
+            .raw_properties
+            .get("mieru_traffic_pattern")
+            .filter(|value| !value.trim().is_empty());
+        let pattern_opt = if let Some(tp_str) = local_pattern.or(node_info.traffic_pattern.as_ref())
+        {
             match TrafficPattern::from_base64(tp_str) {
                 Ok(p) => {
                     info!(
-                        "Node {}: Loaded official Mieru TrafficPattern configuration",
-                        ctx.node_id
+                        node_id = ctx.node_id,
+                        source = if local_pattern.is_some() {
+                            "local"
+                        } else {
+                            "panel"
+                        },
+                        "Loaded Mieru TrafficPattern configuration"
                     );
                     p
                 }
@@ -96,12 +107,17 @@ impl Inbound for MieruInbound {
         );
 
         match transport.as_str() {
-            "UDP" => {
-                udp::start_udp_server(ctx, self.users.clone(), pattern_exec, shutdown_rx).await
-            }
-            "TCP" | _ => {
+            "UDP" => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Mieru UDP transport requires reliable delivery and is not supported",
+            )),
+            "TCP" => {
                 tcp::start_tcp_server(ctx, self.users.clone(), pattern_exec, shutdown_rx).await
             }
+            _ => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "Unsupported Mieru transport",
+            )),
         }
     }
 }

@@ -1,6 +1,8 @@
 use super::auth::verify_auth;
 use super::padding::NaivePaddedStream;
-use crate::conn::{bind_tcp_listener, read_proxy_protocol, BoxedStream, MonitoredStream, PrefixedStream};
+use crate::conn::{
+    bind_tcp_listener, read_proxy_protocol, BoxedStream, MonitoredStream, PrefixedStream,
+};
 use crate::observability::AuditRecord;
 use crate::panel::types::{NodeInfo, User};
 use crate::protocol::{Inbound, InboundContext};
@@ -100,10 +102,15 @@ impl Inbound for NaiveInbound {
             None
         };
 
+        ctx.mark_ready();
         let users = self.users.clone();
 
+        let mut connections = tokio::task::JoinSet::new();
         loop {
             tokio::select! {
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Connection task failed"); }
+                }
                 _ = shutdown_rx.recv() => {
                     info!("Naive inbound on port {} stopping", ctx.port);
                     break;
@@ -122,12 +129,14 @@ impl Inbound for NaiveInbound {
                     let node_info = node_info.clone();
                     let users = users.clone();
                     let tls_manager = tls_manager.clone();
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         let _ = handle_connection(stream, remote_addr, ctx, node_info, users, tls_manager).await;
                     });
                 }
             }
         }
+        drop(listener);
+        crate::protocol::common::inbound::drain_connections(&mut connections).await;
         Ok(())
     }
 }
@@ -156,10 +165,17 @@ async fn handle_connection(
 
     if is_tls {
         // TLS Mode
-        let acceptor = match tls_manager.as_ref().and_then(|m| m.get_acceptor()).or_else(|| ctx.tls_manager.get_acceptor()) {
+        let acceptor = match tls_manager
+            .as_ref()
+            .and_then(|m| m.get_acceptor())
+            .or_else(|| ctx.tls_manager.get_acceptor())
+        {
             Some(a) => a,
             None => {
-                warn!("Naive TLS mode enabled on node {}, but TLS acceptor is not initialized", ctx.node_id);
+                warn!(
+                    "Naive TLS mode enabled on node {}, but TLS acceptor is not initialized",
+                    ctx.node_id
+                );
                 return Ok(());
             }
         };
@@ -191,7 +207,8 @@ async fn handle_connection(
         let mut peek = [0u8; 4];
         match stream.read_exact(&mut peek).await {
             Ok(_) => {
-                let prefixed: BoxedStream = Box::new(PrefixedStream::new(stream, Some(peek.to_vec())));
+                let prefixed: BoxedStream =
+                    Box::new(PrefixedStream::new(stream, Some(peek.to_vec())));
                 if &peek == b"PRI " {
                     handle_h2_stream(prefixed, remote_addr, ctx, users, conn_id).await
                 } else {
@@ -199,21 +216,29 @@ async fn handle_connection(
                 }
             }
             Err(e) => {
-                warn!("[Naive] conn={} node={} peer={} read peek error: {:?}", conn_id, ctx.node_id, remote_addr, e);
+                warn!(
+                    "[Naive] conn={} node={} peer={} read peek error: {:?}",
+                    conn_id, ctx.node_id, remote_addr, e
+                );
                 Ok(())
             }
         }
     } else {
         // Plain (NoTLS) Mode
-        static PLAIN_CONN_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10001);
+        static PLAIN_CONN_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(10001);
         let conn_id = PLAIN_CONN_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        info!("[Naive] conn={} node={} peer={} mode=plain", conn_id, ctx.node_id, remote_addr);
+        info!(
+            "[Naive] conn={} node={} peer={} mode=plain",
+            conn_id, ctx.node_id, remote_addr
+        );
 
         let mut stream: BoxedStream = Box::new(stream);
         let mut peek = [0u8; 4];
         match stream.read_exact(&mut peek).await {
             Ok(_) => {
-                let prefixed: BoxedStream = Box::new(PrefixedStream::new(stream, Some(peek.to_vec())));
+                let prefixed: BoxedStream =
+                    Box::new(PrefixedStream::new(stream, Some(peek.to_vec())));
                 if &peek == b"PRI " {
                     handle_h2_stream(prefixed, remote_addr, ctx, users, conn_id).await
                 } else {
@@ -239,11 +264,17 @@ async fn handle_h2_stream(
 
     let mut connection = match builder.handshake(stream).await {
         Ok(c) => {
-            info!("[Naive] conn={} node={} peer={} h2=PASS", conn_id, ctx.node_id, remote_addr);
+            info!(
+                "[Naive] conn={} node={} peer={} h2=PASS",
+                conn_id, ctx.node_id, remote_addr
+            );
             c
         }
         Err(e) => {
-            warn!("[Naive] conn={} node={} peer={} Naive H2 handshake error: {e}", conn_id, ctx.node_id, remote_addr);
+            warn!(
+                "[Naive] conn={} node={} peer={} Naive H2 handshake error: {e}",
+                conn_id, ctx.node_id, remote_addr
+            );
             return Ok(());
         }
     };
@@ -252,7 +283,10 @@ async fn handle_h2_stream(
         let (request, respond) = match accept_res {
             Ok(pair) => pair,
             Err(e) => {
-                warn!("[Naive] conn={} node={} peer={} Naive H2 stream accept error: {e}", conn_id, ctx.node_id, remote_addr);
+                warn!(
+                    "[Naive] conn={} node={} peer={} Naive H2 stream accept error: {e}",
+                    conn_id, ctx.node_id, remote_addr
+                );
                 break;
             }
         };
@@ -278,7 +312,13 @@ async fn process_h2_connect(
     let client_ip = remote_addr.ip();
 
     if request.method() == http::Method::GET || request.method() == http::Method::HEAD {
-        info!("[Naive] conn={} node={} peer={} camouflage=PASS method={}", conn_id, ctx.node_id, remote_addr, request.method());
+        info!(
+            "[Naive] conn={} node={} peer={} camouflage=PASS method={}",
+            conn_id,
+            ctx.node_id,
+            remote_addr,
+            request.method()
+        );
         let resp = Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "text/html; charset=utf-8")
@@ -298,7 +338,13 @@ async fn process_h2_connect(
     }
 
     if request.method() != http::Method::CONNECT {
-        warn!("[Naive] conn={} node={} peer={} invalid method: {}", conn_id, ctx.node_id, remote_addr, request.method());
+        warn!(
+            "[Naive] conn={} node={} peer={} invalid method: {}",
+            conn_id,
+            ctx.node_id,
+            remote_addr,
+            request.method()
+        );
         let resp = Response::builder()
             .status(StatusCode::METHOD_NOT_ALLOWED)
             .body(())
@@ -335,7 +381,10 @@ async fn process_h2_connect(
     let user = match verify_auth(auth_header, &users) {
         Ok(u) => {
             ctx.defense.record_success(client_ip);
-            info!("[Naive] conn={} node={} peer={} auth=PASS user={}", conn_id, ctx.node_id, remote_addr, u.id);
+            info!(
+                "[Naive] conn={} node={} peer={} auth=PASS user={}",
+                conn_id, ctx.node_id, remote_addr, u.id
+            );
             u
         }
         Err(err) => {
@@ -353,9 +402,16 @@ async fn process_h2_connect(
         }
     };
 
-    info!("[Naive] conn={} node={} peer={} CONNECT=PASS target={}", conn_id, ctx.node_id, remote_addr, target_str);
+    info!(
+        "[Naive] conn={} node={} peer={} CONNECT=PASS target={}",
+        conn_id, ctx.node_id, remote_addr, target_str
+    );
 
-    if !ctx.device_limiter.check_and_record_async(user.id, client_ip).await {
+    if !ctx
+        .device_limiter
+        .check_and_record_async(user.id, client_ip)
+        .await
+    {
         let resp = Response::builder()
             .status(StatusCode::FORBIDDEN)
             .body(())
@@ -402,11 +458,17 @@ async fn process_h2_connect(
         .await
     {
         Ok(s) => {
-            info!("[Naive] conn={} node={} peer={} target_connection=PASS target={}:{}", conn_id, ctx.node_id, remote_addr, target_host, target_port);
+            info!(
+                "[Naive] conn={} node={} peer={} target_connection=PASS target={}:{}",
+                conn_id, ctx.node_id, remote_addr, target_host, target_port
+            );
             s
         }
         Err(e) => {
-            warn!("[Naive] conn={} node={} peer={} target_connection=FAIL target={}:{} error={:?}", conn_id, ctx.node_id, remote_addr, target_host, target_port, e);
+            warn!(
+                "[Naive] conn={} node={} peer={} target_connection=FAIL target={}:{} error={:?}",
+                conn_id, ctx.node_id, remote_addr, target_host, target_port, e
+            );
             let resp = Response::builder()
                 .status(StatusCode::BAD_GATEWAY)
                 .body(())
@@ -418,7 +480,10 @@ async fn process_h2_connect(
 
     let has_padding = request.headers().contains_key("padding");
     if has_padding {
-        info!("[Naive] conn={} node={} peer={} padding=PASS", conn_id, ctx.node_id, remote_addr);
+        info!(
+            "[Naive] conn={} node={} peer={} padding=PASS",
+            conn_id, ctx.node_id, remote_addr
+        );
     }
 
     let mut resp_builder = Response::builder().status(StatusCode::OK);
@@ -426,7 +491,8 @@ async fn process_h2_connect(
         let pad_len = rand::thread_rng().gen_range(30..=62);
         let pad_symbols: String = (0..pad_len)
             .map(|_| {
-                const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                const CHARS: &[u8] =
+                    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
                 let idx = rand::thread_rng().gen_range(0..CHARS.len());
                 CHARS[idx] as char
             })
@@ -447,6 +513,7 @@ async fn process_h2_connect(
     let raw_h2_stream = H2RawStreamWrapper::new(recv_stream, send_stream);
     let padded_stream = NaivePaddedStream::new(raw_h2_stream, has_padding);
     let mut client_conn = MonitoredStream::new(Box::new(padded_stream), user.id, remote_addr);
+    let _traffic = client_conn.traffic_guard(ctx.on_traffic.clone());
 
     let start_time = Instant::now();
     let _ = crate::conn::copy_bidirectional_throttled(
@@ -454,6 +521,7 @@ async fn process_h2_connect(
         &mut out_stream,
         user.id,
         Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
     )
     .await;
 
@@ -461,11 +529,13 @@ async fn process_h2_connect(
     let (up, down) = client_conn.stats();
     info!(
         "[Naive] conn={} node={} peer={} transfer completed up={} down={} duration_ms={}",
-        conn_id, ctx.node_id, remote_addr, up, down, duration.as_millis()
+        conn_id,
+        ctx.node_id,
+        remote_addr,
+        up,
+        down,
+        duration.as_millis()
     );
-    if up > 0 || down > 0 {
-        (ctx.on_traffic)(user.id, up, down);
-    }
 
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,
@@ -513,7 +583,9 @@ async fn handle_http1_stream(
     let end_idx = match header_end {
         Some(pos) => pos,
         None => {
-            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n").await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                .await;
             return Ok(());
         }
     };
@@ -523,15 +595,24 @@ async fn handle_http1_stream(
     let request_line = match lines.next() {
         Some(l) => l,
         None => {
-            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n").await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+                .await;
             return Ok(());
         }
     };
 
     let parts: Vec<&str> = request_line.split_whitespace().collect();
     if !parts.is_empty() && (parts[0] == "GET" || parts[0] == "HEAD") {
-        info!("[Naive] conn={} node={} peer={} camouflage=PASS method={}", conn_id, ctx.node_id, remote_addr, parts[0]);
-        let body = if parts[0] == "GET" { CAMOUFLAGE_HTML } else { b"" };
+        info!(
+            "[Naive] conn={} node={} peer={} camouflage=PASS method={}",
+            conn_id, ctx.node_id, remote_addr, parts[0]
+        );
+        let body = if parts[0] == "GET" {
+            CAMOUFLAGE_HTML
+        } else {
+            b""
+        };
         let resp = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
             CAMOUFLAGE_HTML.len()
@@ -544,8 +625,16 @@ async fn handle_http1_stream(
     }
 
     if parts.len() < 2 || parts[0] != "CONNECT" {
-        warn!("[Naive] conn={} node={} peer={} invalid method: {:?}", conn_id, ctx.node_id, remote_addr, parts.first());
-        let _ = stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n").await;
+        warn!(
+            "[Naive] conn={} node={} peer={} invalid method: {:?}",
+            conn_id,
+            ctx.node_id,
+            remote_addr,
+            parts.first()
+        );
+        let _ = stream
+            .write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n")
+            .await;
         return Ok(());
     }
 
@@ -575,7 +664,10 @@ async fn handle_http1_stream(
     let user = match verify_auth(auth_header.as_deref(), &users) {
         Ok(u) => {
             ctx.defense.record_success(client_ip);
-            info!("[Naive] conn={} node={} peer={} auth=PASS user={}", conn_id, ctx.node_id, remote_addr, u.id);
+            info!(
+                "[Naive] conn={} node={} peer={} auth=PASS user={}",
+                conn_id, ctx.node_id, remote_addr, u.id
+            );
             u
         }
         Err(err) => {
@@ -590,23 +682,36 @@ async fn handle_http1_stream(
         }
     };
 
-    info!("[Naive] conn={} node={} peer={} CONNECT=PASS target={}", conn_id, ctx.node_id, remote_addr, target);
+    info!(
+        "[Naive] conn={} node={} peer={} CONNECT=PASS target={}",
+        conn_id, ctx.node_id, remote_addr, target
+    );
 
-    if !ctx.device_limiter.check_and_record_async(user.id, client_ip).await {
-        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n").await;
+    if !ctx
+        .device_limiter
+        .check_and_record_async(user.id, client_ip)
+        .await
+    {
+        let _ = stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+            .await;
         return Ok(());
     }
 
     let _conn_guard = match ctx.conn_limiter.try_acquire(user.id) {
         Some(g) => g,
         None => {
-            let _ = stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n").await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 429 Too Many Requests\r\nConnection: close\r\n\r\n")
+                .await;
             return Ok(());
         }
     };
 
     if ctx.audit.should_block(&target_host, None, target_port) {
-        let _ = stream.write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n").await;
+        let _ = stream
+            .write_all(b"HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n")
+            .await;
         return Ok(());
     }
 
@@ -627,22 +732,34 @@ async fn handle_http1_stream(
         .await
     {
         Ok(s) => {
-            info!("[Naive] conn={} node={} peer={} target_connection=PASS target={}:{}", conn_id, ctx.node_id, remote_addr, target_host, target_port);
+            info!(
+                "[Naive] conn={} node={} peer={} target_connection=PASS target={}:{}",
+                conn_id, ctx.node_id, remote_addr, target_host, target_port
+            );
             s
         }
         Err(e) => {
-            warn!("[Naive] conn={} node={} peer={} target_connection=FAIL target={}:{} error={:?}", conn_id, ctx.node_id, remote_addr, target_host, target_port, e);
-            let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n").await;
+            warn!(
+                "[Naive] conn={} node={} peer={} target_connection=FAIL target={}:{} error={:?}",
+                conn_id, ctx.node_id, remote_addr, target_host, target_port, e
+            );
+            let _ = stream
+                .write_all(b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n")
+                .await;
             return Ok(());
         }
     };
 
     if has_padding {
-        info!("[Naive] conn={} node={} peer={} padding=PASS", conn_id, ctx.node_id, remote_addr);
+        info!(
+            "[Naive] conn={} node={} peer={} padding=PASS",
+            conn_id, ctx.node_id, remote_addr
+        );
         let pad_len = rand::thread_rng().gen_range(30..=62);
         let pad_symbols: String = (0..pad_len)
             .map(|_| {
-                const CHARS: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+                const CHARS: &[u8] =
+                    b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
                 let idx = rand::thread_rng().gen_range(0..CHARS.len());
                 CHARS[idx] as char
             })
@@ -653,7 +770,9 @@ async fn handle_http1_stream(
         );
         stream.write_all(resp.as_bytes()).await?;
     } else {
-        stream.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await?;
     }
 
     let unconsumed = header_buf[end_idx + 4..].to_vec();
@@ -665,6 +784,7 @@ async fn handle_http1_stream(
 
     let padded_stream = NaivePaddedStream::new(stream, has_padding);
     let mut client_conn = MonitoredStream::new(Box::new(padded_stream), user.id, remote_addr);
+    let _traffic = client_conn.traffic_guard(ctx.on_traffic.clone());
 
     let start_time = Instant::now();
     let _ = crate::conn::copy_bidirectional_throttled(
@@ -672,6 +792,7 @@ async fn handle_http1_stream(
         &mut out_stream,
         user.id,
         Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
     )
     .await;
 
@@ -679,11 +800,13 @@ async fn handle_http1_stream(
     let (up, down) = client_conn.stats();
     info!(
         "[Naive] conn={} node={} peer={} transfer completed up={} down={} duration_ms={}",
-        conn_id, ctx.node_id, remote_addr, up, down, duration.as_millis()
+        conn_id,
+        ctx.node_id,
+        remote_addr,
+        up,
+        down,
+        duration.as_millis()
     );
-    if up > 0 || down > 0 {
-        (ctx.on_traffic)(user.id, up, down);
-    }
 
     ctx.audit_logger.record(AuditRecord::new(
         ctx.node_id,
@@ -704,5 +827,7 @@ async fn handle_http1_stream(
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack.windows(needle.len()).position(|window| window == needle)
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
 }

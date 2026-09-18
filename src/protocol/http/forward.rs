@@ -1,10 +1,11 @@
 use crate::conn::BoxedStream;
 use crate::panel::types::User;
 use crate::protocol::http::auth::RESP_502_BAD_GATEWAY;
+use crate::protocol::InboundContext;
 use std::io;
+use std::net::SocketAddr;
 use tokio::io::AsyncWriteExt;
-use tokio::net::TcpStream;
-use tracing::{info, warn};
+use tracing::warn;
 
 /// Check if a header name is a hop-by-hop header that must be stripped by proxies.
 pub fn is_hop_by_hop_header(name: &str) -> bool {
@@ -70,6 +71,8 @@ pub async fn handle_forward(
     leftover: &[u8],
     user: &User,
     conn_id: u64,
+    remote_addr: SocketAddr,
+    ctx: &InboundContext,
 ) -> io::Result<(u64, u64)> {
     let host_header = headers
         .iter()
@@ -92,19 +95,6 @@ pub async fn handle_forward(
     };
 
     let target_addr = format!("{}:{}", host, port);
-    let mut target_stream = match TcpStream::connect(&target_addr).await {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(
-                "[HTTP FORWARD] conn={} user_id={} failed to connect to {}: {}",
-                conn_id, user.id, target_addr, e
-            );
-            let _ = client_stream.write_all(RESP_502_BAD_GATEWAY).await;
-            return Err(e);
-        }
-    };
-    let _ = target_stream.set_nodelay(true);
-
     // Reconstruct HTTP request for target:
     // 1. Request-line: METHOD origin-form HTTP/version
     let mut rewritten_req = format!("{} {} {}\r\n", method, path, version);
@@ -127,41 +117,17 @@ pub async fn handle_forward(
     }
     rewritten_req.push_str("Connection: close\r\n\r\n");
 
-    // Send rewritten headers to target
-    target_stream.write_all(rewritten_req.as_bytes()).await?;
-    let mut initial_up = rewritten_req.len() as u64;
-
-    // Send leftover request body data if any
-    if !leftover.is_empty() {
-        target_stream.write_all(leftover).await?;
-        initial_up += leftover.len() as u64;
-    }
-    target_stream.flush().await?;
-
-    info!(
-        "[HTTP FORWARD] conn={} user_id={} {} {} -> {}",
-        conn_id, user.id, method, target, target_addr
-    );
-
-    // Stream response back to client and rest of body from client to target
-    let (mut client_read, mut client_write) = tokio::io::split(client_stream);
-    let (mut target_read, mut target_write) = target_stream.into_split();
-
-    let client_to_target = async {
-        tokio::io::copy(&mut client_read, &mut target_write).await
-    };
-    let target_to_client = async {
-        tokio::io::copy(&mut target_read, &mut client_write).await
-    };
-
-    let (up_res, down_res) = tokio::join!(client_to_target, target_to_client);
-    let up = up_res.unwrap_or(0) + initial_up;
-    let down = down_res.unwrap_or(0);
-
-    info!(
-        "[HTTP FORWARD] conn={} user_id={} target={} finished (up={} bytes, down={} bytes)",
-        conn_id, user.id, target_addr, up, down
-    );
-
-    Ok((up, down))
+    let mut prefix = rewritten_req.into_bytes();
+    prefix.extend_from_slice(leftover);
+    crate::protocol::http::connect::relay(
+        client_stream,
+        &host,
+        port,
+        prefix,
+        user,
+        remote_addr,
+        ctx,
+        false,
+    )
+    .await
 }
