@@ -198,7 +198,7 @@ PY
         [[ "$entry" != instance || "$SERVICE_MANAGER" == systemd ]] || continue
         if [[ -e "$dest" ]]; then cp -p "$dest" "$WORK/old-$entry"; else touch "$WORK/new-$entry"; fi
     done
-    for entry in elise.conf routes.toml dns.yml blockList whiteList; do
+    for entry in elise.conf dns.yml blockList whiteList; do
         if [[ ! -e "$CONF_DIR/$entry" ]]; then
             install -m 600 "$WORK/elise/example/$entry" "$CONF_DIR/$entry"
         fi

@@ -33,7 +33,6 @@ WORKDIR /etc/elise
 # Copy executable and example configurations
 COPY --from=builder /build/elise-binary /usr/local/bin/elise
 COPY example/elise.conf /etc/elise/elise.conf
-COPY example/routes.toml /etc/elise/routes.toml
 COPY example/dns.yml /etc/elise/dns.yml
 COPY example/blockList /etc/elise/blockList
 COPY example/whiteList /etc/elise/whiteList

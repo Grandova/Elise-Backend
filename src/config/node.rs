@@ -136,7 +136,7 @@ impl NodeConfig {
 
         let file_path = dir.join(format!("node_{}.conf", self.node_id));
 
-        let user_part = if !self.raw_user_section.is_empty() {
+        let mut user_part = if !self.raw_user_section.is_empty() {
             format!("[USER]\n{}\n", self.raw_user_section)
         } else {
             format!(
@@ -156,28 +156,141 @@ impl NodeConfig {
             )
         };
 
+        let mut pattern = String::new();
+        if node_info.node_type.eq_ignore_ascii_case("mieru") {
+            pattern = format!(
+                "traffic_pattern = {}\n",
+                node_info.traffic_pattern.as_deref().unwrap_or("").trim()
+            );
+            if !user_part.lines().any(|line| {
+                line.trim()
+                    .trim_start_matches('#')
+                    .trim()
+                    .split_once('=')
+                    .is_some_and(|(key, _)| {
+                        key.trim().eq_ignore_ascii_case("mieru_traffic_pattern")
+                    })
+            }) {
+                user_part.push_str(
+                    "# Mieru 非空覆盖优先级：节点 [USER] > 主配置 > 面板；留空使用面板值。\n# mieru_traffic_pattern =\n",
+                );
+            }
+        }
+
         let content = format!(
             r#"# ==============================================================================
 # Elise 节点独立配置文件 (Node ID: {})
 # [AUTO] 区由 Elise 根据面板 API 下发信息自动维护生成，请勿手动编辑该区域。
 # [USER] 区为用户自定义覆盖项，重启与更新配置时将完整保留。
-# 覆盖优先级：面板 API > [USER] 自定义覆盖 > 主配置 elise.conf
+# 参数优先级按字段确定；[USER] 仅覆盖已接入的配置项。
 # ==============================================================================
 
 [AUTO]
 node_id = {}
 server_type = {}
 server_port = {}
-
+{}
 {}
 "#,
             self.node_id,
             self.node_id,
             node_info.node_type,
             node_info.server_port,
+            pattern,
             user_part.trim()
         );
 
         fs::write(file_path, content)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::prelude::*;
+    use prost::Message;
+
+    #[test]
+    fn mieru_config_refresh_preserves_local_overrides() {
+        let dir = std::env::temp_dir().join(format!("elise-node-config-{}", uuid::Uuid::new_v4()));
+        let mut info = NodeInfo {
+            node_type: "mieru".into(),
+            server_port: 5000,
+            traffic_pattern: Some(
+                BASE64_STANDARD.encode(
+                    crate::protocol::mieru::proto::TrafficPattern {
+                        seed: Some(42),
+                        ..Default::default()
+                    }
+                    .encode_to_vec(),
+                ),
+            ),
+            ..Default::default()
+        };
+        let mut cfg = NodeConfig {
+            node_id: 26,
+            ..Default::default()
+        };
+        cfg.parse_content("[USER]\n# existing comment\nlisten_addr = 127.0.0.1");
+        cfg.save_node_conf(&dir, &info).unwrap();
+        let path = dir.join("node_26.conf");
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains(&format!(
+            "traffic_pattern = {}",
+            info.traffic_pattern.as_deref().unwrap()
+        )));
+        assert!(content.contains("# existing comment\nlisten_addr = 127.0.0.1"));
+        assert_eq!(content.matches("# mieru_traffic_pattern =").count(), 1);
+        let mut reloaded = NodeConfig::load_for_node(&dir, 26);
+        assert!(!reloaded
+            .custom_settings
+            .contains_key("mieru_traffic_pattern"));
+
+        reloaded.parse_content(&content.replace(
+            "# mieru_traffic_pattern =",
+            &format!(
+                "mieru_traffic_pattern = {}",
+                info.traffic_pattern.as_deref().unwrap()
+            ),
+        ));
+        info.traffic_pattern = None;
+        reloaded.save_node_conf(&dir, &info).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("traffic_pattern = \n"));
+        assert_eq!(content.matches("mieru_traffic_pattern =").count(), 1);
+        assert_eq!(
+            NodeConfig::load_for_node(&dir, 26)
+                .custom_settings
+                .get("mieru_traffic_pattern"),
+            reloaded.custom_settings.get("mieru_traffic_pattern")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn default_config_only_adds_pattern_for_mieru() {
+        let dir = std::env::temp_dir().join(format!("elise-node-config-{}", uuid::Uuid::new_v4()));
+        let cfg = NodeConfig {
+            node_id: 1,
+            ..Default::default()
+        };
+        for kind in ["mieru", "vless"] {
+            cfg.save_node_conf(
+                &dir,
+                &NodeInfo {
+                    node_type: kind.into(),
+                    server_port: 1234,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let content = fs::read_to_string(dir.join("node_1.conf")).unwrap();
+            assert_eq!(content.contains("traffic_pattern ="), kind == "mieru");
+            assert_eq!(
+                content.contains("# mieru_traffic_pattern ="),
+                kind == "mieru"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -62,7 +62,9 @@ impl DNSResolver {
             if let Some(ref strat) = tbl.strategy {
                 *self.strategy.write() = strat.clone();
             }
-            if let Some(mins) = tbl.cache_time {
+            if let Some(seconds) = tbl.cache_ttl {
+                *self.cache_ttl.write() = Duration::from_secs(seconds.max(1));
+            } else if let Some(mins) = tbl.cache_time {
                 *self.cache_ttl.write() = Duration::from_secs(mins.max(1) * 60);
             }
             if !tbl.default_servers.is_empty() {
@@ -70,6 +72,7 @@ impl DNSResolver {
             }
         }
         *self.rules_table.write() = table;
+        self.cache.write().clear();
     }
 
     pub fn update_config(
@@ -304,5 +307,67 @@ impl DNSResolver {
                 v4
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::UdpSocket;
+
+    #[tokio::test]
+    async fn tagged_dns_rules_query_selected_server_and_reload_cache() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            // Independent DNS fixture: reply to A questions with a fixed IPv4 RR.
+            for octet in [10, 20] {
+                let mut buf = [0u8; 512];
+                let (len, peer) = socket.recv_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[len - 4..len - 2], &[0, 1]);
+                let mut reply = Vec::from(&buf[..len]);
+                reply[2..4].copy_from_slice(&[0x81, 0x80]);
+                reply[6..8].copy_from_slice(&[0, 1]);
+                reply.extend_from_slice(&[
+                    0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, octet,
+                ]);
+                socket.send_to(&reply, peer).await.unwrap();
+            }
+        });
+        let resolver = DNSResolver::default();
+        let table = DnsRulesTable::parse_yaml(&format!(
+            "strategy: ipv4_only\ncache_ttl: 7\nservers: [{{tag: local, address: 'udp://{addr}'}}]\nrules: [{{domains: ['*.elise.invalid'], server: local}}]"
+        )).unwrap();
+        resolver.set_rules_table(Some(table.clone()));
+        assert_eq!(*resolver.cache_ttl.read(), Duration::from_secs(7));
+        for _ in 0..2 {
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                resolver.resolve("test.elise.invalid", 443),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                result,
+                vec!["192.0.2.10:443".parse::<SocketAddr>().unwrap()]
+            );
+        }
+        resolver.set_rules_table(Some(table));
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            resolver.resolve("test.elise.invalid", 443),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            result,
+            vec!["192.0.2.20:443".parse::<SocketAddr>().unwrap()]
+        );
+        tokio::time::timeout(Duration::from_secs(3), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

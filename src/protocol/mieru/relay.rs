@@ -167,6 +167,16 @@ where
     let outbound_stream = match outbound_res {
         Ok(s) => s,
         Err(e) => {
+            debug!(
+                node_id = ctx.node_id,
+                user_id,
+                target_host = %target_host,
+                target_port,
+                outbound = %outbound.tag,
+                outbound_type = %outbound.outbound_type,
+                error = %e,
+                "Mieru TCP outbound failed"
+            );
             let _ = client_write
                 .write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await;

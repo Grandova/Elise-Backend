@@ -21,6 +21,9 @@ impl DomainMatcher {
         if let Some(rest) = raw.strip_prefix("full:") {
             return DomainMatcher::Full(rest.to_lowercase());
         }
+        if let Some(rest) = raw.strip_prefix("*.") {
+            return DomainMatcher::Domain(rest.to_lowercase());
+        }
         if let Some(rest) = raw.strip_prefix("domain:") {
             return DomainMatcher::Domain(rest.to_lowercase());
         }
@@ -92,6 +95,7 @@ pub struct CompiledDnsRule {
 pub struct DnsRulesTable {
     pub strategy: Option<String>,
     pub cache_time: Option<u64>,
+    pub cache_ttl: Option<u64>,
     pub default_servers: Vec<String>,
     pub rules: Vec<CompiledDnsRule>,
 }
@@ -106,14 +110,23 @@ struct FullYamlRuleItem {
     domains: Vec<String>,
     #[serde(default)]
     servers: Vec<String>,
+    server: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(untagged)]
+enum FullYamlServer {
+    Address(String),
+    Named { tag: String, address: String },
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct FullYamlConfig {
     strategy: Option<String>,
     cache_time: Option<u64>,
+    cache_ttl: Option<u64>,
     #[serde(default)]
-    servers: Vec<String>,
+    servers: Vec<FullYamlServer>,
     #[serde(default)]
     rules: Vec<FullYamlRuleItem>,
 }
@@ -153,22 +166,45 @@ impl DnsRulesTable {
         if let Ok(full) = serde_yaml::from_str::<FullYamlConfig>(content) {
             if full.strategy.is_some()
                 || full.cache_time.is_some()
+                || full.cache_ttl.is_some()
                 || !full.servers.is_empty()
                 || !full.rules.is_empty()
             {
+                let mut named = HashMap::new();
+                let mut default_servers = Vec::new();
+                for server in full.servers {
+                    match server {
+                        FullYamlServer::Address(address) => default_servers.push(address),
+                        FullYamlServer::Named { tag, address } => {
+                            if tag.trim().is_empty() || address.trim().is_empty() {
+                                return Err("DNS server tag and address must not be empty".into());
+                            }
+                            if named.insert(tag.clone(), address).is_some() {
+                                return Err(format!("Duplicate DNS server tag: {tag}"));
+                            }
+                        }
+                    }
+                }
                 let mut rules = Vec::new();
                 for r in full.rules {
                     let matchers = r.domains.iter().map(|d| DomainMatcher::parse(d)).collect();
-                    rules.push(CompiledDnsRule {
-                        matchers,
-                        servers: r.servers,
-                    });
+                    let mut servers = r.servers;
+                    if let Some(tag) = r.server {
+                        servers.push(
+                            named
+                                .get(&tag)
+                                .cloned()
+                                .ok_or_else(|| format!("Unknown DNS server tag: {tag}"))?,
+                        );
+                    }
+                    rules.push(CompiledDnsRule { matchers, servers });
                 }
 
                 return Ok(DnsRulesTable {
                     strategy: full.strategy,
                     cache_time: full.cache_time,
-                    default_servers: full.servers,
+                    cache_ttl: full.cache_ttl,
+                    default_servers,
                     rules,
                 });
             }
@@ -187,6 +223,7 @@ impl DnsRulesTable {
             return Ok(DnsRulesTable {
                 strategy: None,
                 cache_time: None,
+                cache_ttl: None,
                 default_servers: Vec::new(),
                 rules,
             });
@@ -244,6 +281,33 @@ mod tests {
         assert!(m_geo.matches("test.baidu.com"));
         assert!(m_geo.matches("gov.cn"));
         assert!(!m_geo.matches("google.com"));
+    }
+
+    #[test]
+    fn shipped_dns_config_resolves_tags_and_wildcards() {
+        let table = DnsRulesTable::parse_yaml(include_str!("../../example/dns.yml")).unwrap();
+        assert_eq!(table.cache_ttl, Some(300));
+        assert!(table.default_servers.is_empty());
+        for (domain, server) in [
+            ("www.github.com", "https://1.1.1.1/dns-query"),
+            ("openai.com", "https://1.1.1.1/dns-query"),
+            ("chatgpt.com", "https://dns.google/dns-query"),
+            ("www.baidu.com", "udp://223.5.5.5:53"),
+            ("notgithub.com", "https://dns.google/dns-query"),
+        ] {
+            assert_eq!(table.match_servers(domain), Some(&[server.to_owned()][..]));
+        }
+    }
+
+    #[test]
+    fn invalid_dns_server_references_are_rejected() {
+        for (yaml, expected) in [
+            ("{servers: [{tag: resolver, address: '1.1.1.1'}], rules: [{domains: ['*'], server: missing}]}", "Unknown DNS server tag: missing"),
+            ("servers: [{tag: resolver, address: '1.1.1.1'}, {tag: resolver, address: '8.8.8.8'}]", "Duplicate DNS server tag: resolver"),
+            ("servers: [{tag: resolver, address: ''}]", "DNS server tag and address must not be empty"),
+        ] {
+            assert_eq!(DnsRulesTable::parse_yaml(yaml).unwrap_err(), expected);
+        }
     }
 
     #[test]

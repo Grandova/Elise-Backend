@@ -533,6 +533,8 @@ cert_mode = none
 
 ### 3.3 路由、DNS 与出站分流
 
+安装脚本和容器镜像不会自动创建 `/etc/elise/routes.toml`；文件不存在时使用默认直连。有分流需求时请手动创建，或参考 `example/routes.toml`。示例中的 WARP 路由默认注释，确认对应 SOCKS5 服务可用后再启用。
+
 <a id="section-3-3-1"></a>
 
 #### 3.3.1 基础路由与 DNS 参数

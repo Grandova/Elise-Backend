@@ -75,10 +75,10 @@ outbound = "block"
 domain_suffix = [".cn", ".qq.com", ".baidu.com", ".aliyun.com", ".jd.com"]
 outbound = "direct"
 
-# Rule 4: Forward Specific Node or Streaming Traffic to Upstream SOCKS5 (e.g. WARP)
-[[rules]]
-domain_keyword = ["netflix", "chatgpt", "openai"]
-outbound = "warp-socks5"
+# Rule 4: Optional WARP routing. Enable only after a SOCKS5 server is running at the configured address.
+# [[rules]]
+# domain_keyword = ["netflix", "chatgpt", "openai"]
+# outbound = "warp-socks5"
 
 # Rule 5: Fallthrough to direct outbound
 [[rules]]
