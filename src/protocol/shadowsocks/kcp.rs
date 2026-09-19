@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::{Aes128, Aes192, Aes256};
 use rand::RngCore;

@@ -1,17 +1,19 @@
-use crate::conn::{BoxedStream, PrefixedStream};
+use crate::conn::BoxedStream;
 use crate::panel::types::User;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use base64::Engine;
 use bytes::{BufMut, BytesMut};
+use rand::RngCore;
 use shadowsocks::context::Context;
 use shadowsocks::crypto::{v2::tcp::TcpCipher, v2::udp::UdpCipher, CipherKind};
 use shadowsocks::relay::socks5::Address;
-use shadowsocks::relay::tcprelay::proxy_stream::ProxyServerStream;
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Cursor};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context as TaskContext, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, ReadBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -64,32 +66,86 @@ impl Method {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ss2022Key {
+    raw: Vec<u8>,
+    identity_hash: [u8; 16],
+}
+
+impl Ss2022Key {
+    pub fn parse(b64_key: &str, method: Method) -> io::Result<Self> {
+        let raw = decode_key(b64_key, method)?;
+        let hash = blake3::hash(&raw);
+        let mut identity_hash = [0u8; 16];
+        identity_hash.copy_from_slice(&hash.as_bytes()[..16]);
+        Ok(Self { raw, identity_hash })
+    }
+
+    pub fn from_raw(raw: Vec<u8>, method: Method) -> io::Result<Self> {
+        if raw.len() != method.key_len() {
+            return Err(invalid("Raw key length mismatch for cipher"));
+        }
+        let hash = blake3::hash(&raw);
+        let mut identity_hash = [0u8; 16];
+        identity_hash.copy_from_slice(&hash.as_bytes()[..16]);
+        Ok(Self { raw, identity_hash })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.raw
+    }
+
+    pub fn identity_hash(&self) -> &[u8; 16] {
+        &self.identity_hash
+    }
+}
+
 pub struct Credential {
     pub user: User,
     pub key: Vec<u8>,
+    pub identity_hash: [u8; 16],
     pub context: Arc<Context>,
 }
 
 impl Credential {
+    pub fn all_for_user(user: User, method: Method, context: Arc<Context>) -> Vec<Self> {
+        match Self::new(user, method, context) {
+            Ok(cred) => vec![cred],
+            Err(_) => Vec::new(),
+        }
+    }
+
     pub fn new(user: User, method: Method, context: Arc<Context>) -> io::Result<Self> {
-        let password = user.password.as_deref().unwrap_or(&user.uuid);
-        let key = if method == Method::None {
-            Vec::new()
-        } else if method.is_aead_2022() {
-            match decode_key(password, method) {
-                Ok(k) => k,
-                Err(_) => {
-                    // Panel compatibility: if user password/uuid is not pre-encoded Base64 of exact length,
-                    // derive a deterministic key of required length using BLAKE3 KDF.
-                    let derived =
-                        blake3::derive_key("shadowsocks 2022 user key", password.as_bytes());
-                    derived[..method.key_len()].to_vec()
-                }
-            }
+        if method == Method::None {
+            return Ok(Self {
+                user,
+                key: Vec::new(),
+                identity_hash: [0u8; 16],
+                context,
+            });
+        }
+        let raw_pwd = user
+            .password
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(user.uuid.as_str());
+
+        let key = if method.is_aead_2022() {
+            decode_key(raw_pwd, method)?
         } else {
-            crate::protocol::ss_crypto::evp_bytes_to_key(password.as_bytes(), method.key_len())
+            crate::protocol::ss_crypto::evp_bytes_to_key(raw_pwd.as_bytes(), method.key_len())
         };
-        Ok(Self { user, key, context })
+
+        let hash = blake3::hash(&key);
+        let mut identity_hash = [0u8; 16];
+        identity_hash.copy_from_slice(&hash.as_bytes()[..16]);
+
+        Ok(Self {
+            user,
+            key,
+            identity_hash,
+            context,
+        })
     }
 }
 
@@ -172,17 +228,17 @@ pub fn decode_key(value: &str, method: Method) -> io::Result<Vec<u8>> {
         }
     }
 
-    // 3. Hex (e.g. 32 chars for 16B, 64 chars for 32B)
-    if value.len() == key_len * 2 {
-        if let Ok(key) = hex::decode(value) {
-            if key.len() == key_len {
-                return Ok(key);
-            }
-        }
-    }
-
-    Err(invalid("SS2022 key length does not match cipher"))
+    Err(invalid(
+        "SS2022 key must be Base64-encoded PSK with matching length",
+    ))
 }
+
+pub const SS2022_SESSION_SUBKEY_CONTEXT: &str = "shadowsocks 2022 session subkey";
+pub const SS2022_IDENTITY_SUBKEY_CONTEXT: &str = "shadowsocks 2022 identity subkey";
+pub const SERVER_STREAM_TIMESTAMP_MAX_DIFF: u64 = 30;
+pub const SERVER_PACKET_TIMESTAMP_MAX_DIFF: u64 = 30;
+pub const MAX_TIMESTAMP_SKEW_SECS: u64 = 30;
+pub const SS2022_MAX_CHUNK_LEN: usize = 0xFFFF; // 65535 bytes
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -195,26 +251,436 @@ fn now() -> io::Result<u64> {
         .map_err(|_| invalid("System clock is before UNIX epoch"))
 }
 
-// SIP023 uses a single AES block, not AEAD, for the identity/header block.
-fn aes_block(method: CipherKind, key: &[u8], block: &mut [u8], encrypt: bool) {
+pub fn derive_session_subkey(psk: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
+    let mut hasher = blake3::Hasher::new_derive_key(SS2022_SESSION_SUBKEY_CONTEXT);
+    hasher.update(psk);
+    hasher.update(salt);
+    let mut out = vec![0u8; key_len];
+    hasher.finalize_xof().fill(&mut out);
+    out
+}
+
+pub fn derive_identity_subkey(server_key: &[u8], salt: &[u8]) -> [u8; 32] {
+    let mut key_material = Vec::with_capacity(server_key.len() + salt.len());
+    key_material.extend_from_slice(server_key);
+    key_material.extend_from_slice(salt);
+    blake3::derive_key(SS2022_IDENTITY_SUBKEY_CONTEXT, &key_material)
+}
+
+pub fn aes_block_encrypt(method: CipherKind, key: &[u8], block: &mut [u8; 16]) {
     match method {
         CipherKind::AEAD2022_BLAKE3_AES_128_GCM => {
-            let cipher = aes::Aes128::new_from_slice(key).expect("validated AES key");
-            if encrypt {
-                cipher.encrypt_block(block.into());
-            } else {
-                cipher.decrypt_block(block.into());
-            }
+            let cipher = aes::Aes128::new_from_slice(key).expect("16-byte AES-128 key");
+            cipher.encrypt_block(block.into());
         }
         CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
-            let cipher = aes::Aes256::new_from_slice(key).expect("validated AES key");
-            if encrypt {
-                cipher.encrypt_block(block.into());
-            } else {
-                cipher.decrypt_block(block.into());
+            let cipher = aes::Aes256::new_from_slice(key).expect("32-byte AES-256 key");
+            cipher.encrypt_block(block.into());
+        }
+        _ => panic!("AES block encrypt only supported for AES ciphers"),
+    }
+}
+
+pub fn aes_block_decrypt(method: CipherKind, key: &[u8], block: &mut [u8; 16]) {
+    match method {
+        CipherKind::AEAD2022_BLAKE3_AES_128_GCM => {
+            let cipher = aes::Aes128::new_from_slice(key).expect("16-byte AES-128 key");
+            cipher.decrypt_block(block.into());
+        }
+        CipherKind::AEAD2022_BLAKE3_AES_256_GCM => {
+            let cipher = aes::Aes256::new_from_slice(key).expect("32-byte AES-256 key");
+            cipher.decrypt_block(block.into());
+        }
+        _ => panic!("AES block decrypt only supported for AES ciphers"),
+    }
+}
+
+pub fn aes_block(method: CipherKind, key: &[u8], block: &mut [u8], encrypt: bool) {
+    let b: &mut [u8; 16] = block.try_into().expect("16-byte block");
+    if encrypt {
+        aes_block_encrypt(method, key, b);
+    } else {
+        aes_block_decrypt(method, key, b);
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ss2022Nonce {
+    bytes: [u8; 12],
+}
+
+impl Default for Ss2022Nonce {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Ss2022Nonce {
+    pub fn new() -> Self {
+        Self { bytes: [0u8; 12] }
+    }
+
+    pub fn as_slice(&self) -> &[u8; 12] {
+        &self.bytes
+    }
+
+    pub fn increment(&mut self) {
+        let mut c = self.bytes[0] as u16 + 1;
+        self.bytes[0] = c as u8;
+        c >>= 8;
+        let mut n = 1;
+        while n < 12 {
+            c += self.bytes[n] as u16;
+            self.bytes[n] = c as u8;
+            c >>= 8;
+            n += 1;
+        }
+    }
+}
+
+enum ReaderState {
+    YieldingData {
+        buf: Vec<u8>,
+        pos: usize,
+    },
+    ReadingLength {
+        buf: [u8; 18],
+        pos: usize,
+    },
+    ReadingData {
+        length: usize,
+        buf: Vec<u8>,
+        pos: usize,
+    },
+}
+
+pub struct Ss2022TcpReader {
+    cipher: TcpCipher,
+    state: ReaderState,
+}
+
+impl Ss2022TcpReader {
+    pub fn new(cipher: TcpCipher, initial_payload: Vec<u8>) -> Self {
+        let state = if initial_payload.is_empty() {
+            ReaderState::ReadingLength {
+                buf: [0u8; 18],
+                pos: 0,
+            }
+        } else {
+            ReaderState::YieldingData {
+                buf: initial_payload,
+                pos: 0,
+            }
+        };
+        Self { cipher, state }
+    }
+
+    pub fn poll_read_decrypted<S>(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        stream: &mut S,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>>
+    where
+        S: AsyncRead + Unpin + ?Sized,
+    {
+        loop {
+            match &mut self.state {
+                ReaderState::YieldingData { buf: data, pos } => {
+                    let remaining = data.len() - *pos;
+                    let to_read = remaining.min(buf.remaining());
+                    buf.put_slice(&data[*pos..*pos + to_read]);
+                    *pos += to_read;
+                    if *pos >= data.len() {
+                        self.state = ReaderState::ReadingLength {
+                            buf: [0u8; 18],
+                            pos: 0,
+                        };
+                    }
+                    return Poll::Ready(Ok(()));
+                }
+                ReaderState::ReadingLength { buf: len_buf, pos } => {
+                    while *pos < 18 {
+                        let mut read_buf = ReadBuf::new(&mut len_buf[*pos..18]);
+                        match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = read_buf.filled().len();
+                                if n == 0 {
+                                    if *pos == 0 {
+                                        return Poll::Ready(Ok(())); // Clean EOF
+                                    } else {
+                                        return Poll::Ready(Err(io::Error::new(
+                                            io::ErrorKind::UnexpectedEof,
+                                            "Unexpected EOF while reading length chunk",
+                                        )));
+                                    }
+                                }
+                                *pos += n;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    if !self.cipher.decrypt_packet(len_buf) {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Failed to decrypt SS2022 chunk length tag",
+                        )));
+                    }
+                    let chunk_len = u16::from_be_bytes([len_buf[0], len_buf[1]]) as usize;
+                    if chunk_len == 0 {
+                        self.state = ReaderState::ReadingLength {
+                            buf: [0u8; 18],
+                            pos: 0,
+                        };
+                        continue;
+                    }
+                    self.state = ReaderState::ReadingData {
+                        length: chunk_len,
+                        buf: vec![0u8; chunk_len + 16],
+                        pos: 0,
+                    };
+                }
+                ReaderState::ReadingData {
+                    length,
+                    buf: data_buf,
+                    pos,
+                } => {
+                    let total = *length + 16;
+                    while *pos < total {
+                        let mut read_buf = ReadBuf::new(&mut data_buf[*pos..total]);
+                        match Pin::new(&mut *stream).poll_read(cx, &mut read_buf) {
+                            Poll::Ready(Ok(())) => {
+                                let n = read_buf.filled().len();
+                                if n == 0 {
+                                    return Poll::Ready(Err(io::Error::new(
+                                        io::ErrorKind::UnexpectedEof,
+                                        "Unexpected EOF while reading data chunk",
+                                    )));
+                                }
+                                *pos += n;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Pending => return Poll::Pending,
+                        }
+                    }
+                    if !self.cipher.decrypt_packet(data_buf) {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Failed to decrypt SS2022 chunk data tag",
+                        )));
+                    }
+                    data_buf.truncate(*length);
+                    let finished_buf = std::mem::take(data_buf);
+                    self.state = ReaderState::YieldingData {
+                        buf: finished_buf,
+                        pos: 0,
+                    };
+                }
             }
         }
-        _ => unreachable!("AES identity only"),
+    }
+}
+
+enum WriterState {
+    FirstChunk,
+    Normal,
+}
+
+pub struct Ss2022TcpWriter {
+    cipher: TcpCipher,
+    response_salt: Vec<u8>,
+    request_salt: Vec<u8>,
+    pending_buf: Vec<u8>,
+    pending_pos: usize,
+    state: WriterState,
+}
+
+impl Ss2022TcpWriter {
+    pub fn new(cipher: TcpCipher, response_salt: Vec<u8>, request_salt: Vec<u8>) -> Self {
+        Self {
+            cipher,
+            response_salt,
+            request_salt,
+            pending_buf: Vec::new(),
+            pending_pos: 0,
+            state: WriterState::FirstChunk,
+        }
+    }
+
+    pub fn poll_write_encrypted<S>(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        stream: &mut S,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>>
+    where
+        S: AsyncWrite + Unpin + ?Sized,
+    {
+        while self.pending_pos < self.pending_buf.len() {
+            match Pin::new(&mut *stream).poll_write(cx, &self.pending_buf[self.pending_pos..]) {
+                Poll::Ready(Ok(n)) => {
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "Failed to write to stream",
+                        )));
+                    }
+                    self.pending_pos += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+
+        self.pending_buf.clear();
+        self.pending_pos = 0;
+
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+
+        let chunk_len = buf.len().min(SS2022_MAX_CHUNK_LEN);
+        let payload = &buf[..chunk_len];
+
+        match self.state {
+            WriterState::FirstChunk => {
+                let salt_len = self.request_salt.len();
+                let fixed_header_plain_len = 1 + 8 + salt_len + 2;
+                let mut fixed_header = Vec::with_capacity(fixed_header_plain_len + 16);
+                fixed_header.push(1u8); // Type = 1 (Server)
+                fixed_header.extend_from_slice(&now()?.to_be_bytes());
+                fixed_header.extend_from_slice(&self.request_salt);
+                fixed_header.extend_from_slice(&(chunk_len as u16).to_be_bytes());
+                fixed_header.resize(fixed_header_plain_len + 16, 0);
+                self.cipher.encrypt_packet(&mut fixed_header);
+
+                let mut data_chunk = Vec::with_capacity(chunk_len + 16);
+                data_chunk.extend_from_slice(payload);
+                data_chunk.resize(chunk_len + 16, 0);
+                self.cipher.encrypt_packet(&mut data_chunk);
+
+                self.pending_buf.extend_from_slice(&self.response_salt);
+                self.pending_buf.extend_from_slice(&fixed_header);
+                self.pending_buf.extend_from_slice(&data_chunk);
+                self.state = WriterState::Normal;
+            }
+            WriterState::Normal => {
+                let mut len_chunk = vec![0u8; 18];
+                len_chunk[..2].copy_from_slice(&(chunk_len as u16).to_be_bytes());
+                self.cipher.encrypt_packet(&mut len_chunk);
+
+                let mut data_chunk = Vec::with_capacity(chunk_len + 16);
+                data_chunk.extend_from_slice(payload);
+                data_chunk.resize(chunk_len + 16, 0);
+                self.cipher.encrypt_packet(&mut data_chunk);
+
+                self.pending_buf.extend_from_slice(&len_chunk);
+                self.pending_buf.extend_from_slice(&data_chunk);
+            }
+        }
+
+        while self.pending_pos < self.pending_buf.len() {
+            match Pin::new(&mut *stream).poll_write(cx, &self.pending_buf[self.pending_pos..]) {
+                Poll::Ready(Ok(n)) => {
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "Failed to write to stream",
+                        )));
+                    }
+                    self.pending_pos += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => {
+                    return Poll::Ready(Ok(chunk_len));
+                }
+            }
+        }
+
+        self.pending_buf.clear();
+        self.pending_pos = 0;
+        Poll::Ready(Ok(chunk_len))
+    }
+
+    pub fn poll_flush<S>(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        stream: &mut S,
+    ) -> Poll<io::Result<()>>
+    where
+        S: AsyncWrite + Unpin + ?Sized,
+    {
+        while self.pending_pos < self.pending_buf.len() {
+            match Pin::new(&mut *stream).poll_write(cx, &self.pending_buf[self.pending_pos..]) {
+                Poll::Ready(Ok(n)) => {
+                    if n == 0 {
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::WriteZero,
+                            "Failed to write to stream",
+                        )));
+                    }
+                    self.pending_pos += n;
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.pending_buf.clear();
+        self.pending_pos = 0;
+        Pin::new(&mut *stream).poll_flush(cx)
+    }
+
+    pub fn poll_shutdown<S>(
+        &mut self,
+        cx: &mut TaskContext<'_>,
+        stream: &mut S,
+    ) -> Poll<io::Result<()>>
+    where
+        S: AsyncWrite + Unpin + ?Sized,
+    {
+        match self.poll_flush(cx, stream) {
+            Poll::Ready(Ok(())) => Pin::new(&mut *stream).poll_shutdown(cx),
+            other => other,
+        }
+    }
+}
+
+pub struct Ss2022Stream<S> {
+    inner: S,
+    reader: Ss2022TcpReader,
+    writer: Ss2022TcpWriter,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for Ss2022Stream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        this.reader.poll_read_decrypted(cx, &mut this.inner, buf)
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for Ss2022Stream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = &mut *self;
+        this.writer.poll_write_encrypted(cx, &mut this.inner, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        this.writer.poll_flush(cx, &mut this.inner)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<io::Result<()>> {
+        let this = &mut *self;
+        this.writer.poll_shutdown(cx, &mut this.inner)
     }
 }
 
@@ -228,117 +694,89 @@ pub async fn handshake(
         return Err(invalid("Expected SS2022 method"));
     };
     let is_chacha = method == CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305;
-    let mut salt = vec![0; method.salt_len()];
+    let mut salt = vec![0u8; method.salt_len()];
     stream.read_exact(&mut salt).await?;
 
     let is_eih_supported = !is_chacha && server_key.is_some();
-    let (credential, header) = if is_eih_supported {
+    let credential = if is_eih_supported {
         let key = server_key.unwrap();
-        let mut first_16 = [0u8; 16];
-        stream.read_exact(&mut first_16).await?;
+        let mut eih = [0u8; 16];
+        stream.read_exact(&mut eih).await?;
 
-        let subkey = blake3::derive_key("shadowsocks 2022 identity subkey", &[key, &salt].concat());
-        let mut identity = first_16;
-        aes_block(method, &subkey[..method.key_len()], &mut identity, false);
+        let subkey = derive_identity_subkey(key, &salt);
+        let mut identity = eih;
+        aes_block_decrypt(method, &subkey[..method.key_len()], &mut identity);
 
-        if let Some(cred) = users.identity_map.get(&identity) {
-            let mut header = [0u8; 27];
-            stream.read_exact(&mut header).await?;
-            (cred.clone(), header)
-        } else {
-            // Client connected without EIH (single-user or direct mode): first_16 is the start of header
-            let mut rem_11 = [0u8; 11];
-            stream.read_exact(&mut rem_11).await?;
-            let mut header = [0u8; 27];
-            header[..16].copy_from_slice(&first_16);
-            header[16..].copy_from_slice(&rem_11);
-
-            let mut found = None;
-            for cred in &users.credentials {
-                let mut cipher = TcpCipher::new(method, &cred.key, &salt);
-                let mut plain = header;
-                if cipher.decrypt_packet(&mut plain)
-                    && plain[0] == 0
-                    && now()?.abs_diff(u64::from_be_bytes(plain[1..9].try_into().unwrap())) <= 30
-                {
-                    found = Some(cred.clone());
-                    break;
-                }
-            }
-            match found {
-                Some(cred) => (cred, header),
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        "SS2022 authentication failed",
-                    ));
-                }
-            }
-        }
+        users.identity_map.get(&identity).cloned().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "SS2022 EIH user authentication failed",
+            )
+        })?
     } else {
-        let mut header = [0u8; 27];
-        stream.read_exact(&mut header).await?;
-        let mut found = None;
-        for cred in &users.credentials {
-            let mut cipher = TcpCipher::new(method, &cred.key, &salt);
-            let mut plain = header;
-            if cipher.decrypt_packet(&mut plain)
-                && plain[0] == 0
-                && now()?.abs_diff(u64::from_be_bytes(plain[1..9].try_into().unwrap())) <= 30
-            {
-                found = Some(cred.clone());
-                break;
-            }
-        }
-        match found {
-            Some(cred) => (cred, header),
-            None => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "SS2022 authentication failed",
-                ));
-            }
-        }
+        users.credentials.first().cloned().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::PermissionDenied, "SS2022 no user configured")
+        })?
     };
 
-    let mut cipher = TcpCipher::new(method, &credential.key, &salt);
-    let mut plain = header;
-    if !cipher.decrypt_packet(&mut plain) {
+    let mut req_cipher = TcpCipher::new(method, &credential.key, &salt);
+    let mut fixed_header = [0u8; 27];
+    stream.read_exact(&mut fixed_header).await?;
+    if !req_cipher.decrypt_packet(&mut fixed_header) {
         return Err(invalid("Invalid SS2022 header tag"));
     }
-    if plain[0] != 0 || now()?.abs_diff(u64::from_be_bytes(plain[1..9].try_into().unwrap())) > 30 {
-        return Err(invalid("Invalid SS2022 request type or timestamp"));
+    if fixed_header[0] != 0 {
+        return Err(invalid("Invalid SS2022 request type"));
     }
-    let length = u16::from_be_bytes([plain[9], plain[10]]) as usize;
-    let mut body = vec![0; length + 16];
+    let timestamp = u64::from_be_bytes(fixed_header[1..9].try_into().unwrap());
+    if now()?.abs_diff(timestamp) > SERVER_STREAM_TIMESTAMP_MAX_DIFF {
+        return Err(invalid("Invalid SS2022 request timestamp"));
+    }
+
+    let var_len = u16::from_be_bytes([fixed_header[9], fixed_header[10]]) as usize;
+    let mut body = vec![0u8; var_len + 16];
     stream.read_exact(&mut body).await?;
-    let mut decoded = body.clone();
-    if !cipher.decrypt_packet(&mut decoded) {
-        return Err(invalid("Invalid SS2022 header tag"));
+    if !req_cipher.decrypt_packet(&mut body) {
+        return Err(invalid("Invalid SS2022 variable header tag"));
     }
-    let mut cursor = Cursor::new(&decoded[..length]);
+    body.truncate(var_len);
+
+    let mut cursor = Cursor::new(&body);
     let address = Address::read_cursor(&mut cursor).map_err(io::Error::other)?;
     let offset = cursor.position() as usize;
-    if length < offset + 2 {
+    if var_len < offset + 2 {
         return Err(invalid("Truncated SS2022 padding length"));
     }
-    let padding = u16::from_be_bytes([decoded[offset], decoded[offset + 1]]) as usize;
-    if offset + 2 + padding > length {
+
+    let padding = u16::from_be_bytes([body[offset], body[offset + 1]]) as usize;
+    let payload_start = offset + 2 + padding;
+    if var_len < payload_start {
         return Err(invalid("Invalid SS2022 initial padding/payload"));
     }
-    // Strip EIH after authenticating it; the library then handles the selected user's
-    // single-key stream, including replay and binding the response to the request salt.
-    let mut prefix = salt;
-    prefix.extend_from_slice(&header);
-    prefix.extend_from_slice(&body);
-    let stream = PrefixedStream::new(stream, Some(prefix));
-    let mut stream =
-        ProxyServerStream::from_stream(credential.context.clone(), stream, method, &credential.key);
-    let parsed = stream.handshake().await?;
-    if parsed != address {
-        return Err(invalid("SS2022 header mismatch"));
+    let initial_payload = body[payload_start..].to_vec();
+    if padding == 0 && initial_payload.is_empty() {
+        return Err(invalid(
+            "Insecure client: padding is 0 and no initial payload",
+        ));
     }
-    Ok((credential, Box::new(stream), address))
+
+    // Replay check strictly after all headers are fully authenticated
+    credential.context.check_nonce_replay(method, &salt)?;
+
+    let reader = Ss2022TcpReader::new(req_cipher, initial_payload);
+
+    let mut response_salt = vec![0u8; method.salt_len()];
+    rand::rngs::OsRng.fill_bytes(&mut response_salt);
+    let resp_cipher = TcpCipher::new(method, &credential.key, &response_salt);
+    let writer = Ss2022TcpWriter::new(resp_cipher, response_salt, salt);
+
+    let ss_stream = Ss2022Stream {
+        inner: stream,
+        reader,
+        writer,
+    };
+
+    Ok((credential, Box::new(ss_stream), address))
 }
 
 pub struct Datagram {
@@ -394,7 +832,7 @@ pub fn decrypt_udp_with_cache(
 
         // Fast path: try cached user credential first
         if let Some(uid) = cached_user_id {
-            if let Some(credential) = users.credentials.iter().find(|c| c.user.id == uid) {
+            for credential in users.credentials.iter().filter(|c| c.user.id == uid) {
                 let mut key = vec![0; kind.key_len()];
                 crate::protocol::ss_crypto::hkdf_sha1(&credential.key, salt, &mut key);
                 let cipher = crate::protocol::ss_crypto::AeadCipher::new(kind, &key);
@@ -450,14 +888,60 @@ pub fn decrypt_udp_with_cache(
         unreachable!()
     };
     let chacha = method == CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305;
-    let nonce_len = if chacha { 24 } else { 0 };
-    if packet.len() < nonce_len + 16 + 11 + 16 {
-        return Err(invalid("Truncated SS2022 UDP packet"));
+
+    // Case 1: ChaCha20-Poly1305 (Single-user only, no EIH, 24B random nonce)
+    if chacha {
+        if packet.len() < 24 + 16 + 11 + 16 {
+            return Err(invalid("Truncated SS2022 ChaCha20 UDP packet"));
+        }
+        let credential = if let Some(uid) = cached_user_id {
+            users
+                .credentials
+                .iter()
+                .find(|c| c.user.id == uid)
+                .or_else(|| users.credentials.first())
+        } else {
+            users.credentials.first()
+        }
+        .ok_or_else(|| invalid("No user configured for SS2022 UDP"))?;
+
+        let mut data = packet[24..].to_vec();
+        if !UdpCipher::new(method, &credential.key, 0).decrypt_packet(&packet[..24], &mut data) {
+            return Err(invalid("SS2022 ChaCha20 UDP tag verification failed"));
+        }
+        data.truncate(data.len() - 16);
+        let sid = u64::from_be_bytes(data[..8].try_into().unwrap());
+        let pid = u64::from_be_bytes(data[8..16].try_into().unwrap());
+        let offset = 16;
+        if data[offset] != 0 {
+            return Err(invalid("Invalid SS2022 UDP request type"));
+        }
+        let timestamp = u64::from_be_bytes(data[offset + 1..offset + 9].try_into().unwrap());
+        if now()?.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
+            return Err(invalid("Invalid SS2022 UDP timestamp"));
+        }
+        let padding = u16::from_be_bytes([data[offset + 9], data[offset + 10]]) as usize;
+        let start = offset + 11 + padding;
+        if start > data.len() {
+            return Err(invalid("Invalid SS2022 UDP padding"));
+        }
+        let mut cursor = Cursor::new(&data[start..]);
+        let address = Address::read_cursor(&mut cursor).map_err(io::Error::other)?;
+        let payload = data[start + cursor.position() as usize..].to_vec();
+        return Ok(Datagram {
+            credential: credential.clone(),
+            address,
+            payload,
+            session_id: sid,
+            packet_id: pid,
+        });
     }
 
-    // SS2022 Multi-User AES EIH Fast Path: O(1) user identification without looping
-    if !chacha && server_key.is_some() && packet.len() >= 32 + 11 + 16 {
-        let header_key = server_key.unwrap();
+    // Case 2: AES-128-GCM / AES-256-GCM Multi-User with SIP023 EIH (server_key is Some)
+    if let Some(header_key) = server_key {
+        if packet.len() < 32 + 11 + 16 {
+            return Err(invalid("Truncated SS2022 multi-user UDP packet"));
+        }
         let mut data = packet.to_vec();
         aes_block(method, header_key, &mut data[..16], false);
         aes_block(method, header_key, &mut data[16..32], false);
@@ -467,143 +951,92 @@ pub fn decrypt_udp_with_cache(
         let mut user_id = [0u8; 16];
         user_id.copy_from_slice(&data[16..32]);
 
-        if let Some(credential) = users.identity_map.get(&user_id) {
-            let sid = u64::from_be_bytes(data[..8].try_into().unwrap());
-            let nonce = data[4..16].to_vec();
-            if UdpCipher::new(method, &credential.key, sid).decrypt_packet(&nonce, &mut data[32..])
-            {
-                data.truncate(data.len() - 16);
-                let offset = 32;
-                if data[offset] == 0
-                    && now()?.abs_diff(u64::from_be_bytes(
-                        data[offset + 1..offset + 9].try_into().unwrap(),
-                    )) <= 30
-                {
-                    let padding =
-                        u16::from_be_bytes([data[offset + 9], data[offset + 10]]) as usize;
-                    let start = offset + 11 + padding;
-                    if start <= data.len() {
-                        let mut cursor = Cursor::new(&data[start..]);
-                        if let Ok(address) = Address::read_cursor(&mut cursor) {
-                            return Ok(Datagram {
-                                credential: credential.clone(),
-                                address,
-                                payload: data[start + cursor.position() as usize..].to_vec(),
-                                session_id: u64::from_be_bytes(data[..8].try_into().unwrap()),
-                                packet_id: u64::from_be_bytes(data[8..16].try_into().unwrap()),
-                            });
-                        }
-                    }
-                }
-            }
+        let credential = users.identity_map.get(&user_id).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "SS2022 UDP EIH user authentication failed",
+            )
+        })?;
+
+        let sid = u64::from_be_bytes(data[..8].try_into().unwrap());
+        let pid = u64::from_be_bytes(data[8..16].try_into().unwrap());
+        let nonce = data[4..16].to_vec();
+        if !UdpCipher::new(method, &credential.key, sid).decrypt_packet(&nonce, &mut data[32..]) {
+            return Err(invalid("SS2022 UDP body tag verification failed"));
         }
+        data.truncate(data.len() - 16);
+        let offset = 32;
+        if data[offset] != 0 {
+            return Err(invalid("Invalid SS2022 UDP request type"));
+        }
+        let timestamp = u64::from_be_bytes(data[offset + 1..offset + 9].try_into().unwrap());
+        if now()?.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
+            return Err(invalid("Invalid SS2022 UDP timestamp"));
+        }
+        let padding = u16::from_be_bytes([data[offset + 9], data[offset + 10]]) as usize;
+        let start = offset + 11 + padding;
+        if start > data.len() {
+            return Err(invalid("Invalid SS2022 UDP padding"));
+        }
+        let mut cursor = Cursor::new(&data[start..]);
+        let address = Address::read_cursor(&mut cursor).map_err(io::Error::other)?;
+        let payload = data[start + cursor.position() as usize..].to_vec();
+        return Ok(Datagram {
+            credential: credential.clone(),
+            address,
+            payload,
+            session_id: sid,
+            packet_id: pid,
+        });
     }
 
-    // Fast path: try cached user credential first (single-user / direct)
-    if let Some(uid) = cached_user_id {
-        if let Some(credential) = users.credentials.iter().find(|c| c.user.id == uid) {
-            let mut data = packet[nonce_len..].to_vec();
-            let mut success = false;
-            let mut sid = 0u64;
-            let mut pid = 0u64;
-            if chacha {
-                if UdpCipher::new(method, &credential.key, 0)
-                    .decrypt_packet(&packet[..24], &mut data)
-                {
-                    sid = u64::from_be_bytes(data[..8].try_into().unwrap());
-                    pid = u64::from_be_bytes(data[8..16].try_into().unwrap());
-                    success = true;
-                }
-            } else {
-                aes_block(method, &credential.key, &mut data[..16], false);
-                sid = u64::from_be_bytes(data[..8].try_into().unwrap());
-                pid = u64::from_be_bytes(data[8..16].try_into().unwrap());
-                let nonce = data[4..16].to_vec();
-                if UdpCipher::new(method, &credential.key, sid)
-                    .decrypt_packet(&nonce, &mut data[16..])
-                {
-                    success = true;
-                }
-            }
-            if success {
-                data.truncate(data.len() - 16);
-                let offset = 16;
-                if data[offset] == 0
-                    && now()?.abs_diff(u64::from_be_bytes(
-                        data[offset + 1..offset + 9].try_into().unwrap(),
-                    )) <= 30
-                {
-                    let padding =
-                        u16::from_be_bytes([data[offset + 9], data[offset + 10]]) as usize;
-                    let start = offset + 11 + padding;
-                    if start <= data.len() {
-                        let mut cursor = Cursor::new(&data[start..]);
-                        if let Ok(address) = Address::read_cursor(&mut cursor) {
-                            return Ok(Datagram {
-                                credential: credential.clone(),
-                                address,
-                                payload: data[start + cursor.position() as usize..].to_vec(),
-                                session_id: sid,
-                                packet_id: pid,
-                            });
-                        }
-                    }
-                }
-            }
-        }
+    // Case 3: AES-128-GCM / AES-256-GCM Single-User (server_key is None, no EIH)
+    if packet.len() < 16 + 11 + 16 {
+        return Err(invalid("Truncated SS2022 single-user UDP packet"));
     }
+    let credential = if let Some(uid) = cached_user_id {
+        users
+            .credentials
+            .iter()
+            .find(|c| c.user.id == uid)
+            .or_else(|| users.credentials.first())
+    } else {
+        users.credentials.first()
+    }
+    .ok_or_else(|| invalid("No user configured for SS2022 UDP"))?;
 
-    // Fallback scan for single-user (without EIH) or ChaCha20
-    for credential in &users.credentials {
-        if Some(credential.user.id) == cached_user_id {
-            continue;
-        }
-        let mut data = packet[nonce_len..].to_vec();
-        let mut success = false;
-        let mut sid = 0u64;
-        let mut pid = 0u64;
-        if chacha {
-            if UdpCipher::new(method, &credential.key, 0).decrypt_packet(&packet[..24], &mut data) {
-                sid = u64::from_be_bytes(data[..8].try_into().unwrap());
-                pid = u64::from_be_bytes(data[8..16].try_into().unwrap());
-                success = true;
-            }
-        } else {
-            aes_block(method, &credential.key, &mut data[..16], false);
-            sid = u64::from_be_bytes(data[..8].try_into().unwrap());
-            pid = u64::from_be_bytes(data[8..16].try_into().unwrap());
-            let nonce = data[4..16].to_vec();
-            if UdpCipher::new(method, &credential.key, sid).decrypt_packet(&nonce, &mut data[16..])
-            {
-                success = true;
-            }
-        }
-        if success {
-            data.truncate(data.len() - 16);
-            let offset = 16;
-            if data[offset] == 0
-                && now()?.abs_diff(u64::from_be_bytes(
-                    data[offset + 1..offset + 9].try_into().unwrap(),
-                )) <= 30
-            {
-                let padding = u16::from_be_bytes([data[offset + 9], data[offset + 10]]) as usize;
-                let start = offset + 11 + padding;
-                if start <= data.len() {
-                    let mut cursor = Cursor::new(&data[start..]);
-                    if let Ok(address) = Address::read_cursor(&mut cursor) {
-                        return Ok(Datagram {
-                            credential: credential.clone(),
-                            address,
-                            payload: data[start + cursor.position() as usize..].to_vec(),
-                            session_id: sid,
-                            packet_id: pid,
-                        });
-                    }
-                }
-            }
-        }
+    let mut data = packet.to_vec();
+    aes_block(method, &credential.key, &mut data[..16], false);
+    let sid = u64::from_be_bytes(data[..8].try_into().unwrap());
+    let pid = u64::from_be_bytes(data[8..16].try_into().unwrap());
+    let nonce = data[4..16].to_vec();
+    if !UdpCipher::new(method, &credential.key, sid).decrypt_packet(&nonce, &mut data[16..]) {
+        return Err(invalid("SS2022 UDP body tag verification failed"));
     }
-    Err(invalid("SS2022 UDP authentication failed"))
+    data.truncate(data.len() - 16);
+    let offset = 16;
+    if data[offset] != 0 {
+        return Err(invalid("Invalid SS2022 UDP request type"));
+    }
+    let timestamp = u64::from_be_bytes(data[offset + 1..offset + 9].try_into().unwrap());
+    if now()?.abs_diff(timestamp) > MAX_TIMESTAMP_SKEW_SECS {
+        return Err(invalid("Invalid SS2022 UDP timestamp"));
+    }
+    let padding = u16::from_be_bytes([data[offset + 9], data[offset + 10]]) as usize;
+    let start = offset + 11 + padding;
+    if start > data.len() {
+        return Err(invalid("Invalid SS2022 UDP padding"));
+    }
+    let mut cursor = Cursor::new(&data[start..]);
+    let address = Address::read_cursor(&mut cursor).map_err(io::Error::other)?;
+    let payload = data[start + cursor.position() as usize..].to_vec();
+    Ok(Datagram {
+        credential: credential.clone(),
+        address,
+        payload,
+        session_id: sid,
+        packet_id: pid,
+    })
 }
 
 pub fn encrypt_udp(
@@ -773,9 +1206,9 @@ mod tests {
 
         // Create 5,000 distinct users
         let mut users = Vec::with_capacity(5000);
-        for id in 1..=5000 {
+        for id in 1u32..=5000 {
             let mut key = vec![0u8; 16];
-            key[..4].copy_from_slice(&(id as u32).to_be_bytes());
+            key[..4].copy_from_slice(&id.to_be_bytes());
             key[4..8].copy_from_slice(&0xdeadbeefu32.to_be_bytes());
             let password = base64::engine::general_purpose::STANDARD.encode(&key);
             let cred = Arc::new(
@@ -859,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ss2022_decode_key_various_formats() {
+    fn test_ss2022_key_base64_strict_and_rejection() {
         for name in [
             "2022-blake3-aes-128-gcm",
             "2022-blake3-aes-256-gcm",
@@ -882,26 +1315,99 @@ mod tests {
             let url_unpadded = url_padded.trim_end_matches('=').to_string();
             assert_eq!(decode_key(&url_unpadded, method).unwrap(), raw_key);
 
-            // 4. Hex format
-            let hex_key = hex::encode(&raw_key);
-            assert_eq!(decode_key(&hex_key, method).unwrap(), raw_key);
+            // 4. Ss2022Key wrapper validation
+            let ss_key = Ss2022Key::parse(&std_padded, method).unwrap();
+            assert_eq!(ss_key.as_bytes(), &raw_key);
+            let hash = blake3::hash(&raw_key);
+            let expected_hash = &hash.as_bytes()[..16];
+            assert_eq!(ss_key.identity_hash(), expected_hash);
 
-            // 5. Credential fallback for non-base64 panel UUID
+            // 5. Raw non-base64 panel UUID MUST FAIL
             let context = Arc::new(Context::new(shadowsocks::config::ServerType::Server));
             let uuid = "c26f63be-5c1a-4d2b-923c-74a49c638e4a";
-            let cred = Credential::new(
+            assert!(decode_key(uuid, method).is_err());
+            assert!(Credential::new(
                 User {
                     uuid: uuid.to_string(),
                     ..Default::default()
                 },
                 method,
-                context,
+                context.clone(),
             )
-            .unwrap();
-            assert_eq!(cred.key.len(), method.key_len());
-            let expected_key = blake3::derive_key("shadowsocks 2022 user key", uuid.as_bytes());
-            assert_eq!(&cred.key[..], &expected_key[..method.key_len()]);
+            .is_err());
+
+            // 6. Wrong length base64 strings MUST FAIL
+            let wrong_len_raw = vec![0x37u8; method.key_len() + 1];
+            let wrong_len_b64 = base64::engine::general_purpose::STANDARD.encode(&wrong_len_raw);
+            assert!(decode_key(&wrong_len_b64, method).is_err());
+
+            let wrong_short_raw = vec![0x37u8; method.key_len() - 1];
+            let wrong_short_b64 =
+                base64::engine::general_purpose::STANDARD.encode(&wrong_short_raw);
+            assert!(decode_key(&wrong_short_b64, method).is_err());
         }
+    }
+
+    #[test]
+    fn test_ss2022_cryptographic_primitives_deterministic() {
+        let psk16 = [0x42u8; 16];
+        let psk32 = [0x24u8; 32];
+        let salt16 = [0x11u8; 16];
+        let salt32 = [0x99u8; 32];
+
+        // 1. Session subkey matches shadowsocks-crypto TcpCipher internal derivation
+        let subkey16 = derive_session_subkey(&psk16, &salt16, 16);
+        assert_eq!(subkey16.len(), 16);
+        let mut hasher16 = blake3::Hasher::new_derive_key(SS2022_SESSION_SUBKEY_CONTEXT);
+        hasher16.update(&psk16);
+        hasher16.update(&salt16);
+        let mut expected_subkey16 = [0u8; 16];
+        hasher16.finalize_xof().fill(&mut expected_subkey16);
+        assert_eq!(subkey16.as_slice(), &expected_subkey16);
+
+        let subkey32 = derive_session_subkey(&psk32, &salt32, 32);
+        assert_eq!(subkey32.len(), 32);
+        let mut hasher32 = blake3::Hasher::new_derive_key(SS2022_SESSION_SUBKEY_CONTEXT);
+        hasher32.update(&psk32);
+        hasher32.update(&salt32);
+        let mut expected_subkey32 = [0u8; 32];
+        hasher32.finalize_xof().fill(&mut expected_subkey32);
+        assert_eq!(subkey32.as_slice(), &expected_subkey32);
+
+        // 2. Identity subkey matches blake3 derive_key
+        let id_subkey = derive_identity_subkey(&psk16, &salt16);
+        let expected_id_subkey = blake3::derive_key(
+            SS2022_IDENTITY_SUBKEY_CONTEXT,
+            &[&psk16[..], &salt16[..]].concat(),
+        );
+        assert_eq!(id_subkey, expected_id_subkey);
+
+        // 3. AES ECB block encrypt & decrypt
+        let mut block = [0x55u8; 16];
+        let orig_block = block;
+        aes_block_encrypt(CipherKind::AEAD2022_BLAKE3_AES_128_GCM, &psk16, &mut block);
+        assert_ne!(block, orig_block);
+        aes_block_decrypt(CipherKind::AEAD2022_BLAKE3_AES_128_GCM, &psk16, &mut block);
+        assert_eq!(block, orig_block);
+
+        aes_block_encrypt(CipherKind::AEAD2022_BLAKE3_AES_256_GCM, &psk32, &mut block);
+        assert_ne!(block, orig_block);
+        aes_block_decrypt(CipherKind::AEAD2022_BLAKE3_AES_256_GCM, &psk32, &mut block);
+        assert_eq!(block, orig_block);
+
+        // 4. Ss2022Nonce 12-byte little endian increment
+        let mut nonce = Ss2022Nonce::new();
+        assert_eq!(nonce.as_slice(), &[0u8; 12]);
+        nonce.increment();
+        assert_eq!(nonce.as_slice()[0], 1);
+        for _ in 0..254 {
+            nonce.increment();
+        }
+        assert_eq!(nonce.as_slice()[0], 255);
+        assert_eq!(nonce.as_slice()[1], 0);
+        nonce.increment(); // 255 -> 256, carry to index 1
+        assert_eq!(nonce.as_slice()[0], 0);
+        assert_eq!(nonce.as_slice()[1], 1);
     }
 
     #[tokio::test]
@@ -942,9 +1448,9 @@ mod tests {
             // --- Sub-test A: Single-user client connection ---
             // Even if server has server_key configured, single-user clients must connect successfully!
             let raw_server_key = vec![0x21u8; method.key_len()];
-            let server_keys_to_test: Vec<Option<&[u8]>> = vec![None, Some(&raw_server_key)];
 
-            for server_key in server_keys_to_test {
+            // Sub-test A: Single-user client connection (server_key is None)
+            {
                 let (client_io, server_io) = tokio::io::duplex(65536);
                 let svr_cfg = ServerConfig::new(
                     "127.0.0.1:8388".parse::<std::net::SocketAddr>().unwrap(),
@@ -969,7 +1475,7 @@ mod tests {
                 });
 
                 let (authed_cred, mut server_stream, parsed_addr) =
-                    handshake(Box::new(server_io), method, server_key, &user_index)
+                    handshake(Box::new(server_io), method, None, &user_index)
                         .await
                         .unwrap();
                 assert_eq!(authed_cred.user.id, 1);
@@ -1112,14 +1618,63 @@ mod tests {
                 wire.extend_from_slice(&body);
             }
 
-            // Test decryption with server_key = None and server_key = Some
-            for server_key in [None, Some(raw_server_key.as_slice())] {
-                let dg = decrypt_udp(method, server_key, &user_index, &wire).unwrap();
-                assert_eq!(dg.credential.user.id, 42);
-                assert_eq!(dg.address, target_addr);
-                assert_eq!(dg.payload, client_payload);
-                assert_eq!(dg.session_id, client_session);
-                assert_eq!(dg.packet_id, client_packet_id);
+            // Test decryption with server_key = None (single-user packet)
+            let dg = decrypt_udp(method, None, &user_index, &wire).unwrap();
+            assert_eq!(dg.credential.user.id, 42);
+            assert_eq!(dg.address, target_addr);
+            assert_eq!(dg.payload, client_payload);
+            assert_eq!(dg.session_id, client_session);
+            assert_eq!(dg.packet_id, client_packet_id);
+
+            if !is_chacha {
+                // Multi-user server with server_key MUST reject single-user packet without EIH (no fallback)
+                assert!(
+                    decrypt_udp(method, Some(raw_server_key.as_slice()), &user_index, &wire)
+                        .is_err()
+                );
+
+                // Test multi-user packet with authentic SIP023 EIH
+                let mut eih_wire = Vec::new();
+                let mut header = [0u8; 16];
+                header[..8].copy_from_slice(&client_session.to_be_bytes());
+                header[8..16].copy_from_slice(&client_packet_id.to_be_bytes());
+
+                let mut eih = [0u8; 16];
+                let id_hash = blake3::hash(&cred.key);
+                eih.copy_from_slice(&id_hash.as_bytes()[..16]);
+                for i in 0..16 {
+                    eih[i] ^= header[i];
+                }
+
+                let mut body = Vec::new();
+                body.push(0u8);
+                body.extend_from_slice(&now().unwrap().to_be_bytes());
+                body.extend_from_slice(&0u16.to_be_bytes());
+                target_addr.write_to_buf(&mut body);
+                body.extend_from_slice(client_payload);
+                body.resize(body.len() + 16, 0);
+
+                let cipher = UdpCipher::new(cipher_kind, &cred.key, client_session);
+                cipher.encrypt_packet(&header[4..16], &mut body);
+                aes_block(cipher_kind, &raw_server_key, &mut header, true);
+                aes_block(cipher_kind, &raw_server_key, &mut eih, true);
+
+                eih_wire.extend_from_slice(&header);
+                eih_wire.extend_from_slice(&eih);
+                eih_wire.extend_from_slice(&body);
+
+                let eih_dg = decrypt_udp(
+                    method,
+                    Some(raw_server_key.as_slice()),
+                    &user_index,
+                    &eih_wire,
+                )
+                .unwrap();
+                assert_eq!(eih_dg.credential.user.id, 42);
+                assert_eq!(eih_dg.address, target_addr);
+                assert_eq!(eih_dg.payload, client_payload);
+                assert_eq!(eih_dg.session_id, client_session);
+                assert_eq!(eih_dg.packet_id, client_packet_id);
             }
 
             // Test encrypt_udp response

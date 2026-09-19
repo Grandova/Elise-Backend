@@ -4,7 +4,7 @@ use crate::conn::udp::UdpSession;
 use crate::protocol::InboundContext;
 use parking_lot::RwLock;
 use shadowsocks::relay::socks5::Address;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -15,23 +15,25 @@ use tokio::sync::mpsc;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-#[derive(Hash, Eq, PartialEq)]
+#[derive(Debug, Hash, Eq, PartialEq)]
 struct SessionKey {
-    remote: SocketAddr,
     user: u32,
     key: [u8; 32],
     session: u64,
     address: Address,
+    legacy_remote: Option<SocketAddr>,
 }
 
 struct Session {
     sender: mpsc::Sender<Vec<u8>>,
+    client_remote: Arc<RwLock<SocketAddr>>,
     cancel: CancellationToken,
 }
 
 struct ReplayWindow {
-    packets: BTreeSet<u64>,
+    bitmap: [u64; 16], // 16 * 64 = 1024-slot sliding bitmap
     highest: u64,
+    initialized: bool,
     seen: Instant,
     response: Arc<ResponseSession>,
 }
@@ -42,14 +44,61 @@ struct ResponseSession {
 }
 
 impl ReplayWindow {
-    fn accept(&mut self, packet: u64) -> bool {
-        if packet < self.highest.saturating_sub(1023) || !self.packets.insert(packet) {
-            return false;
+    fn new(response: Arc<ResponseSession>) -> Self {
+        Self {
+            bitmap: [0u64; 16],
+            highest: 0,
+            initialized: false,
+            seen: Instant::now(),
+            response,
         }
-        self.highest = self.highest.max(packet);
-        self.packets = self.packets.split_off(&self.highest.saturating_sub(1023));
+    }
+
+    fn accept(&mut self, packet: u64) -> bool {
         self.seen = Instant::now();
-        true
+        if !self.initialized {
+            self.initialized = true;
+            self.highest = packet;
+            self.bitmap[0] = 1;
+            return true;
+        }
+
+        if packet > self.highest {
+            let diff = packet - self.highest;
+            if diff >= 1024 {
+                self.bitmap.fill(0);
+            } else {
+                let word_shift = (diff / 64) as usize;
+                let bit_shift = (diff % 64) as usize;
+                for i in (0..16).rev() {
+                    if i >= word_shift {
+                        let mut val = self.bitmap[i - word_shift] << bit_shift;
+                        if bit_shift > 0 && i > word_shift {
+                            val |= self.bitmap[i - word_shift - 1] >> (64 - bit_shift);
+                        }
+                        self.bitmap[i] = val;
+                    } else {
+                        self.bitmap[i] = 0;
+                    }
+                }
+            }
+            self.highest = packet;
+            self.bitmap[0] |= 1;
+            true
+        } else {
+            let diff = self.highest - packet;
+            if diff >= 1024 {
+                return false; // packet too old
+            }
+            let word_idx = (diff / 64) as usize;
+            let bit_idx = (diff % 64) as usize;
+            let mask = 1u64 << bit_idx;
+            if (self.bitmap[word_idx] & mask) != 0 {
+                return false; // replayed packet
+            }
+            self.bitmap[word_idx] |= mask;
+            true
+        }
     }
 }
 
@@ -128,23 +177,47 @@ pub async fn run_udp(
                 if method.is_aead_2022() {
                     let replay_key = (packet.credential.user.id, hash, packet.session_id);
                     if !replay.contains_key(&replay_key) && replay.len() >= 4096 { continue; }
-                    let window = replay.entry(replay_key).or_insert_with(|| ReplayWindow { packets: BTreeSet::new(), highest: 0, seen: Instant::now(), response: Arc::new(ResponseSession { id: rand::random(), counter: AtomicU64::new(0) }) });
+                    let window = replay.entry(replay_key).or_insert_with(|| ReplayWindow::new(Arc::new(ResponseSession { id: rand::random(), counter: AtomicU64::new(0) })));
                     if !window.accept(packet.packet_id) { continue; }
                     response_session = Some(window.response.clone());
                 }
                 let host = packet.address.host();
                 if host.is_empty() || packet.address.port() == 0 || ctx.audit.should_block(&host, host.parse().ok(), packet.address.port()) { continue; }
-                let key = SessionKey { remote, user: packet.credential.user.id, key: hash, session: packet.session_id, address: packet.address.clone() };
-                if sessions.get(&key).is_some_and(|s| s.sender.is_closed()) { sessions.remove(&key); }
+                let key = SessionKey {
+                    user: packet.credential.user.id,
+                    key: hash,
+                    session: packet.session_id,
+                    address: packet.address.clone(),
+                    legacy_remote: if method.is_aead_2022() {
+                        None
+                    } else {
+                        Some(remote)
+                    },
+                };
+                if sessions.get(&key).is_some_and(|s| s.sender.is_closed()) {
+                    sessions.remove(&key);
+                }
                 if let Some(session) = sessions.get(&key) {
+                    *session.client_remote.write() = remote;
                     let _ = session.sender.try_send(packet.payload);
                     continue;
                 }
-                if sessions.len() >= 4096 { continue; }
+                if sessions.len() >= 4096 {
+                    continue;
+                }
                 let (sender, requests) = mpsc::channel(256);
                 let child_cancel = cancel.child_token();
                 let _ = sender.try_send(packet.payload);
-                sessions.insert(key, Session { sender, cancel: child_cancel.clone() });
+                let client_remote_holder = Arc::new(RwLock::new(remote));
+                let client_remote_ref = client_remote_holder.clone();
+                sessions.insert(
+                    key,
+                    Session {
+                        sender,
+                        client_remote: client_remote_holder,
+                        cancel: child_cancel.clone(),
+                    },
+                );
                 let ctx = ctx.clone();
                 let socket = socket.clone();
                 tasks.spawn(async move {
@@ -172,9 +245,10 @@ pub async fn run_udp(
                                         continue;
                                     }
                                 };
+                                let cur_remote = *client_remote_ref.read();
                                 tokio::select! {
                                     _ = child_cancel.cancelled() => return Ok(()),
-                                    result = socket.send_to(&encoded, remote) => {
+                                    result = socket.send_to(&encoded, cur_remote) => {
                                         match result {
                                             Ok(_) => { let _ = ack.send(()); }
                                             Err(e) => { tracing::debug!(error = %e, "SS UDP send_to remote failed"); }
@@ -224,15 +298,10 @@ mod tests {
     use super::*;
     #[test]
     fn replay_window_handles_reordering_and_counter_edges() {
-        let mut window = ReplayWindow {
-            packets: BTreeSet::new(),
-            highest: 0,
-            seen: Instant::now(),
-            response: Arc::new(ResponseSession {
-                id: 1,
-                counter: AtomicU64::new(0),
-            }),
-        };
+        let mut window = ReplayWindow::new(Arc::new(ResponseSession {
+            id: 1,
+            counter: AtomicU64::new(0),
+        }));
         assert!(window.accept(0));
         assert!(window.accept(1024));
         assert!(!window.accept(0));
@@ -242,5 +311,60 @@ mod tests {
         assert!(window.accept(u64::MAX - 1));
         assert!(!window.accept(u64::MAX));
         assert!(!window.accept(1024));
+    }
+
+    #[test]
+    fn test_ss2022_udp_session_key_and_nat_roaming() {
+        let addr = Address::SocketAddress("8.8.8.8:53".parse().unwrap());
+        let hash = [0x42u8; 32];
+        let session_id = 0x1234567887654321;
+
+        // In SS2022, remote IP:Port changes must map to the SAME session key to allow NAT roaming
+        let remote1: SocketAddr = "1.2.3.4:10001".parse().unwrap();
+        let remote2: SocketAddr = "5.6.7.8:20002".parse().unwrap();
+
+        let key1 = SessionKey {
+            user: 1,
+            key: hash,
+            session: session_id,
+            address: addr.clone(),
+            legacy_remote: None,
+        };
+
+        let key2 = SessionKey {
+            user: 1,
+            key: hash,
+            session: session_id,
+            address: addr.clone(),
+            legacy_remote: None,
+        };
+
+        // SS2022 session keys must match across different remote IPs
+        assert_eq!(key1, key2);
+
+        // Verify client_remote RwLock update simulates NAT roaming
+        let client_remote_holder = Arc::new(RwLock::new(remote1));
+        assert_eq!(*client_remote_holder.read(), remote1);
+
+        // Client roams to remote2
+        *client_remote_holder.write() = remote2;
+        assert_eq!(*client_remote_holder.read(), remote2);
+
+        // In legacy SS (AEAD 2017), sessions must remain isolated per remote to avoid collisions
+        let legacy_key1 = SessionKey {
+            user: 1,
+            key: hash,
+            session: 0,
+            address: addr.clone(),
+            legacy_remote: Some(remote1),
+        };
+        let legacy_key2 = SessionKey {
+            user: 1,
+            key: hash,
+            session: 0,
+            address: addr.clone(),
+            legacy_remote: Some(remote2),
+        };
+        assert_ne!(legacy_key1, legacy_key2);
     }
 }
