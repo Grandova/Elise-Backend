@@ -300,6 +300,7 @@ impl StreamSettings {
         let network_str = node_info
             .network
             .as_deref()
+            .or(node_info.transport.as_deref())
             .unwrap_or("tcp")
             .trim()
             .to_ascii_lowercase();
@@ -557,7 +558,7 @@ impl StreamSettings {
                     initial_windows_size,
                 })
             }
-            "httpupgrade" | "http-upgrade" => {
+            "httpupgrade" | "http-upgrade" | "http_upgrade" => {
                 let mut path = node_info.path.clone().unwrap_or_else(|| "/".to_string());
                 let mut host = node_info.host.clone();
                 let mut headers = HashMap::new();
@@ -630,7 +631,7 @@ impl StreamSettings {
                     extra,
                 })
             }
-            "h2" | "http" => {
+            "h2" | "http" | "http2" => {
                 let mut path = node_info.path.clone().unwrap_or_else(|| "/".to_string());
                 let mut host_list = node_info.host.clone().map(|h| vec![h]).unwrap_or_default();
 

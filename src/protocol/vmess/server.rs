@@ -193,13 +193,23 @@ async fn handle_connection(
     }
 
     // 2. Transport security (TLS)
+    let alpn = match &settings.transport {
+        crate::transport::TransportConfig::Grpc(_)
+        | crate::transport::TransportConfig::LegacyHttp2(_) => {
+            vec![b"h2".to_vec()]
+        }
+        crate::transport::TransportConfig::XHttp(_) => {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        }
+        _ => vec![b"http/1.1".to_vec()],
+    };
     let sec_stream = match apply_transport_security(
         Box::new(stream),
         remote_addr,
         &settings.security,
         tls_manager,
         None,
-        vec![],
+        alpn,
     )
     .await
     {
@@ -476,6 +486,7 @@ async fn perform_vmess_handshake(
     };
 
     stream.write_all(&resp_header_38b).await?;
+    stream.flush().await?;
     info!("VMess: sent 38-byte response header to {}", client_ip);
 
     let target_host = req_header.target_host;
@@ -659,7 +670,13 @@ async fn forward_vmess_stream(
             rate_limiter.throttle(user_id, plain_len).await;
 
             let sent = match (&mut out_write, &udp) {
-                (Some(writer), _) => idle.run(writer.write_all(&payload_buf[..plain_len])).await,
+                (Some(writer), _) => {
+                    let res = idle.run(writer.write_all(&payload_buf[..plain_len])).await;
+                    if res.is_ok() {
+                        let _ = idle.run(writer.flush()).await;
+                    }
+                    res
+                }
                 (_, Some(socket)) => idle
                     .run(socket.send(&payload_buf[..plain_len]))
                     .await
@@ -725,6 +742,13 @@ async fn forward_vmess_stream(
             if let Err(e) = idle.run(client_write.write_all(&enc_buf)).await {
                 warn!(
                     "VMess: down_task client_write err on chunk #{}: {:?}",
+                    chunk_count, e
+                );
+                break;
+            }
+            if let Err(e) = idle.run(client_write.flush()).await {
+                warn!(
+                    "VMess: down_task client_write.flush err on chunk #{}: {:?}",
                     chunk_count, e
                 );
                 break;
@@ -802,4 +826,66 @@ async fn forward_vmess_stream(
 
     drop(_conn_guard);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::types::{
+        GrpcTransportConfig, Http2TransportConfig, TcpTransportConfig,
+        WebSocketTransportConfig, XHttpTransportConfig,
+    };
+    use crate::transport::TransportConfig;
+
+    #[test]
+    fn test_vmess_alpn_mapping() {
+        let grpc_cfg = TransportConfig::Grpc(GrpcTransportConfig {
+            service_name: "Tun".to_string(),
+            authority: None,
+            multi_mode: false,
+            idle_timeout: Duration::from_secs(10),
+            health_check_timeout: Duration::from_secs(10),
+            permit_without_stream: false,
+            initial_windows_size: 65535,
+        });
+        let h2_cfg = TransportConfig::LegacyHttp2(Http2TransportConfig {
+            path: "/h2".to_string(),
+            host: vec![],
+        });
+        let xhttp_cfg = TransportConfig::XHttp(XHttpTransportConfig {
+            mode: "auto".to_string(),
+            host: None,
+            path: "/xhttp".to_string(),
+            headers: std::collections::HashMap::new(),
+            extra: None,
+        });
+        let ws_cfg = TransportConfig::WebSocket(WebSocketTransportConfig {
+            path: "/ws".to_string(),
+            host: None,
+            headers: std::collections::HashMap::new(),
+            heartbeat_period: None,
+            early_data_header: None,
+            max_early_data: 2048,
+        });
+        let tcp_cfg = TransportConfig::Tcp(TcpTransportConfig {
+            header_type: crate::transport::TcpHeaderType::None,
+            request: None,
+            response: None,
+        });
+
+        let get_alpn = |t: &TransportConfig| match t {
+            TransportConfig::Grpc(_) | TransportConfig::LegacyHttp2(_) => vec![b"h2".to_vec()],
+            TransportConfig::XHttp(_) => vec![b"h2".to_vec(), b"http/1.1".to_vec()],
+            _ => vec![b"http/1.1".to_vec()],
+        };
+
+        assert_eq!(get_alpn(&grpc_cfg), vec![b"h2".to_vec()]);
+        assert_eq!(get_alpn(&h2_cfg), vec![b"h2".to_vec()]);
+        assert_eq!(
+            get_alpn(&xhttp_cfg),
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        );
+        assert_eq!(get_alpn(&ws_cfg), vec![b"http/1.1".to_vec()]);
+        assert_eq!(get_alpn(&tcp_cfg), vec![b"http/1.1".to_vec()]);
+    }
 }

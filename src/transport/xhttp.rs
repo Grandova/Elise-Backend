@@ -1,4 +1,4 @@
-use crate::conn::{BoxedStream, PrefixedStream};
+use crate::conn::{AutoFlushingStream, BoxedStream, PrefixedStream};
 use crate::transport::types::XHttpTransportConfig;
 use bytes::{Buf, Bytes, BytesMut};
 use h2::server;
@@ -37,6 +37,7 @@ async fn apply_xhttp_h2(
     builder.initial_connection_window_size(8 * 1024 * 1024);
     builder.max_concurrent_streams(1024);
 
+    let stream = Box::new(AutoFlushingStream::new(stream));
     let mut connection = builder.handshake(stream).await.map_err(|e| {
         io::Error::new(
             io::ErrorKind::ConnectionReset,
@@ -61,10 +62,18 @@ async fn apply_xhttp_h2(
     };
 
     let path = request.uri().path();
-    let normalized_config_path = config.path.trim_end_matches('/');
+    let norm_config = if config.path.starts_with('/') {
+        config.path.clone()
+    } else {
+        format!("/{}", config.path)
+    };
+    let normalized_config_path = norm_config.trim_end_matches('/');
     let normalized_req_path = path.trim_end_matches('/');
 
-    if !normalized_req_path.starts_with(normalized_config_path) {
+    if !normalized_config_path.is_empty()
+        && normalized_req_path != normalized_config_path
+        && !normalized_req_path.starts_with(normalized_config_path)
+    {
         let resp = Response::builder()
             .status(StatusCode::NOT_FOUND)
             .body(())
@@ -80,19 +89,22 @@ async fn apply_xhttp_h2(
     }
 
     if let Some(ref expected_host) = config.host {
-        if let Some(auth) = request.uri().authority() {
-            let clean_req = auth.host();
-            let clean_expected = expected_host.split(':').next().unwrap_or(expected_host);
-            if clean_req != clean_expected {
-                let resp = Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(())
-                    .unwrap();
-                let _ = respond.send_response(resp, true);
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("XHTTP host mismatch: expected '{expected_host}', got '{auth}'"),
-                ));
+        let clean_expected = expected_host.trim();
+        if !clean_expected.is_empty() {
+            if let Some(auth) = request.uri().authority() {
+                let clean_req = auth.host();
+                let clean_exp = clean_expected.split(':').next().unwrap_or(clean_expected);
+                if clean_req != clean_exp {
+                    let resp = Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(())
+                        .unwrap();
+                    let _ = respond.send_response(resp, true);
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("XHTTP host mismatch: expected '{expected_host}', got '{auth}'"),
+                    ));
+                }
             }
         }
     }
@@ -117,7 +129,16 @@ async fn apply_xhttp_h2(
 
     // Drive connection in background to service WINDOW_UPDATE, ACKs, and outgoing data flush
     tokio::spawn(async move {
-        let _ = std::future::poll_fn(|cx| connection.poll_closed(cx)).await;
+        let _ = std::future::poll_fn(|cx| {
+            while let Poll::Ready(Some(res)) = connection.poll_accept(cx) {
+                if let Ok((_req, mut resp)) = res {
+                    let r = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                    let _ = resp.send_response(r, true);
+                }
+            }
+            connection.poll_closed(cx)
+        })
+        .await;
     });
 
     Ok(Box::new(XHttpStreamWrapper {
@@ -262,10 +283,18 @@ async fn apply_xhttp_http1(
         ));
     }
     let req_path = parts[1];
-    let normalized_config_path = config.path.trim_end_matches('/');
+    let norm_config = if config.path.starts_with('/') {
+        config.path.clone()
+    } else {
+        format!("/{}", config.path)
+    };
+    let normalized_config_path = norm_config.trim_end_matches('/');
     let normalized_req_path = req_path.trim_end_matches('/');
 
-    if !normalized_req_path.starts_with(normalized_config_path) {
+    if !normalized_config_path.is_empty()
+        && normalized_req_path != normalized_config_path
+        && !normalized_req_path.starts_with(normalized_config_path)
+    {
         let _ = stream
             .write_all(b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n")
             .await;
@@ -279,28 +308,31 @@ async fn apply_xhttp_http1(
     }
 
     if let Some(ref expected_host) = config.host {
-        let mut host_header = None;
-        for line in lines {
-            if let Some((k, v)) = line.split_once(':') {
-                if k.trim().eq_ignore_ascii_case("host") {
-                    host_header = Some(v.trim());
-                    break;
+        let clean_expected = expected_host.trim();
+        if !clean_expected.is_empty() {
+            let mut host_header = None;
+            for line in lines {
+                if let Some((k, v)) = line.split_once(':') {
+                    if k.trim().eq_ignore_ascii_case("host") {
+                        host_header = Some(v.trim());
+                        break;
+                    }
                 }
             }
-        }
-        if let Some(host_val) = host_header {
-            let clean_req = host_val.split(':').next().unwrap_or(host_val);
-            let clean_expected = expected_host.split(':').next().unwrap_or(expected_host);
-            if clean_req != clean_expected {
-                let _ = stream
-                    .write_all(
-                        b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
-                    )
-                    .await;
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("XHTTP host mismatch: expected '{expected_host}', got '{host_val}'"),
-                ));
+            if let Some(host_val) = host_header {
+                let clean_req = host_val.split(':').next().unwrap_or(host_val);
+                let clean_exp = clean_expected.split(':').next().unwrap_or(clean_expected);
+                if clean_req != clean_exp {
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
+                        )
+                        .await;
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("XHTTP host mismatch: expected '{expected_host}', got '{host_val}'"),
+                    ));
+                }
             }
         }
     }
@@ -308,6 +340,7 @@ async fn apply_xhttp_http1(
     // Send HTTP/1.1 200 OK with chunked transfer encoding and SSE headers
     let response = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nX-Accel-Buffering: no\r\nTransfer-Encoding: chunked\r\n\r\n";
     stream.write_all(response).await?;
+    stream.flush().await?;
 
     let unconsumed = header_buf[end_idx + 4..].to_vec();
     let mut initial_read_buf = BytesMut::new();

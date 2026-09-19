@@ -71,7 +71,13 @@ impl XboardClient {
                 .and_then(|v| v.as_u64())
                 .unwrap_or(443) as u16,
             host: data.get("host").and_then(|v| v.as_str()).map(String::from),
-            path: data.get("path").and_then(|v| v.as_str()).map(String::from),
+            path: data.get("path").and_then(|v| v.as_str()).map(|p| {
+                if p.is_empty() || p.starts_with('/') {
+                    p.to_string()
+                } else {
+                    format!("/{p}")
+                }
+            }),
             server_name: data
                 .get("server_name")
                 .and_then(|v| v.as_str())

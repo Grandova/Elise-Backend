@@ -1,4 +1,4 @@
-use crate::conn::BoxedStream;
+use crate::conn::{AutoFlushingStream, BoxedStream};
 use crate::transport::types::GrpcTransportConfig;
 use bytes::{Buf, Bytes, BytesMut};
 use h2::server;
@@ -17,10 +17,16 @@ pub async fn apply_grpc_transport(
     config: &GrpcTransportConfig,
 ) -> io::Result<BoxedStream> {
     let mut h2_builder = server::Builder::new();
-    if config.initial_windows_size > 0 {
-        h2_builder.initial_window_size(config.initial_windows_size);
-    }
+    let win_size = if config.initial_windows_size > 0 {
+        config.initial_windows_size
+    } else {
+        4 * 1024 * 1024
+    };
+    h2_builder.initial_window_size(win_size);
+    h2_builder.initial_connection_window_size(win_size * 2);
+    h2_builder.max_concurrent_streams(1024);
 
+    let stream = Box::new(AutoFlushingStream::new(stream));
     let mut connection = h2_builder.handshake(stream).await.map_err(|e| {
         io::Error::new(
             io::ErrorKind::ConnectionReset,
@@ -46,15 +52,17 @@ pub async fn apply_grpc_transport(
     };
 
     let path = request.uri().path();
-    let expected_service = &config.service_name;
+    let clean_service = config.service_name.trim_matches('/');
 
     // Upstream Xray paths: "/{service_name}/Tun" or "/{service_name}/TunMulti"
     // If service_name is empty, Xray allows "/Tun" or "/GunService/Tun"
-    let valid_path = if expected_service.is_empty() {
+    let valid_path = if clean_service.is_empty() {
         path.ends_with("/Tun") || path.ends_with("/TunMulti")
     } else {
-        path == format!("/{expected_service}/Tun")
-            || path == format!("/{expected_service}/TunMulti")
+        path == format!("/{clean_service}/Tun")
+            || path == format!("/{clean_service}/TunMulti")
+            || path.ends_with(&format!("/{clean_service}/Tun"))
+            || path.ends_with(&format!("/{clean_service}/TunMulti"))
     };
 
     if !valid_path {
@@ -66,26 +74,29 @@ pub async fn apply_grpc_transport(
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!(
-                "gRPC path mismatch: requested '{path}', expected service '{expected_service}'"
+                "gRPC path mismatch: requested '{path}', expected service '{clean_service}'"
             ),
         ));
     }
 
     // Check authority if configured
     if let Some(ref expected_auth) = config.authority {
-        if let Some(auth) = request.uri().authority() {
-            let clean_req = auth.host();
-            let clean_expected = expected_auth.split(':').next().unwrap_or(expected_auth);
-            if clean_req != clean_expected {
-                let resp = Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(())
-                    .unwrap();
-                let _ = respond.send_response(resp, true);
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("gRPC authority mismatch: expected '{expected_auth}', got '{auth}'"),
-                ));
+        let clean_expected = expected_auth.trim();
+        if !clean_expected.is_empty() {
+            if let Some(auth) = request.uri().authority() {
+                let clean_req = auth.host();
+                let clean_exp = clean_expected.split(':').next().unwrap_or(clean_expected);
+                if clean_req != clean_exp {
+                    let resp = Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(())
+                        .unwrap();
+                    let _ = respond.send_response(resp, true);
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("gRPC authority mismatch: expected '{expected_auth}', got '{auth}'"),
+                    ));
+                }
             }
         }
     }
@@ -107,15 +118,18 @@ pub async fn apply_grpc_transport(
 
     let recv_stream = request.into_body();
 
-    // Spawn background H2 connection driver
+    // Spawn background H2 connection driver (drives accept & connection lifecycle)
     tokio::spawn(async move {
-        while let Some(res) = connection.accept().await {
-            if let Ok((_req, mut resp)) = res {
-                // Return 200/empty for health checks if needed
-                let r = Response::builder().status(StatusCode::OK).body(()).unwrap();
-                let _ = resp.send_response(r, true);
+        let _ = std::future::poll_fn(|cx| {
+            while let Poll::Ready(Some(res)) = connection.poll_accept(cx) {
+                if let Ok((_req, mut resp)) = res {
+                    let r = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                    let _ = resp.send_response(r, true);
+                }
             }
-        }
+            connection.poll_closed(cx)
+        })
+        .await;
     });
 
     Ok(Box::new(GrpcStreamWrapper {
@@ -257,7 +271,9 @@ impl AsyncWrite for GrpcStreamWrapper {
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let _ = self.send_stream.send_data(Bytes::new(), true);
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+        let _ = self.send_stream.send_trailers(trailers);
         Poll::Ready(Ok(()))
     }
 }
@@ -308,4 +324,93 @@ fn read_varint(bytes: &[u8]) -> Option<(u64, usize)> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn test_grpc_protobuf_hunk_roundtrip() {
+        let payload = b"hello vmess over grpc payload test 1234567890";
+        let mut pb = Vec::new();
+        pb.push(0x0a);
+        encode_varint(payload.len() as u64, &mut pb);
+        pb.extend_from_slice(payload);
+
+        let decoded = decode_protobuf_hunk(&pb).expect("should decode successfully");
+        assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn test_grpc_varint_encoding() {
+        let mut buf = Vec::new();
+        encode_varint(1, &mut buf);
+        assert_eq!(buf, vec![1]);
+
+        buf.clear();
+        encode_varint(300, &mut buf);
+        let (val, len) = read_varint(&buf).unwrap();
+        assert_eq!(val, 300);
+        assert_eq!(len, buf.len());
+    }
+
+    #[tokio::test]
+    async fn test_grpc_transport_handshake_and_framing() {
+        let (client, server) = tokio::io::duplex(65536);
+        let config = GrpcTransportConfig {
+            service_name: "TestService".to_string(),
+            authority: None,
+            multi_mode: false,
+            idle_timeout: std::time::Duration::from_secs(10),
+            health_check_timeout: std::time::Duration::from_secs(10),
+            permit_without_stream: false,
+            initial_windows_size: 65535,
+        };
+
+        let server_task = tokio::spawn(async move {
+            let mut stream = apply_grpc_transport(Box::new(server), &config)
+                .await
+                .expect("server grpc handshake");
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping!");
+            stream.write_all(b"pong!").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        // H2 client handshake
+        let (mut client_h2, conn) = h2::client::handshake(client).await.expect("client h2 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://localhost/TestService/Tun")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers")
+            .body(())
+            .unwrap();
+
+        let (response, mut send_stream) = client_h2.send_request(req, false).unwrap();
+        let resp = response.await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        // Send gRPC frame: [0x00, 4-byte len, [0x0a, varint, "ping!"]]
+        let mut pb = Vec::new();
+        pb.push(0x0a);
+        encode_varint(5, &mut pb);
+        pb.extend_from_slice(b"ping!");
+
+        let mut frame = Vec::new();
+        frame.push(0x00);
+        frame.extend_from_slice(&(pb.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&pb);
+
+        send_stream.send_data(Bytes::from(frame), false).unwrap();
+
+        server_task.await.unwrap();
+    }
 }

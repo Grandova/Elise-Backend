@@ -32,9 +32,11 @@ pub async fn apply_websocket_transport(
     let mut early_data = Vec::new();
 
     #[allow(clippy::result_large_err)]
-    let callback = |request: &Request, response: Response| {
-        // 1. Path validation
-        if request.uri().path() != expected_path {
+    let callback = |request: &Request, mut response: Response| {
+        // 1. Path validation (normalized for leading/trailing slashes)
+        let req_path = request.uri().path().trim_matches('/');
+        let exp_path = expected_path.trim_matches('/');
+        if req_path != exp_path {
             return Err(tokio_tungstenite::tungstenite::http::Response::builder()
                 .status(404)
                 .body(None)
@@ -43,14 +45,17 @@ pub async fn apply_websocket_transport(
 
         // 2. Host header validation
         if let Some(ref h) = expected_host {
-            let host_header = request.headers().get("host").and_then(|v| v.to_str().ok());
-            let clean_host = host_header.map(|s| s.split(':').next().unwrap_or(s));
-            let clean_expected = h.split(':').next().unwrap_or(h);
-            if clean_host != Some(clean_expected) {
-                return Err(tokio_tungstenite::tungstenite::http::Response::builder()
-                    .status(404)
-                    .body(None)
-                    .unwrap());
+            let clean_expected = h.trim();
+            if !clean_expected.is_empty() {
+                let host_header = request.headers().get("host").and_then(|v| v.to_str().ok());
+                let clean_host = host_header.map(|s| s.split(':').next().unwrap_or(s));
+                let clean_exp = clean_expected.split(':').next().unwrap_or(clean_expected);
+                if clean_host != Some(clean_exp) {
+                    return Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                        .status(404)
+                        .body(None)
+                        .unwrap());
+                }
             }
         }
 
@@ -88,6 +93,13 @@ pub async fn apply_websocket_transport(
                         .unwrap());
                 }
             }
+        }
+
+        // 5. Echo Sec-WebSocket-Protocol if present (standard RFC 6455 & Xray 0-RTT subprotocol requirement)
+        if let Some(proto) = request.headers().get("sec-websocket-protocol") {
+            response
+                .headers_mut()
+                .insert("sec-websocket-protocol", proto.clone());
         }
 
         Ok(response)
@@ -166,6 +178,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStreamWrapper<S>
             Message::Binary(Bytes::copy_from_slice(&data[..n])),
         )
         .map_err(io::Error::other)?;
+        let _ = Sink::poll_flush(Pin::new(&mut self.socket), cx);
         Poll::Ready(Ok(n))
     }
 
@@ -175,5 +188,76 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for WebSocketStreamWrapper<S>
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         Sink::poll_close(Pin::new(&mut self.socket), cx).map_err(io::Error::other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio_tungstenite::client_async;
+
+    #[tokio::test]
+    async fn test_websocket_transport_handshake_and_subprotocol() {
+        let (client, server) = tokio::io::duplex(4096);
+        let config = WebSocketTransportConfig {
+            path: "/vmess-ws".to_string(),
+            host: Some("example.com".to_string()),
+            headers: std::collections::HashMap::new(),
+            heartbeat_period: None,
+            early_data_header: None,
+            max_early_data: 2048,
+        };
+
+        let early_bytes = b"early_123";
+        let early_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(early_bytes);
+
+        let server_task = tokio::spawn(async move {
+            let mut ws_stream = apply_websocket_transport(Box::new(server), &config)
+                .await
+                .expect("server ws handshake should succeed");
+
+            // First read early data prefix
+            let mut early_buf = [0u8; 9];
+            ws_stream.read_exact(&mut early_buf).await.unwrap();
+            assert_eq!(&early_buf, b"early_123");
+
+            // Then read normal WebSocket frame
+            let mut frame_buf = [0u8; 10];
+            ws_stream.read_exact(&mut frame_buf).await.unwrap();
+            assert_eq!(&frame_buf, b"ping-hello");
+
+            ws_stream.write_all(b"pong-world").await.unwrap();
+            ws_stream.flush().await.unwrap();
+        });
+
+        // Client request with trailing slash and Sec-WebSocket-Protocol early data
+        let req = tokio_tungstenite::tungstenite::handshake::client::Request::builder()
+            .uri("ws://example.com/vmess-ws/")
+            .header("Host", "example.com")
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Protocol", &early_b64)
+            .body(())
+            .unwrap();
+
+        let (mut client_ws, response) = client_async(req, client).await.expect("client handshake");
+        assert_eq!(
+            response.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()),
+            Some(early_b64.as_str())
+        );
+
+        client_ws
+            .send(Message::Binary(Bytes::from_static(b"ping-hello")))
+            .await
+            .unwrap();
+
+        let msg = client_ws.next().await.unwrap().unwrap();
+        assert_eq!(msg, Message::Binary(Bytes::from_static(b"pong-world")));
+
+        server_task.await.unwrap();
     }
 }

@@ -62,10 +62,16 @@ async fn apply_h2_framed(
     };
 
     let path = request.uri().path();
-    let normalized_config_path = config.path.trim_end_matches('/');
+    let norm_config = if config.path.starts_with('/') {
+        config.path.clone()
+    } else {
+        format!("/{}", config.path)
+    };
+    let normalized_config_path = norm_config.trim_end_matches('/');
     let normalized_req_path = path.trim_end_matches('/');
 
-    if normalized_req_path != normalized_config_path
+    if !normalized_config_path.is_empty()
+        && normalized_req_path != normalized_config_path
         && !normalized_req_path.starts_with(normalized_config_path)
     {
         let resp = Response::builder()
@@ -82,10 +88,11 @@ async fn apply_h2_framed(
         ));
     }
 
-    if !config.host.is_empty() {
+    let effective_hosts: Vec<&String> = config.host.iter().filter(|h| !h.trim().is_empty()).collect();
+    if !effective_hosts.is_empty() {
         if let Some(auth) = request.uri().authority() {
             let clean_req = auth.host();
-            if !config.host.iter().any(|h| {
+            if !effective_hosts.iter().any(|h| {
                 let clean_h = h.split(':').next().unwrap_or(h);
                 clean_h == clean_req
             }) {
@@ -119,12 +126,16 @@ async fn apply_h2_framed(
 
     // Drive connection in background to service WINDOW_UPDATE, ACKs, and outgoing data flush
     tokio::spawn(async move {
-        while let Some(res) = connection.accept().await {
-            if let Ok((_req, mut resp)) = res {
-                let r = Response::builder().status(StatusCode::OK).body(()).unwrap();
-                let _ = resp.send_response(r, true);
+        let _ = std::future::poll_fn(|cx| {
+            while let Poll::Ready(Some(res)) = connection.poll_accept(cx) {
+                if let Ok((_req, mut resp)) = res {
+                    let r = Response::builder().status(StatusCode::OK).body(()).unwrap();
+                    let _ = resp.send_response(r, true);
+                }
             }
-        }
+            connection.poll_closed(cx)
+        })
+        .await;
     });
 
     Ok(Box::new(H2RawStreamWrapper {
@@ -279,10 +290,16 @@ async fn apply_h2_http1(
         ));
     }
     let req_path = parts[1];
-    let normalized_config_path = config.path.trim_end_matches('/');
+    let norm_config = if config.path.starts_with('/') {
+        config.path.clone()
+    } else {
+        format!("/{}", config.path)
+    };
+    let normalized_config_path = norm_config.trim_end_matches('/');
     let normalized_req_path = req_path.trim_end_matches('/');
 
-    if normalized_req_path != normalized_config_path
+    if !normalized_config_path.is_empty()
+        && normalized_req_path != normalized_config_path
         && !normalized_req_path.starts_with(normalized_config_path)
     {
         let _ = stream
@@ -297,7 +314,8 @@ async fn apply_h2_http1(
         ));
     }
 
-    if !config.host.is_empty() {
+    let effective_hosts: Vec<&String> = config.host.iter().filter(|h| !h.trim().is_empty()).collect();
+    if !effective_hosts.is_empty() {
         let mut host_header = None;
         for line in lines {
             if let Some((k, v)) = line.split_once(':') {
@@ -309,7 +327,7 @@ async fn apply_h2_http1(
         }
         if let Some(host_val) = host_header {
             let clean_req = host_val.split(':').next().unwrap_or(host_val);
-            if !config.host.iter().any(|h| {
+            if !effective_hosts.iter().any(|h| {
                 let clean_h = h.split(':').next().unwrap_or(h);
                 clean_h == clean_req
             }) {
@@ -329,6 +347,7 @@ async fn apply_h2_http1(
     // Send 200 OK response
     let response = b"HTTP/1.1 200 OK\r\nConnection: keep-alive\r\nContent-Type: application/octet-stream\r\n\r\n";
     stream.write_all(response).await?;
+    stream.flush().await?;
 
     let unconsumed = header_buf[end_idx + 4..].to_vec();
     if !unconsumed.is_empty() {
