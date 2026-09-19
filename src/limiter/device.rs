@@ -293,7 +293,7 @@ impl DeviceLimiter {
     }
 
     pub fn normalize_ip(&self, ip: IpAddr) -> String {
-        match ip {
+        match ip.to_canonical() {
             IpAddr::V4(v4) => {
                 if self.prefix_v4 >= 32 {
                     v4.to_string()
@@ -332,6 +332,27 @@ mod tests {
 
         let limiter16 = DeviceLimiter::new(60, 16, 64, None);
         assert_eq!(limiter16.normalize_ip(ip), "192.168.0.0/16");
+    }
+
+    #[test]
+    fn mapped_ipv4_uses_ipv4_device_identity() {
+        let limiter = DeviceLimiter::new(60, 32, 64, None);
+        let mapped = "::ffff:192.0.2.17".parse().unwrap();
+        assert_eq!(limiter.normalize_ip(mapped), "192.0.2.17");
+        assert_eq!(
+            DeviceLimiter::new(60, 24, 64, None).normalize_ip(mapped),
+            "192.0.2.0/24"
+        );
+        assert_eq!(
+            limiter.normalize_ip("2001:db8:1:2::17".parse().unwrap()),
+            "2001:db8:1:2::/64"
+        );
+
+        limiter.set_user_limit(12, 1);
+        assert!(limiter.check_and_record(12, mapped));
+        assert!(limiter.check_and_record(12, "192.0.2.17".parse().unwrap()));
+        assert!(!limiter.check_and_record(12, "::ffff:192.0.2.18".parse().unwrap()));
+        assert_eq!(limiter.get_online_devices(12), vec!["192.0.2.17"]);
     }
 
     #[test]
