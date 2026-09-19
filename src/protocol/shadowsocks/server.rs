@@ -118,26 +118,24 @@ impl Inbound for ShadowsocksInbound {
         let transport = Arc::new(Transport::new(&node_info, &ctx.tls_manager).await?);
         *self.method.write() = method;
         let server_key = if method.is_aead_2022() {
-            node_info
-                .server_key
-                .as_deref()
-                .filter(|s| !s.is_empty())
-                .map(|key| ss2022::decode_key(key, method))
-                .transpose()?
-        } else {
-            None
-        };
-        if server_key.is_some()
-            && method
+            if method
                 == Method::Aead2022(
                     shadowsocks::crypto::CipherKind::AEAD2022_BLAKE3_CHACHA20_POLY1305,
                 )
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "SS2022 ChaCha20 does not support AES identity headers",
-            ));
-        }
+            {
+                // SIP022: ChaCha20-Poly1305 is single-key only and does not use EIH
+                None
+            } else {
+                node_info
+                    .server_key
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .map(|key| ss2022::decode_key(key, method))
+                    .transpose()?
+            }
+        } else {
+            None
+        };
         let server_key = Arc::new(server_key);
         let existing = self.users.read().values().cloned().collect();
         self.update_users(existing);
