@@ -272,14 +272,31 @@ pub async fn obtain_certificate(config: &AcmeConfig) -> Result<(), String> {
     let key_pair = rcgen::KeyPair::generate_for(key_alg)
         .map_err(|e| format!("Failed to generate private key: {e}"))?;
 
-    let params = rcgen::CertificateParams::new(vec![config.domain.clone()])
+    let mut params = rcgen::CertificateParams::new(vec![config.domain.clone()])
         .map_err(|e| format!("Failed to create certificate params: {e}"))?;
+    params.distinguished_name = rcgen::DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, config.domain.clone());
     let csr = params
         .serialize_request(&key_pair)
         .map_err(|e| format!("Failed to generate CSR: {e}"))?;
 
+    let csr_der = csr.der();
+    if csr_der
+        .windows(b"rcgen self signed cert".len())
+        .any(|window| window == b"rcgen self signed cert")
+    {
+        return Err("Generated CSR unexpectedly contains default rcgen subject name".to_string());
+    }
+
+    info!(
+        domain = %config.domain,
+        "ACME order finalizing with clean CSR (CN = domain, SAN = [domain])"
+    );
+
     order
-        .finalize_csr(csr.der())
+        .finalize_csr(csr_der)
         .await
         .map_err(|e| format!("ACME finalize CSR failed: {e}"))?;
 
@@ -372,7 +389,7 @@ pub async fn ensure_acme_certificate(
     // 2. Determine cert_file and key_file from user configuration.
     // If not specified, dynamically compute sensible defaults based on domain and environment.
     let cert_file = match &node_cfg.cert_file {
-        Some(path) => path.clone(),
+        Some(path) => crate::config::node::normalize_cert_path(path),
         None => {
             if Path::new("/etc/elise").exists() {
                 PathBuf::from(format!("/etc/elise/cert/{domain}.crt"))
@@ -383,7 +400,7 @@ pub async fn ensure_acme_certificate(
     };
 
     let key_file = match &node_cfg.key_file {
-        Some(path) => path.clone(),
+        Some(path) => crate::config::node::normalize_cert_path(path),
         None => {
             if Path::new("/etc/elise").exists() {
                 PathBuf::from(format!("/etc/elise/cert/{domain}.key"))
@@ -452,6 +469,7 @@ mod tests {
     use super::*;
     use rcgen::{CertificateParams, KeyPair};
     use std::fs;
+    use x509_parser::prelude::FromDer;
 
     #[test]
     fn test_check_cert_validity_missing() {
@@ -556,5 +574,83 @@ mod tests {
         assert_eq!(acme_cfg.key_file, key_path);
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_acme_csr_does_not_contain_rcgen_default_cn() {
+        let domain = "ft.nksea.com";
+        let key_pair = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut params = rcgen::CertificateParams::new(vec![domain.to_string()]).unwrap();
+        params.distinguished_name = rcgen::DistinguishedName::new();
+        params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, domain.to_string());
+        let csr = params.serialize_request(&key_pair).unwrap();
+        let pem = csr.pem().unwrap();
+        assert!(
+            !pem.contains("rcgen self signed cert"),
+            "CSR PEM must not contain rcgen self signed cert"
+        );
+
+        let csr_der = csr.der();
+        assert!(
+            !csr_der
+                .windows(b"rcgen self signed cert".len())
+                .any(|w| w == b"rcgen self signed cert"),
+            "CSR DER must not contain rcgen default CN"
+        );
+
+        // Verify subject contains the real domain
+        let (_, parsed_csr) =
+            x509_parser::certification_request::X509CertificationRequest::from_der(
+                csr_der.as_ref(),
+            )
+            .expect("Failed to parse generated CSR DER");
+        let subject = parsed_csr.certification_request_info.subject.to_string();
+        assert!(
+            subject.contains("ft.nksea.com"),
+            "Subject should contain domain ft.nksea.com: {}",
+            subject
+        );
+        assert!(
+            !subject.contains("rcgen self signed cert"),
+            "Subject must not contain rcgen self signed cert: {}",
+            subject
+        );
+    }
+
+    #[tokio::test]
+    async fn test_ensure_acme_certificate_normalizes_typo_path() {
+        let mut node_cfg = NodeConfig {
+            node_id: 32,
+            cert_domain: Some("ft.nksea.com".to_string()),
+            cert_mode: Some("http".to_string()),
+            // Intentionally provide path with /etc/eslise/ typo
+            cert_file: Some(PathBuf::from("/etc/eslise/my_cert.crt")),
+            key_file: Some(PathBuf::from("/etc/eslise/my_cert.key")),
+            ..Default::default()
+        };
+
+        let node_info = NodeInfo {
+            id: 32,
+            node_type: "anytls".to_string(),
+            server_port: 8000,
+            server_name: Some("ft.nksea.com".to_string()),
+            tls: Some(1),
+            ..Default::default()
+        };
+
+        // When normalizing, check_cert_validity will be called on /etc/elise/my_cert.crt
+        // Even if obtain_certificate fails (in test environment without port 80 / LE server),
+        // node_cfg cert_file/key_file must be normalized to /etc/elise/...
+        let _ = ensure_acme_certificate(&mut node_cfg, &node_info).await;
+        assert_eq!(
+            node_cfg.cert_file,
+            Some(PathBuf::from("/etc/elise/my_cert.crt"))
+        );
+        assert_eq!(
+            node_cfg.key_file,
+            Some(PathBuf::from("/etc/elise/my_cert.key"))
+        );
     }
 }

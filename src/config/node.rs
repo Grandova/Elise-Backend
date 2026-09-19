@@ -33,6 +33,19 @@ pub struct NodeConfig {
     pub raw_user_section: String,
 }
 
+/// Normalizes certificate file paths to avoid common typos (such as /etc/eslise -> /etc/elise).
+pub fn normalize_cert_path<P: AsRef<Path>>(path: P) -> PathBuf {
+    let p_str = path.as_ref().to_string_lossy();
+    if p_str.contains("/etc/eslise") || p_str.contains("\\etc\\eslise") {
+        let fixed = p_str
+            .replace("/etc/eslise", "/etc/elise")
+            .replace("\\etc\\eslise", "\\etc\\elise");
+        PathBuf::from(fixed)
+    } else {
+        path.as_ref().to_path_buf()
+    }
+}
+
 impl NodeConfig {
     pub fn load_for_node<P: AsRef<Path>>(base_dir: P, node_id: u32) -> Self {
         let mut cfg = NodeConfig {
@@ -103,8 +116,8 @@ impl NodeConfig {
                             self.force_close_ssl =
                                 Some(val.eq_ignore_ascii_case("true") || val == "1");
                         }
-                        "cert_file" => self.cert_file = Some(PathBuf::from(val.clone())),
-                        "key_file" => self.key_file = Some(PathBuf::from(val.clone())),
+                        "cert_file" => self.cert_file = Some(normalize_cert_path(val)),
+                        "key_file" => self.key_file = Some(normalize_cert_path(val)),
                         "cert_domain" => self.cert_domain = Some(val.clone()),
                         "cert_mode" => self.cert_mode = Some(val.clone()),
                         "cert_key_length" => self.cert_key_length = Some(val.clone()),
@@ -154,10 +167,10 @@ impl NodeConfig {
                     .cloned();
             }
             if self.cert_file.is_none() {
-                self.cert_file = overrides.get("cert_file").map(PathBuf::from);
+                self.cert_file = overrides.get("cert_file").map(normalize_cert_path);
             }
             if self.key_file.is_none() {
-                self.key_file = overrides.get("key_file").map(PathBuf::from);
+                self.key_file = overrides.get("key_file").map(normalize_cert_path);
             }
             if self.listen_addr.is_none() {
                 self.listen_addr = overrides
@@ -245,8 +258,8 @@ impl NodeConfig {
                 .join(format!("{domain}.key"))
         };
 
-        let cert = self.cert_file.as_ref().unwrap_or(&default_cert);
-        let key = self.key_file.as_ref().unwrap_or(&default_key);
+        let cert = normalize_cert_path(self.cert_file.as_ref().unwrap_or(&default_cert));
+        let key = normalize_cert_path(self.key_file.as_ref().unwrap_or(&default_key));
 
         if self.cert_file.is_some()
             || self.cert_mode.as_deref() == Some("http")
@@ -877,13 +890,14 @@ mod tests {
             .cert_config
             .as_ref()
             .expect("cert_config should be present");
+        // Paths are automatically normalized to /etc/elise even if configured with typo /etc/eslise
         assert_eq!(
             cert_config.get("cert_file").and_then(|v| v.as_str()),
-            Some("/etc/eslise/my_cert.crt")
+            Some("/etc/elise/my_cert.crt")
         );
         assert_eq!(
             cert_config.get("key_file").and_then(|v| v.as_str()),
-            Some("/etc/eslise/my_cert.key")
+            Some("/etc/elise/my_cert.key")
         );
         assert_eq!(node_info.server_name.as_deref(), Some("ft.nksea.com"));
     }

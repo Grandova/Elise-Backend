@@ -390,8 +390,8 @@ impl GlobalConfig {
             "cert_key_length" => self.cert_key_length = Some(val.to_string()),
             "acme_server" => self.acme_server = Some(val.to_string()),
             "acme_email" | "email" => self.acme_email = Some(val.to_string()),
-            "cert_file" => self.cert_file = Some(PathBuf::from(val)),
-            "key_file" => self.key_file = Some(PathBuf::from(val)),
+            "cert_file" => self.cert_file = Some(crate::config::node::normalize_cert_path(val)),
+            "key_file" => self.key_file = Some(crate::config::node::normalize_cert_path(val)),
             "listen_strategy" | "multi_node_listen_strategy" => {
                 self.listen_strategy = val.to_lowercase()
             }
