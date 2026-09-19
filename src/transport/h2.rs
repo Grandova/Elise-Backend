@@ -88,7 +88,11 @@ async fn apply_h2_framed(
         ));
     }
 
-    let effective_hosts: Vec<&String> = config.host.iter().filter(|h| !h.trim().is_empty()).collect();
+    let effective_hosts: Vec<&String> = config
+        .host
+        .iter()
+        .filter(|h| !h.trim().is_empty())
+        .collect();
     if !effective_hosts.is_empty() {
         if let Some(auth) = request.uri().authority() {
             let clean_req = auth.host();
@@ -314,7 +318,11 @@ async fn apply_h2_http1(
         ));
     }
 
-    let effective_hosts: Vec<&String> = config.host.iter().filter(|h| !h.trim().is_empty()).collect();
+    let effective_hosts: Vec<&String> = config
+        .host
+        .iter()
+        .filter(|h| !h.trim().is_empty())
+        .collect();
     if !effective_hosts.is_empty() {
         let mut host_header = None;
         for line in lines {

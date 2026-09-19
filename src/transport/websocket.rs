@@ -246,7 +246,10 @@ mod tests {
 
         let (mut client_ws, response) = client_async(req, client).await.expect("client handshake");
         assert_eq!(
-            response.headers().get("sec-websocket-protocol").and_then(|v| v.to_str().ok()),
+            response
+                .headers()
+                .get("sec-websocket-protocol")
+                .and_then(|v| v.to_str().ok()),
             Some(early_b64.as_str())
         );
 

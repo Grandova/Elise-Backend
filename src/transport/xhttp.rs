@@ -330,7 +330,9 @@ async fn apply_xhttp_http1(
                         .await;
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
-                        format!("XHTTP host mismatch: expected '{expected_host}', got '{host_val}'"),
+                        format!(
+                            "XHTTP host mismatch: expected '{expected_host}', got '{host_val}'"
+                        ),
                     ));
                 }
             }

@@ -73,9 +73,7 @@ pub async fn apply_grpc_transport(
         let _ = respond.send_response(resp, true);
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            format!(
-                "gRPC path mismatch: requested '{path}', expected service '{clean_service}'"
-            ),
+            format!("gRPC path mismatch: requested '{path}', expected service '{clean_service}'"),
         ));
     }
 
@@ -94,7 +92,9 @@ pub async fn apply_grpc_transport(
                     let _ = respond.send_response(resp, true);
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
-                        format!("gRPC authority mismatch: expected '{expected_auth}', got '{auth}'"),
+                        format!(
+                            "gRPC authority mismatch: expected '{expected_auth}', got '{auth}'"
+                        ),
                     ));
                 }
             }
@@ -381,7 +381,9 @@ mod tests {
         });
 
         // H2 client handshake
-        let (mut client_h2, conn) = h2::client::handshake(client).await.expect("client h2 handshake");
+        let (mut client_h2, conn) = h2::client::handshake(client)
+            .await
+            .expect("client h2 handshake");
         tokio::spawn(async move {
             let _ = conn.await;
         });

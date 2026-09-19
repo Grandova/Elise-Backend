@@ -832,8 +832,8 @@ async fn forward_vmess_stream(
 mod tests {
     use super::*;
     use crate::transport::types::{
-        GrpcTransportConfig, Http2TransportConfig, TcpTransportConfig,
-        WebSocketTransportConfig, XHttpTransportConfig,
+        GrpcTransportConfig, Http2TransportConfig, TcpTransportConfig, WebSocketTransportConfig,
+        XHttpTransportConfig,
     };
     use crate::transport::TransportConfig;
 
