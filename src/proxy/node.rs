@@ -857,6 +857,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn socks_requires_panel_users_and_limits_handshake_not_session() {
+        tokio::time::timeout(Duration::from_secs(22), async {
+            let runner = runner("http://127.0.0.1:1".into());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            drop(listener);
+            let info = NodeInfo {
+                node_type: "socks".into(),
+                server_port: port,
+                listen_ip: Some("127.0.0.1".into()),
+                ..Default::default()
+            };
+            let mut active = runner.launch_inbound(&info, &[]).await.unwrap();
+            let mut response = [0u8; 2];
+            let mut unauth = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            unauth.write_all(b"\x05\x01\x00").await.unwrap();
+            unauth.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [5, 255]);
+            drop(unauth);
+            active.inbound.update_users(vec![User {
+                id: 42,
+                uuid: "test".into(),
+                password: Some("pass".into()),
+                ..Default::default()
+            }]);
+            let mut bad = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            bad.write_all(b"\x05\x01\x02").await.unwrap();
+            bad.read_exact(&mut response).await.unwrap();
+            bad.write_all(b"\x01\x04test\x05wrong").await.unwrap();
+            bad.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [1, 1]);
+            drop(bad);
+            let mut silent = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            let echo = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let target_port = echo.local_addr().unwrap().port();
+            let target = tokio::spawn(async move {
+                let (mut stream, _) = echo.accept().await.unwrap();
+                let mut received = Vec::new();
+                stream.read_to_end(&mut received).await.unwrap();
+                assert_eq!(received, b"after-handshake-timeout");
+                stream.write_all(b"half-close-response").await.unwrap();
+            });
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            stream.write_all(b"\x05\x01\x02").await.unwrap();
+            stream.read_exact(&mut response).await.unwrap();
+            stream.write_all(b"\x01\x04test\x04pass").await.unwrap();
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [1, 0]);
+            let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+            request.extend_from_slice(&target_port.to_be_bytes());
+            stream.write_all(&request).await.unwrap();
+            let mut response = [0; 10];
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(response[1], 0);
+            tokio::time::sleep(Duration::from_secs(16)).await;
+            assert_eq!(silent.read(&mut [0u8; 1]).await.unwrap(), 0);
+            stream.write_all(b"after-handshake-timeout").await.unwrap();
+            stream.shutdown().await.unwrap();
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await.unwrap();
+            assert_eq!(response, b"half-close-response");
+            target.await.unwrap();
+            active.inbound.update_users(vec![]);
+            let mut removed = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            removed.write_all(b"\x05\x02\x00\x02").await.unwrap();
+            let mut response = [0u8; 2];
+            removed.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [5, 255]);
+            drop(removed);
+            active.stop().await;
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn socks_udp_control_close_and_idle_release_relay_socket() {
+        let mut runner = runner("http://127.0.0.1:1".into());
+        Arc::make_mut(&mut runner.global_config).udp_timeout = 1;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let info = NodeInfo {
+            node_type: "socks".into(),
+            server_port: port,
+            listen_ip: Some("127.0.0.1".into()),
+            ..Default::default()
+        };
+        let user = User {
+            id: 42,
+            uuid: "test".into(),
+            password: Some("pass".into()),
+            ..Default::default()
+        };
+        let mut active = runner.launch_inbound(&info, &[user]).await.unwrap();
+        let echo = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let target_port = echo.local_addr().unwrap().port();
+        let target = tokio::spawn(async move {
+            let mut buf = [0u8; 128];
+            for _ in 0..4 {
+                let (n, peer) = echo.recv_from(&mut buf).await.unwrap();
+                assert_eq!(&buf[..n], b"udp-payload");
+                echo.send_to(&buf[..n], peer).await.unwrap();
+            }
+        });
+        for exit in ["close", "idle"] {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            stream.write_all(b"\x05\x01\x02").await.unwrap();
+            let mut response = [0u8; 2];
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [5, 2]);
+            stream.write_all(b"\x01\x04test\x04pass").await.unwrap();
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(response, [1, 0]);
+            stream
+                .write_all(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+                .await
+                .unwrap();
+            let mut response = [0u8; 10];
+            stream.read_exact(&mut response).await.unwrap();
+            assert_eq!(&response[..4], &[5, 0, 0, 1]);
+            let relay_port = u16::from_be_bytes([response[8], response[9]]);
+            let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let malformed = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let mut packet = vec![0, 0, 1, 1, 127, 0, 0, 1];
+            packet.extend_from_slice(&target_port.to_be_bytes());
+            packet.extend_from_slice(b"udp-payload");
+            malformed
+                .send_to(&packet, ("127.0.0.1", relay_port))
+                .await
+                .unwrap();
+            packet[2] = 0;
+            for _ in 0..2 {
+                client
+                    .send_to(&packet, ("127.0.0.1", relay_port))
+                    .await
+                    .unwrap();
+                let mut response = [0u8; 128];
+                let (n, _) =
+                    tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut response))
+                        .await
+                        .unwrap()
+                        .unwrap();
+                assert_eq!(&response[..n], &packet);
+            }
+            if exit == "idle" {
+                let mut byte = [0u8; 1];
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(3), stream.read(&mut byte))
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                    0
+                );
+            }
+            drop(stream);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if let Ok(socket) = tokio::net::UdpSocket::bind(("0.0.0.0", relay_port)).await {
+                        drop(socket);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("UDP relay leaked after control closed");
+        }
+        tokio::time::timeout(Duration::from_secs(2), target)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(runner.traffic_buffer.lock().get(&42), Some(&(44, 44)));
+        active.stop().await;
+    }
+
+    #[tokio::test]
     async fn tls_inbounds_respect_panel_certificate_policy() {
         let runner = runner("http://127.0.0.1:1".into());
         for protocol in ["vless", "vmess", "trojan", "http", "anytls", "naive"] {

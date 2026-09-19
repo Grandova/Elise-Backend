@@ -7,9 +7,11 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info};
 
@@ -46,13 +48,16 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
     stream.write_all(&rep).await?;
 
     let cancel_token = CancellationToken::new();
+    let _cancel_on_drop = cancel_token.clone().drop_guard();
+    let activity = Arc::new(Notify::new());
+    let mut tasks = JoinSet::new();
 
     // 3. Outbound session map keyed by (dst_host, dst_port)
     let sessions: Arc<RwLock<HashMap<(String, u16), mpsc::Sender<Vec<u8>>>>> =
         Arc::new(RwLock::new(HashMap::new()));
 
     // Channel for multiplexing downstream UDP responses back to client
-    let (downstream_tx, mut downstream_rx) = mpsc::channel::<(Vec<u8>, SocketAddr)>(256);
+    let (downstream_tx, mut downstream_rx) = mpsc::channel::<(Vec<u8>, SocketAddr, usize)>(256);
 
     let client_udp_peer: Arc<RwLock<Option<SocketAddr>>> = Arc::new(RwLock::new(None));
 
@@ -60,13 +65,19 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
     let ds_udp = udp_socket.clone();
     let ds_peer = client_udp_peer.clone();
     let ds_cancel = cancel_token.clone();
-    tokio::spawn(async move {
-        while let Some((packet, dest)) = downstream_rx.recv().await {
+    let ds_activity = activity.clone();
+    let ds_traffic = ctx.on_traffic.clone();
+    let ds_user_id = user.id;
+    tasks.spawn(async move {
+        while let Some((packet, dest, payload_len)) = downstream_rx.recv().await {
             if ds_cancel.is_cancelled() {
                 break;
             }
             let target = ds_peer.read().unwrap_or(dest);
-            let _ = ds_udp.send_to(&packet, target).await;
+            if ds_udp.send_to(&packet, target).await.is_ok() {
+                ds_traffic(ds_user_id, 0, payload_len as u64);
+                ds_activity.notify_one();
+            }
         }
     });
 
@@ -78,23 +89,35 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
     let in_ctx = ctx.clone();
     let in_user_id = user.id;
 
-    tokio::spawn(async move {
+    let in_activity = activity.clone();
+    tasks.spawn(async move {
+        let mut workers = JoinSet::new();
         let mut buf = vec![0u8; 65535];
         while !in_cancel.is_cancelled() {
-            let (n, src) = match in_udp.recv_from(&mut buf).await {
-                Ok(res) => res,
-                Err(_) => break,
+            let (n, src) = tokio::select! {
+                biased;
+                _ = in_cancel.cancelled() => break,
+                result = workers.join_next(), if !workers.is_empty() => {
+                    if let Some(Ok((key, sender))) = result {
+                        let mut sessions = in_sessions.write();
+                        if sessions.get(&key).is_some_and(|tx| tx.same_channel(&sender)) {
+                            sessions.remove(&key);
+                        }
+                    }
+                    continue;
+                }
+                packet = in_udp.recv_from(&mut buf) => match packet {
+                    Ok(packet) => packet,
+                    Err(_) => break,
+                }
             };
 
-            // Record first seen client UDP address
-            if in_peer.read().is_none() {
-                *in_peer.write() = Some(src);
-            }
-
-            if n < 7 {
+            if src.ip() != meta.client_addr.ip() || n < 7 || buf[0] != 0 || buf[1] != 0 {
                 continue;
             }
-
+            if in_peer.read().is_some_and(|peer| peer != src) {
+                continue;
+            }
             // RFC 1928 UDP packet parsing
             // +----+------+------+----------+----------+----------+
             // |RSV | FRAG | ATYP | DST.ADDR | DST.PORT |   DATA   |
@@ -118,7 +141,7 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
                 }
                 0x03 => {
                     let dlen = buf[4] as usize;
-                    if n < 5 + dlen + 2 {
+                    if dlen == 0 || n < 5 + dlen + 2 {
                         continue;
                     }
                     let domain = String::from_utf8_lossy(&buf[5..5 + dlen]).to_string();
@@ -140,6 +163,11 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
             let port_idx = header_len - 2;
             let target_port = u16::from_be_bytes([buf[port_idx], buf[port_idx + 1]]);
             let payload = buf[header_len..n].to_vec();
+            // Only a valid packet may claim the authenticated client's UDP endpoint.
+            if in_peer.read().is_none() {
+                *in_peer.write() = Some(src);
+            }
+            in_activity.notify_one();
 
             if in_ctx
                 .audit
@@ -186,17 +214,21 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
                     let out_ds_tx = downstream_tx.clone();
                     let out_ctx = in_ctx.clone();
 
-                    tokio::spawn(async move {
+                    let worker_key = key.clone();
+                    let worker_sender = tx.clone();
+                    workers.spawn(async move {
                         let mut recv_buf = vec![0u8; 65535];
                         loop {
                             tokio::select! {
                                 _ = out_cancel.cancelled() => break,
+                                _ = tokio::time::sleep(Duration::from_secs(out_ctx.global_config.udp_timeout.max(1))) => break,
                                 packet = rx.recv() => {
                                     match packet {
                                         Some(p) => {
                                             out_ctx.rate_limiter.throttle(in_user_id, p.len()).await;
-                                            (out_ctx.on_traffic)(in_user_id, p.len() as u64, 0);
-                                            let _ = outbound_socket.send(&p).await;
+                                            if let Ok(sent) = outbound_socket.send(&p).await {
+                                                (out_ctx.on_traffic)(in_user_id, sent as u64, 0);
+                                            }
                                         }
                                         None => break,
                                     }
@@ -205,7 +237,6 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
                                     match res {
                                         Ok((len, src_addr)) => {
                                             out_ctx.rate_limiter.throttle(in_user_id, len).await;
-                                            (out_ctx.on_traffic)(in_user_id, 0, len as u64);
 
                                             // Encapsulate response in RFC 1928 SOCKS5 UDP header
                                             let mut resp = Vec::with_capacity(len + 24);
@@ -233,13 +264,14 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
                                             }
                                             resp.extend_from_slice(&recv_buf[..len]);
 
-                                            let _ = out_ds_tx.send((resp, src)).await;
+                                            let _ = out_ds_tx.send((resp, src, len)).await;
                                         }
                                         Err(_) => break,
                                     }
                                 }
                             }
                         }
+                        (worker_key, worker_sender)
                     });
 
                     in_sessions.write().insert(key, tx.clone());
@@ -254,12 +286,19 @@ pub async fn handle_socks5_udp_associate<S: AsyncRead + AsyncWrite + Send + Unpi
     // 4. Lifetime bound to TCP control connection:
     // Wait for client TCP stream to close (EOF / error / shutdown)
     let mut tcp_buf = [0u8; 1];
-    let _ = stream.read(&mut tcp_buf).await;
+    loop {
+        tokio::select! {
+            _ = stream.read(&mut tcp_buf) => break,
+            _ = tokio::time::sleep(Duration::from_secs(ctx.global_config.udp_timeout.max(1))) => break,
+            _ = activity.notified() => {}
+        }
+    }
 
-    // TCP closed -> Immediately cancel UDP session and tear down sockets
     cancel_token.cancel();
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
     debug!(
-        "SOCKS5 UDP ASSOCIATE TCP stream closed for client {}, association destroyed",
+        "SOCKS5 UDP association closed for client {}",
         meta.client_addr
     );
 
