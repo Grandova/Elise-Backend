@@ -54,15 +54,23 @@ pub async fn apply_grpc_transport(
     let path = request.uri().path();
     let clean_service = config.service_name.trim_matches('/');
 
-    // Upstream Xray paths: "/{service_name}/Tun" or "/{service_name}/TunMulti"
-    // If service_name is empty, Xray allows "/Tun" or "/GunService/Tun"
-    let valid_path = if clean_service.is_empty() {
-        path.ends_with("/Tun") || path.ends_with("/TunMulti")
+    let clean_path = path.trim_matches('/');
+    let valid_path = if clean_service.is_empty() || clean_service.eq_ignore_ascii_case("GunService")
+    {
+        true
     } else {
-        path == format!("/{clean_service}/Tun")
-            || path == format!("/{clean_service}/TunMulti")
-            || path.ends_with(&format!("/{clean_service}/Tun"))
-            || path.ends_with(&format!("/{clean_service}/TunMulti"))
+        clean_path.eq_ignore_ascii_case(clean_service)
+            || clean_path
+                .to_ascii_lowercase()
+                .starts_with(&format!("{}/", clean_service.to_ascii_lowercase()))
+            || clean_path
+                .to_ascii_lowercase()
+                .ends_with(&format!("/{}", clean_service.to_ascii_lowercase()))
+            || path
+                .to_ascii_lowercase()
+                .contains(&clean_service.to_ascii_lowercase())
+            || path.ends_with("/Tun")
+            || path.ends_with("/TunMulti")
     };
 
     if !valid_path {
@@ -81,10 +89,17 @@ pub async fn apply_grpc_transport(
     if let Some(ref expected_auth) = config.authority {
         let clean_expected = expected_auth.trim();
         if !clean_expected.is_empty() {
-            if let Some(auth) = request.uri().authority() {
-                let clean_req = auth.host();
+            let req_host = request.uri().authority().map(|a| a.host()).or_else(|| {
+                request
+                    .headers()
+                    .get("host")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|h| h.split(':').next().unwrap_or(h))
+            });
+
+            if let Some(clean_req) = req_host {
                 let clean_exp = clean_expected.split(':').next().unwrap_or(clean_expected);
-                if clean_req != clean_exp {
+                if !clean_req.eq_ignore_ascii_case(clean_exp) {
                     let resp = Response::builder()
                         .status(StatusCode::NOT_FOUND)
                         .body(())
@@ -93,7 +108,7 @@ pub async fn apply_grpc_transport(
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
                         format!(
-                            "gRPC authority mismatch: expected '{expected_auth}', got '{auth}'"
+                            "gRPC authority mismatch: expected '{expected_auth}', got '{clean_req}'"
                         ),
                     ));
                 }
@@ -227,43 +242,61 @@ impl AsyncWrite for GrpcStreamWrapper {
             return Poll::Ready(Ok(0));
         }
 
-        // Check send capacity
-        self.send_stream.reserve_capacity(data.len() + 16);
-        match self.send_stream.poll_capacity(cx) {
-            Poll::Ready(Some(Ok(avail))) => {
-                let chunk_size = data.len().min(avail).min(16384);
-                let to_send = &data[..chunk_size];
-
-                // Encode protobuf Hunk: [0x0a, varint_len, payload]
-                let mut pb = Vec::with_capacity(chunk_size + 10);
-                pb.push(0x0a);
-                encode_varint(chunk_size as u64, &mut pb);
-                pb.extend_from_slice(to_send);
-
-                // Encode gRPC frame: [0x00, msg_len: 4B, pb]
-                let mut frame = Vec::with_capacity(pb.len() + 5);
-                frame.push(0x00); // uncompressed
-                frame.extend_from_slice(&(pb.len() as u32).to_be_bytes());
-                frame.extend_from_slice(&pb);
-
-                self.send_stream
-                    .send_data(Bytes::from(frame), false)
-                    .map_err(|e| {
-                        io::Error::new(io::ErrorKind::Other, format!("gRPC send_data failed: {e}"))
-                    })?;
-
-                Poll::Ready(Ok(chunk_size))
+        let mut avail = self.send_stream.capacity();
+        if avail <= 16 {
+            self.send_stream
+                .reserve_capacity((data.len() + 32).max(16384));
+            match self.send_stream.poll_capacity(cx) {
+                Poll::Ready(Some(Ok(new_cap))) => {
+                    avail = new_cap;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        format!("gRPC send capacity error: {e}"),
+                    )));
+                }
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "gRPC send stream closed",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("gRPC send capacity error: {e}"),
-            ))),
-            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "gRPC send stream closed",
-            ))),
-            Poll::Pending => Poll::Pending,
         }
+
+        if avail <= 16 {
+            return Poll::Pending;
+        }
+
+        // Reserve at least 16 bytes for gRPC 5-byte header + protobuf tag/varint overhead
+        let max_payload = (avail - 16).min(data.len()).min(16384);
+        let to_send = &data[..max_payload];
+
+        // Encode protobuf Hunk: [0x0a, varint_len, payload]
+        let mut pb = Vec::with_capacity(to_send.len() + 10);
+        pb.push(0x0a);
+        encode_varint(to_send.len() as u64, &mut pb);
+        pb.extend_from_slice(to_send);
+
+        // Encode gRPC frame: [0x00, msg_len: 4B, pb]
+        let mut frame = Vec::with_capacity(pb.len() + 5);
+        frame.push(0x00); // uncompressed
+        frame.extend_from_slice(&(pb.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&pb);
+
+        self.send_stream
+            .send_data(Bytes::from(frame), false)
+            .map_err(|e| {
+                io::Error::new(io::ErrorKind::Other, format!("gRPC send_data failed: {e}"))
+            })?;
+
+        if self.send_stream.capacity() < 32768 {
+            self.send_stream.reserve_capacity(65536);
+        }
+
+        Poll::Ready(Ok(to_send.len()))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -369,6 +402,7 @@ mod tests {
             initial_windows_size: 65535,
         };
 
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
         let server_task = tokio::spawn(async move {
             let mut stream = apply_grpc_transport(Box::new(server), &config)
                 .await
@@ -378,6 +412,7 @@ mod tests {
             assert_eq!(&buf, b"ping!");
             stream.write_all(b"pong!").await.unwrap();
             stream.flush().await.unwrap();
+            let _ = done_rx.await;
         });
 
         // H2 client handshake
@@ -413,6 +448,13 @@ mod tests {
 
         send_stream.send_data(Bytes::from(frame), false).unwrap();
 
+        // Read response body from server
+        let mut resp_body = resp.into_body();
+        let chunk = resp_body.data().await.unwrap().unwrap();
+        let decoded = decode_protobuf_hunk(&chunk[5..]).expect("decode response hunk");
+        assert_eq!(decoded, b"pong!");
+
+        let _ = done_tx.send(());
         server_task.await.unwrap();
     }
 }

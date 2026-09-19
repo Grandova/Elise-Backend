@@ -91,10 +91,17 @@ async fn apply_xhttp_h2(
     if let Some(ref expected_host) = config.host {
         let clean_expected = expected_host.trim();
         if !clean_expected.is_empty() {
-            if let Some(auth) = request.uri().authority() {
-                let clean_req = auth.host();
+            let req_host = request.uri().authority().map(|a| a.host()).or_else(|| {
+                request
+                    .headers()
+                    .get("host")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|h| h.split(':').next().unwrap_or(h))
+            });
+
+            if let Some(clean_req) = req_host {
                 let clean_exp = clean_expected.split(':').next().unwrap_or(clean_expected);
-                if clean_req != clean_exp {
+                if !clean_req.eq_ignore_ascii_case(clean_exp) {
                     let resp = Response::builder()
                         .status(StatusCode::NOT_FOUND)
                         .body(())
@@ -102,7 +109,9 @@ async fn apply_xhttp_h2(
                     let _ = respond.send_response(resp, true);
                     return Err(io::Error::new(
                         io::ErrorKind::NotFound,
-                        format!("XHTTP host mismatch: expected '{expected_host}', got '{auth}'"),
+                        format!(
+                            "XHTTP host mismatch: expected '{expected_host}', got '{clean_req}'"
+                        ),
                     ));
                 }
             }
@@ -203,28 +212,45 @@ impl AsyncWrite for XHttpStreamWrapper {
             return Poll::Ready(Ok(0));
         }
 
-        self.send_stream.reserve_capacity(data.len());
-        match self.send_stream.poll_capacity(cx) {
-            Poll::Ready(Some(Ok(avail))) => {
-                let chunk_size = data.len().min(avail);
-                let to_send = Bytes::copy_from_slice(&data[..chunk_size]);
-
-                self.send_stream.send_data(to_send, false).map_err(|e| {
-                    io::Error::new(io::ErrorKind::Other, format!("XHTTP send_data failed: {e}"))
-                })?;
-
-                Poll::Ready(Ok(chunk_size))
+        let mut avail = self.send_stream.capacity();
+        if avail == 0 {
+            self.send_stream.reserve_capacity(data.len().max(16384));
+            match self.send_stream.poll_capacity(cx) {
+                Poll::Ready(Some(Ok(new_cap))) => {
+                    avail = new_cap;
+                }
+                Poll::Ready(Some(Err(e))) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::ConnectionReset,
+                        format!("XHTTP send capacity error: {e}"),
+                    )));
+                }
+                Poll::Ready(None) => {
+                    return Poll::Ready(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "XHTTP send stream closed",
+                    )));
+                }
+                Poll::Pending => return Poll::Pending,
             }
-            Poll::Ready(Some(Err(e))) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::ConnectionReset,
-                format!("XHTTP send capacity error: {e}"),
-            ))),
-            Poll::Ready(None) => Poll::Ready(Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "XHTTP send stream closed",
-            ))),
-            Poll::Pending => Poll::Pending,
         }
+
+        if avail == 0 {
+            return Poll::Pending;
+        }
+
+        let chunk_size = data.len().min(avail).min(16384);
+        let to_send = Bytes::copy_from_slice(&data[..chunk_size]);
+
+        self.send_stream.send_data(to_send, false).map_err(|e| {
+            io::Error::new(io::ErrorKind::Other, format!("XHTTP send_data failed: {e}"))
+        })?;
+
+        if self.send_stream.capacity() < 32768 {
+            self.send_stream.reserve_capacity(65536);
+        }
+
+        Poll::Ready(Ok(chunk_size))
     }
 
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -322,7 +348,7 @@ async fn apply_xhttp_http1(
             if let Some(host_val) = host_header {
                 let clean_req = host_val.split(':').next().unwrap_or(host_val);
                 let clean_exp = clean_expected.split(':').next().unwrap_or(clean_expected);
-                if clean_req != clean_exp {
+                if !clean_req.eq_ignore_ascii_case(clean_exp) {
                     let _ = stream
                         .write_all(
                             b"HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n",
@@ -601,4 +627,104 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|window| window == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_xhttp_h2_transport_handshake_and_framing() {
+        let (client, server) = tokio::io::duplex(65536);
+        let config = XHttpTransportConfig {
+            mode: "auto".to_string(),
+            host: Some("example.com".to_string()),
+            path: "/xhttppath".to_string(),
+            headers: HashMap::new(),
+            extra: None,
+        };
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let server_task = tokio::spawn(async move {
+            let mut stream = apply_xhttp_transport(Box::new(server), &config)
+                .await
+                .expect("server xhttp h2 handshake");
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            stream.flush().await.unwrap();
+            let _ = done_rx.await;
+        });
+
+        // H2 client handshake with preface
+        let (mut client_h2, conn) = h2::client::handshake(client)
+            .await
+            .expect("client h2 handshake");
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        let req = http::Request::builder()
+            .method("POST")
+            .uri("http://example.com/xhttppath")
+            .header("content-type", "application/octet-stream")
+            .body(())
+            .unwrap();
+
+        let (response, mut send_stream) = client_h2.send_request(req, false).unwrap();
+        let resp = response.await.unwrap();
+        assert_eq!(resp.status(), http::StatusCode::OK);
+
+        // Send data
+        send_stream
+            .send_data(Bytes::from_static(b"ping"), false)
+            .unwrap();
+
+        // Read response body from server
+        let mut resp_body = resp.into_body();
+        let chunk = resp_body.data().await.unwrap().unwrap();
+        assert_eq!(&chunk[..], b"pong");
+
+        let _ = done_tx.send(());
+        server_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_xhttp_http1_chunked_handshake_and_framing() {
+        let (mut client, server) = tokio::io::duplex(65536);
+        let config = XHttpTransportConfig {
+            mode: "auto".to_string(),
+            host: Some("example.com".to_string()),
+            path: "/xhttppath".to_string(),
+            headers: HashMap::new(),
+            extra: None,
+        };
+
+        let server_task = tokio::spawn(async move {
+            let mut stream = apply_xhttp_transport(Box::new(server), &config)
+                .await
+                .expect("server xhttp http1 handshake");
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.unwrap();
+            assert_eq!(&buf, b"ping");
+            stream.write_all(b"pong").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        // Client sends HTTP/1.1 request
+        let req = b"POST /xhttppath HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nping\r\n0\r\n\r\n";
+        client.write_all(req).await.unwrap();
+        client.flush().await.unwrap();
+
+        // Read server response header
+        let mut resp_buf = vec![0u8; 1024];
+        let n = client.read(&mut resp_buf).await.unwrap();
+        let resp_str = String::from_utf8_lossy(&resp_buf[..n]);
+        assert!(resp_str.contains("200 OK"));
+        assert!(resp_str.contains("4\r\npong\r\n") || resp_str.contains("pong"));
+
+        server_task.await.unwrap();
+    }
 }

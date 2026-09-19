@@ -503,7 +503,7 @@ impl StreamSettings {
                     .map(|p| p.trim_start_matches('/').to_string())
                     .filter(|s| !s.is_empty())
                     .unwrap_or_else(|| "GunService".to_string());
-                let mut authority = node_info.host.clone();
+                let mut authority = None;
                 let mut multi_mode = false;
                 let mut idle_timeout = Duration::from_secs(60);
                 let mut health_check_timeout = Duration::from_secs(20);
@@ -519,7 +519,10 @@ impl StreamSettings {
                         service_name = sn.to_string();
                     }
                     if let Some(auth) = ns.get("authority").and_then(|v| v.as_str()) {
-                        authority = Some(auth.to_string());
+                        let trimmed = auth.trim();
+                        if !trimmed.is_empty() {
+                            authority = Some(trimmed.to_string());
+                        }
                     }
                     if let Some(mm) = ns.get("multiMode").and_then(|v| v.as_bool()) {
                         multi_mode = mm;
@@ -598,7 +601,7 @@ impl StreamSettings {
             }
             "xhttp" | "splithttp" | "split_http" => {
                 let mut mode = "auto".to_string();
-                let mut host = node_info.host.clone();
+                let mut host = None;
                 let mut path = node_info.path.clone().unwrap_or_else(|| "/".to_string());
                 let mut headers = HashMap::new();
                 let mut extra = None;
@@ -608,7 +611,10 @@ impl StreamSettings {
                         mode = m.to_string();
                     }
                     if let Some(h) = ns.get("host").and_then(|v| v.as_str()) {
-                        host = Some(h.to_string());
+                        let trimmed = h.trim();
+                        if !trimmed.is_empty() {
+                            host = Some(trimmed.to_string());
+                        }
                     }
                     if let Some(p) = ns.get("path").and_then(|v| v.as_str()) {
                         path = p.to_string();
@@ -633,7 +639,7 @@ impl StreamSettings {
             }
             "h2" | "http" | "http2" => {
                 let mut path = node_info.path.clone().unwrap_or_else(|| "/".to_string());
-                let mut host_list = node_info.host.clone().map(|h| vec![h]).unwrap_or_default();
+                let mut host_list = Vec::new();
 
                 if let Some(ns) = &node_info.network_settings {
                     if let Some(p) = ns.get("path").and_then(|v| v.as_str()) {
@@ -643,11 +649,17 @@ impl StreamSettings {
                         if let Some(arr) = h.as_array() {
                             for item in arr {
                                 if let Some(s) = item.as_str() {
-                                    host_list.push(s.to_string());
+                                    let trimmed = s.trim();
+                                    if !trimmed.is_empty() {
+                                        host_list.push(trimmed.to_string());
+                                    }
                                 }
                             }
                         } else if let Some(s) = h.as_str() {
-                            host_list.push(s.to_string());
+                            let trimmed = s.trim();
+                            if !trimmed.is_empty() {
+                                host_list.push(trimmed.to_string());
+                            }
                         }
                     }
                 }
