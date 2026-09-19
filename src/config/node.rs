@@ -16,6 +16,10 @@ pub struct NodeConfig {
     pub cert_file: Option<PathBuf>,
     pub key_file: Option<PathBuf>,
     pub cert_domain: Option<String>,
+    pub cert_mode: Option<String>,
+    pub cert_key_length: Option<String>,
+    pub acme_server: Option<String>,
+    pub acme_email: Option<String>,
     pub check_interval: Option<u64>,
     pub submit_interval: Option<u64>,
     pub out_ip_ipv4: Option<String>,
@@ -102,6 +106,10 @@ impl NodeConfig {
                         "cert_file" => self.cert_file = Some(PathBuf::from(val.clone())),
                         "key_file" => self.key_file = Some(PathBuf::from(val.clone())),
                         "cert_domain" => self.cert_domain = Some(val.clone()),
+                        "cert_mode" => self.cert_mode = Some(val.clone()),
+                        "cert_key_length" => self.cert_key_length = Some(val.clone()),
+                        "acme_server" => self.acme_server = Some(val.clone()),
+                        "acme_email" | "email" => self.acme_email = Some(val.clone()),
                         "check_interval" => self.check_interval = val.parse().ok(),
                         "submit_interval" => self.submit_interval = val.parse().ok(),
                         "out_ip_ipv4" => self.out_ip_ipv4 = Some(val.clone()),
@@ -124,6 +132,68 @@ impl NodeConfig {
         }
     }
 
+    pub fn inherit_from_global(&mut self, global: &crate::config::GlobalConfig) {
+        // 1. Per-node section overrides from main config [node_X]
+        if let Some(overrides) = global.node_overrides.get(&self.node_id) {
+            if self.cert_mode.is_none() {
+                self.cert_mode = overrides.get("cert_mode").cloned();
+            }
+            if self.cert_domain.is_none() {
+                self.cert_domain = overrides.get("cert_domain").cloned();
+            }
+            if self.cert_key_length.is_none() {
+                self.cert_key_length = overrides.get("cert_key_length").cloned();
+            }
+            if self.acme_server.is_none() {
+                self.acme_server = overrides.get("acme_server").cloned();
+            }
+            if self.acme_email.is_none() {
+                self.acme_email = overrides
+                    .get("acme_email")
+                    .or_else(|| overrides.get("email"))
+                    .cloned();
+            }
+            if self.cert_file.is_none() {
+                self.cert_file = overrides.get("cert_file").map(PathBuf::from);
+            }
+            if self.key_file.is_none() {
+                self.key_file = overrides.get("key_file").map(PathBuf::from);
+            }
+            if self.listen_addr.is_none() {
+                self.listen_addr = overrides
+                    .get("listen_addr")
+                    .or_else(|| overrides.get("listen"))
+                    .cloned();
+            }
+            if self.fake_sni.is_none() {
+                self.fake_sni = overrides.get("fake_sni").cloned();
+            }
+        }
+
+        // 2. Global defaults
+        if self.cert_mode.is_none() {
+            self.cert_mode = global.cert_mode.clone();
+        }
+        if self.cert_domain.is_none() {
+            self.cert_domain = global.cert_domain.clone();
+        }
+        if self.cert_key_length.is_none() {
+            self.cert_key_length = global.cert_key_length.clone();
+        }
+        if self.acme_server.is_none() {
+            self.acme_server = global.acme_server.clone();
+        }
+        if self.acme_email.is_none() {
+            self.acme_email = global.acme_email.clone();
+        }
+        if self.cert_file.is_none() {
+            self.cert_file = global.cert_file.clone();
+        }
+        if self.key_file.is_none() {
+            self.key_file = global.key_file.clone();
+        }
+    }
+
     pub fn prepare_node_info(&self, nodes_dir: &Path, info: &mut NodeInfo) -> std::io::Result<()> {
         use base64::prelude::*;
         use serde_json::json;
@@ -137,12 +207,55 @@ impl NodeConfig {
         {
             info.tls = Some(1);
         }
-        if let Some(cert) = &self.cert_file {
-            info.cert_config.get_or_insert(json!({}))["cert_file"] = json!(cert);
+
+        if let Some(domain) = &self.cert_domain {
+            if info
+                .server_name
+                .as_deref()
+                .map(|s| s.is_empty())
+                .unwrap_or(true)
+            {
+                info.server_name = Some(domain.clone());
+            }
         }
-        if let Some(key) = &self.key_file {
+
+        let domain = self
+            .cert_domain
+            .as_deref()
+            .or(info.server_name.as_deref())
+            .or(info.host.as_deref())
+            .unwrap_or("node");
+
+        let default_cert = if std::path::Path::new("/etc/elise").exists() {
+            std::path::PathBuf::from(format!("/etc/elise/cert/{domain}.crt"))
+        } else {
+            nodes_dir
+                .parent()
+                .unwrap_or(nodes_dir)
+                .join("cert")
+                .join(format!("{domain}.crt"))
+        };
+        let default_key = if std::path::Path::new("/etc/elise").exists() {
+            std::path::PathBuf::from(format!("/etc/elise/cert/{domain}.key"))
+        } else {
+            nodes_dir
+                .parent()
+                .unwrap_or(nodes_dir)
+                .join("cert")
+                .join(format!("{domain}.key"))
+        };
+
+        let cert = self.cert_file.as_ref().unwrap_or(&default_cert);
+        let key = self.key_file.as_ref().unwrap_or(&default_key);
+
+        if self.cert_file.is_some()
+            || self.cert_mode.as_deref() == Some("http")
+            || self.cert_mode.as_deref() == Some("acme")
+        {
+            info.cert_config.get_or_insert(json!({}))["cert_file"] = json!(cert);
             info.cert_config.get_or_insert(json!({}))["key_file"] = json!(key);
         }
+
         if !matches!(info.tls, Some(1 | 2)) {
             return Ok(());
         }
@@ -151,6 +264,17 @@ impl NodeConfig {
         let ts = ts
             .as_object_mut()
             .ok_or_else(|| Error::new(ErrorKind::InvalidData, "tls_settings must be an object"))?;
+        if let Some(domain) = &self.cert_domain {
+            if !ts.contains_key("server_name")
+                || ts
+                    .get("server_name")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.is_empty())
+                    .unwrap_or(true)
+            {
+                ts.insert("server_name".to_string(), json!(domain));
+            }
+        }
         if info.tls == Some(2) {
             let panel_public = ts
                 .get("public_key")
@@ -693,5 +817,72 @@ mod tests {
             );
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn test_acme_config_inheritance_and_dynamic_cert_injection_to_node_info() {
+        use crate::config::global::GlobalConfig;
+        use std::path::PathBuf;
+
+        // 1. Global config with custom ACME paths (e.g. /etc/eslise/my_cert.crt)
+        let mut global_cfg = GlobalConfig::default();
+        global_cfg.cert_domain = Some("ft.nksea.com".to_string());
+        global_cfg.cert_mode = Some("http".to_string());
+        global_cfg.cert_key_length = Some("ec-256".to_string());
+        global_cfg.acme_server = Some("letsencrypt".to_string());
+        global_cfg.cert_file = Some(PathBuf::from("/etc/eslise/my_cert.crt"));
+        global_cfg.key_file = Some(PathBuf::from("/etc/eslise/my_cert.key"));
+
+        // 2. Node config inherits from global
+        let mut node_cfg = NodeConfig {
+            node_id: 32,
+            ..Default::default()
+        };
+        node_cfg.inherit_from_global(&global_cfg);
+
+        assert_eq!(node_cfg.cert_domain.as_deref(), Some("ft.nksea.com"));
+        assert_eq!(node_cfg.cert_mode.as_deref(), Some("http"));
+        assert_eq!(
+            node_cfg.cert_file,
+            Some(PathBuf::from("/etc/eslise/my_cert.crt"))
+        );
+        assert_eq!(
+            node_cfg.key_file,
+            Some(PathBuf::from("/etc/eslise/my_cert.key"))
+        );
+
+        // 3. Simulated raw NodeInfo from panel (Xboard)
+        // Panel does NOT provide cert_file or key_file, only tls = 1, server_name = "ft.nksea.com"
+        let mut node_info = NodeInfo {
+            id: 32,
+            node_type: "anytls".to_string(),
+            server_port: 8000,
+            server_name: Some("ft.nksea.com".to_string()),
+            tls: Some(1),
+            tls_settings: Some(serde_json::json!({
+                "allow_insecure": true,
+                "server_name": "ft.nksea.com"
+            })),
+            ..Default::default()
+        };
+
+        // 4. prepare_node_info dynamically injects user's configured cert and key paths into cert_config
+        node_cfg
+            .prepare_node_info(Path::new("./nodes"), &mut node_info)
+            .unwrap();
+
+        let cert_config = node_info
+            .cert_config
+            .as_ref()
+            .expect("cert_config should be present");
+        assert_eq!(
+            cert_config.get("cert_file").and_then(|v| v.as_str()),
+            Some("/etc/eslise/my_cert.crt")
+        );
+        assert_eq!(
+            cert_config.get("key_file").and_then(|v| v.as_str()),
+            Some("/etc/eslise/my_cert.key")
+        );
+        assert_eq!(node_info.server_name.as_deref(), Some("ft.nksea.com"));
     }
 }

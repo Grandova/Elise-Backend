@@ -1,9 +1,13 @@
+pub mod acme;
 pub mod audit;
 pub mod defense;
 pub mod ech;
 pub mod reality;
 pub mod tls;
 
+pub use acme::{
+    check_cert_validity, ensure_acme_certificate, obtain_certificate, AcmeConfig, CertStatus,
+};
 pub use audit::AuditController;
 pub use defense::AttackDefenseManager;
 pub use ech::EchKeyPair;

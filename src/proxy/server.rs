@@ -124,6 +124,7 @@ impl MasterServer {
 
         for (idx, &node_id) in self.global_config.node_ids.iter().enumerate() {
             let mut node_cfg = NodeConfig::load_for_node(&nodes_dir, node_id);
+            node_cfg.inherit_from_global(&self.global_config);
             if node_cfg.listen_addr.is_none() {
                 node_cfg.listen_addr = Some(self.global_config.get_listen_ip_for_node(idx, None));
             }

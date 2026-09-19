@@ -75,6 +75,8 @@ redis = { version = "0.26", optional = true, features = ["tokio-comp", "connecti
 
 # QUIC for Hysteria2 & TUIC
 quinn = { version = "0.11", optional = true }
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring", "rcgen", "x509-parser"] }
+x509-parser = { version = "0.18", default-features = false }
 
 [features]
 default = ["distributed", "quic-protocols"]

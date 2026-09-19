@@ -22,7 +22,7 @@ pub struct NodeRunner {
     pub node_id: u32,
     panel_client: Arc<dyn PanelClient>,
     global_config: Arc<GlobalConfig>,
-    node_config: NodeConfig,
+    node_config: Arc<parking_lot::RwLock<NodeConfig>>,
     router: Arc<Router>,
     node_info: Mutex<Option<NodeInfo>>,
     rate_limiter: Arc<RateLimiter>,
@@ -108,7 +108,7 @@ impl NodeRunner {
             node_id,
             panel_client,
             global_config,
-            node_config,
+            node_config: Arc::new(parking_lot::RwLock::new(node_config)),
             router: Arc::new(router.fork()),
             node_info: Mutex::new(None),
             rate_limiter,
@@ -214,15 +214,46 @@ impl NodeRunner {
             std::path::PathBuf::from("./nodes")
         };
 
+        // If ACME HTTP mode is configured, automatically verify/issue certificate
+        if self.node_config.read().cert_mode.as_deref() == Some("http")
+            || self.node_config.read().cert_mode.as_deref() == Some("acme")
+        {
+            let mut cfg_clone = self.node_config.read().clone();
+            match crate::security::ensure_acme_certificate(&mut cfg_clone, &node_info).await {
+                Ok(acme_cfg) => {
+                    *self.node_config.write() = cfg_clone;
+                    info!(
+                        node_id = self.node_id,
+                        domain = %acme_cfg.domain,
+                        cert_file = %acme_cfg.cert_file.display(),
+                        key_file = %acme_cfg.key_file.display(),
+                        "ACME TLS certificate is ready for node"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        node_id = self.node_id,
+                        error = %e,
+                        "Failed to obtain/verify ACME certificate; continuing with existing config"
+                    );
+                }
+            }
+        }
+
         if let Err(e) = self
             .node_config
+            .read()
             .prepare_node_info(&nodes_dir, &mut node_info)
         {
             error!(node_id = self.node_id, error = %e, "Invalid node security configuration");
             return;
         }
 
-        if let Err(e) = self.node_config.save_node_conf(&nodes_dir, &node_info) {
+        if let Err(e) = self
+            .node_config
+            .read()
+            .save_node_conf(&nodes_dir, &node_info)
+        {
             warn!(
                 "Node {}: Failed to save node config to {}: {}",
                 self.node_id,
@@ -243,8 +274,50 @@ impl NodeRunner {
         let inbound_task = {
             let runner = self.clone();
             let shutdown_sub = shutdown_rx.resubscribe();
+            let node_info_clone = node_info.clone();
             tokio::spawn(async move {
-                runner.run_inbound(node_info, shutdown_sub).await;
+                runner.run_inbound(node_info_clone, shutdown_sub).await;
+            })
+        };
+
+        // ACME Background Certificate Renewal Task (Runs every 12 hours)
+        let _acme_task = {
+            let runner = self.clone();
+            let mut shutdown_sub = shutdown_rx.resubscribe();
+            let node_info_snapshot = node_info.clone();
+            tokio::spawn(async move {
+                if runner.node_config.read().cert_mode.as_deref() != Some("http")
+                    && runner.node_config.read().cert_mode.as_deref() != Some("acme")
+                {
+                    return;
+                }
+                let mut ticker = tokio::time::interval(Duration::from_secs(12 * 3600));
+                ticker.tick().await; // Skip initial tick since startup already ensured validity
+                loop {
+                    tokio::select! {
+                        _ = shutdown_sub.recv() => break,
+                        _ = ticker.tick() => {
+                            let mut cfg_clone = runner.node_config.read().clone();
+                            match crate::security::ensure_acme_certificate(&mut cfg_clone, &node_info_snapshot).await {
+                                Ok(acme_cfg) => {
+                                    *runner.node_config.write() = cfg_clone;
+                                    info!(
+                                        node_id = runner.node_id,
+                                        domain = %acme_cfg.domain,
+                                        "ACME certificate background check completed successfully"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        node_id = runner.node_id,
+                                        error = %e,
+                                        "ACME certificate background check encountered error"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
             })
         };
 
@@ -255,6 +328,7 @@ impl NodeRunner {
             tokio::spawn(async move {
                 let report_secs = runner
                     .node_config
+                    .read()
                     .submit_interval
                     .unwrap_or(runner.global_config.node_report_interval);
                 let interval = Duration::from_secs(report_secs.max(10));
@@ -444,16 +518,14 @@ impl NodeRunner {
     }
 
     fn inbound_context(&self, node_info: &NodeInfo) -> std::io::Result<InboundContext> {
-        let port = u16::try_from(
-            i64::from(node_info.server_port) + i64::from(self.node_config.port_offset),
-        )
-        .ok()
-        .filter(|port| *port > 0)
-        .ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid node port")
-        })?;
-        let listen_addr = self
-            .node_config
+        let cfg = self.node_config.read();
+        let port = u16::try_from(i64::from(node_info.server_port) + i64::from(cfg.port_offset))
+            .ok()
+            .filter(|port| *port > 0)
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid node port")
+            })?;
+        let listen_addr = cfg
             .listen_addr
             .clone()
             .or_else(|| node_info.listen_ip.clone())
@@ -472,18 +544,14 @@ impl NodeRunner {
 
         // 应用节点独立的 [USER] 参数覆盖到 InboundContext 的 global_config 视图
         let mut node_effective_global = (*self.global_config).clone();
-        if let Some(pattern) = self
-            .node_config
-            .custom_settings
-            .get("mieru_traffic_pattern")
-        {
+        if let Some(pattern) = cfg.custom_settings.get("mieru_traffic_pattern") {
             if !pattern.trim().is_empty() {
                 node_effective_global
                     .raw_properties
                     .insert("mieru_traffic_pattern".into(), pattern.clone());
             }
         }
-        if let Some(pp) = self.node_config.proxy_protocol {
+        if let Some(pp) = cfg.proxy_protocol {
             node_effective_global.proxy_protocol = pp;
             if pp
                 && node_effective_global.proxy_protocol_mode == crate::conn::ProxyProtocolMode::Off
@@ -491,17 +559,18 @@ impl NodeRunner {
                 node_effective_global.proxy_protocol_mode = crate::conn::ProxyProtocolMode::Auto;
             }
         }
-        if let Some(upp) = self.node_config.udp_proxy_protocol {
+        if let Some(upp) = cfg.udp_proxy_protocol {
             node_effective_global.udp_proxy_protocol = upp;
         }
-        if let Some(mptcp) = self.node_config.mptcp {
+        if let Some(mptcp) = cfg.mptcp {
             node_effective_global.mptcp = mptcp;
         }
-        if let Some(force_close) = self.node_config.force_close_ssl {
+        if let Some(force_close) = cfg.force_close_ssl {
             if force_close {
                 node_effective_global.auto_tls = false;
             }
         }
+        drop(cfg);
 
         Ok(InboundContext {
             ready: None,
@@ -555,6 +624,7 @@ impl NodeRunner {
         let mut retired = tokio::task::JoinSet::new();
         let interval = self
             .node_config
+            .read()
             .check_interval
             .unwrap_or(self.global_config.node_sync_interval)
             .max(10);
@@ -578,7 +648,7 @@ impl NodeRunner {
                         } else {
                             std::path::PathBuf::from("./nodes")
                         };
-                        if let Err(e) = self.node_config.prepare_node_info(&nodes_dir, &mut next) {
+                        if let Err(e) = self.node_config.read().prepare_node_info(&nodes_dir, &mut next) {
                             warn!(node_id = self.node_id, error = %e, "Invalid node security update; keeping active configuration");
                             return;
                         }
@@ -596,7 +666,7 @@ impl NodeRunner {
                                 retired.spawn(async move { old.stop().await; });
                                 self.apply_node_routes(&next);
                                 info = next;
-                                if let Err(e) = self.node_config.save_node_conf(&nodes_dir, &info) {
+                                if let Err(e) = self.node_config.read().save_node_conf(&nodes_dir, &info) {
                                     warn!(node_id = self.node_id, error = %e, "Failed to update node AUTO settings");
                                 }
                                 info!(node_id = self.node_id, port = info.server_port, "Node configuration reloaded");
@@ -1123,10 +1193,12 @@ mod tests {
 
         runner
             .node_config
+            .write()
             .parse_content("[USER]\nmieru_traffic_pattern = invalid");
         assert!(runner.launch_inbound(&info, &[]).await.is_err());
         runner
             .node_config
+            .write()
             .parse_content(&format!("[USER]\nmieru_traffic_pattern = {pattern}"));
         runner.global_config = Arc::new(crate::config::GlobalConfig::parse(
             "mieru_traffic_pattern = invalid",
@@ -1136,6 +1208,7 @@ mod tests {
 
         runner
             .node_config
+            .write()
             .parse_content("[USER]\nmieru_traffic_pattern = ");
         runner.global_config = Arc::new(crate::config::GlobalConfig::parse(
             "mieru_traffic_pattern = ",

@@ -113,6 +113,17 @@ pub struct GlobalConfig {
     pub vmess_aead_invalid_access_duration: u64,
     pub vmess_aead_invalid_access_forbidden_time: u64,
 
+    // ACME TLS Certificate Settings
+    pub cert_domain: Option<String>,
+    pub cert_mode: Option<String>,
+    pub cert_key_length: Option<String>,
+    pub acme_server: Option<String>,
+    pub acme_email: Option<String>,
+    pub cert_file: Option<PathBuf>,
+    pub key_file: Option<PathBuf>,
+
+    pub node_overrides: HashMap<u32, HashMap<String, String>>,
+
     pub raw_properties: HashMap<String, String>,
 }
 
@@ -129,6 +140,16 @@ impl Default for GlobalConfig {
             fake_sni: "www.microsoft.com".to_string(),
             listen_strategy: "auto".to_string(),
             listen_addr: "0.0.0.0".to_string(),
+
+            cert_domain: None,
+            cert_mode: None,
+            cert_key_length: None,
+            acme_server: None,
+            acme_email: None,
+            cert_file: None,
+            key_file: None,
+
+            node_overrides: HashMap::new(),
 
             routes_file: PathBuf::from("/etc/elise/routes.toml"),
             dns_file: PathBuf::from("/etc/elise/dns.yml"),
@@ -279,6 +300,7 @@ impl GlobalConfig {
 
     pub fn parse(content: &str) -> Self {
         let mut cfg = Self::default();
+        let mut current_node_section: Option<u32> = None;
 
         for line in content.lines() {
             let line = line.trim();
@@ -286,7 +308,15 @@ impl GlobalConfig {
                 continue;
             }
             if line.starts_with('[') && line.ends_with(']') {
-                // Section header like [node_1]
+                let section = line[1..line.len() - 1].trim();
+                if let Some(num_str) = section
+                    .strip_prefix("node_")
+                    .or_else(|| section.strip_prefix("node"))
+                {
+                    current_node_section = num_str.parse::<u32>().ok();
+                } else {
+                    current_node_section = None;
+                }
                 continue;
             }
 
@@ -298,8 +328,16 @@ impl GlobalConfig {
                     .trim_matches('\'')
                     .trim()
                     .to_string();
-                cfg.raw_properties.insert(key.clone(), val.clone());
-                cfg.apply_kv(&key, &val);
+
+                if let Some(node_id) = current_node_section {
+                    cfg.node_overrides
+                        .entry(node_id)
+                        .or_default()
+                        .insert(key, val);
+                } else {
+                    cfg.raw_properties.insert(key.clone(), val.clone());
+                    cfg.apply_kv(&key, &val);
+                }
             }
         }
 
@@ -347,6 +385,13 @@ impl GlobalConfig {
             }
             "auto_tls" => self.auto_tls = val.eq_ignore_ascii_case("true") || val == "1",
             "fake_sni" => self.fake_sni = val.to_string(),
+            "cert_domain" => self.cert_domain = Some(val.to_string()),
+            "cert_mode" => self.cert_mode = Some(val.to_string()),
+            "cert_key_length" => self.cert_key_length = Some(val.to_string()),
+            "acme_server" => self.acme_server = Some(val.to_string()),
+            "acme_email" | "email" => self.acme_email = Some(val.to_string()),
+            "cert_file" => self.cert_file = Some(PathBuf::from(val)),
+            "key_file" => self.key_file = Some(PathBuf::from(val)),
             "listen_strategy" | "multi_node_listen_strategy" => {
                 self.listen_strategy = val.to_lowercase()
             }
