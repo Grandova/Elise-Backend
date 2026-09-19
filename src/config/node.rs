@@ -825,13 +825,15 @@ mod tests {
         use std::path::PathBuf;
 
         // 1. Global config with custom ACME paths (e.g. /etc/eslise/my_cert.crt)
-        let mut global_cfg = GlobalConfig::default();
-        global_cfg.cert_domain = Some("ft.nksea.com".to_string());
-        global_cfg.cert_mode = Some("http".to_string());
-        global_cfg.cert_key_length = Some("ec-256".to_string());
-        global_cfg.acme_server = Some("letsencrypt".to_string());
-        global_cfg.cert_file = Some(PathBuf::from("/etc/eslise/my_cert.crt"));
-        global_cfg.key_file = Some(PathBuf::from("/etc/eslise/my_cert.key"));
+        let global_cfg = GlobalConfig {
+            cert_domain: Some("ft.nksea.com".to_string()),
+            cert_mode: Some("http".to_string()),
+            cert_key_length: Some("ec-256".to_string()),
+            acme_server: Some("letsencrypt".to_string()),
+            cert_file: Some(PathBuf::from("/etc/eslise/my_cert.crt")),
+            key_file: Some(PathBuf::from("/etc/eslise/my_cert.key")),
+            ..Default::default()
+        };
 
         // 2. Node config inherits from global
         let mut node_cfg = NodeConfig {
