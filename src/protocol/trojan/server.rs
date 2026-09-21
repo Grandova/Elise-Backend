@@ -1,0 +1,911 @@
+use crate::conn::{bind_tcp_listener, read_proxy_protocol, BoxedStream, MonitoredStream};
+use crate::observability::AuditRecord;
+use crate::panel::types::{NodeInfo, User};
+use crate::protocol::{Inbound, InboundContext};
+use crate::proxy::router::MatchContext;
+use crate::security::reality::RealityServer;
+use crate::security::TLSManager;
+use crate::transport::{
+    apply_transport_security, serve_transport, StreamSettings, TransportSecurityConfig,
+};
+use async_trait::async_trait;
+use parking_lot::RwLock;
+use sha2::{Digest, Sha224};
+use std::collections::HashMap;
+use std::io;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
+use tokio::sync::{broadcast, mpsc};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
+
+pub struct TrojanInbound {
+    users: Arc<RwLock<Arc<HashMap<String, Arc<User>>>>>,
+}
+
+impl Default for TrojanInbound {
+    fn default() -> Self {
+        Self {
+            users: Arc::new(RwLock::new(Arc::new(HashMap::new()))),
+        }
+    }
+}
+
+impl TrojanInbound {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+#[async_trait]
+impl Inbound for TrojanInbound {
+    fn protocol_type(&self) -> &'static str {
+        "trojan"
+    }
+
+    fn update_users(&self, users: Vec<User>) {
+        let mut map = HashMap::with_capacity(users.len());
+        for u in users {
+            let pass = u.password.as_deref().unwrap_or(&u.uuid);
+            let mut hasher = Sha224::new();
+            hasher.update(pass.as_bytes());
+            let hash_hex = hex::encode(hasher.finalize());
+            map.insert(hash_hex, Arc::new(u));
+        }
+        *self.users.write() = Arc::new(map);
+    }
+
+    async fn start(
+        &self,
+        ctx: InboundContext,
+        node_info: NodeInfo,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) -> io::Result<()> {
+        let settings = StreamSettings::from_node_info(&node_info)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+        let (tls_manager, reality_server) = match &settings.security {
+            TransportSecurityConfig::None => (Some(ctx.tls_manager.clone()), None),
+            TransportSecurityConfig::Tls(tls_cfg) => {
+                let mgr = TLSManager::from_config(
+                    tls_cfg,
+                    ctx.global_config.auto_tls,
+                    &ctx.global_config.fake_sni,
+                )
+                .map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Failed to initialize TLS for Trojan inbound: {e}"),
+                    )
+                })?;
+                (Some(Arc::new(mgr)), None)
+            }
+            TransportSecurityConfig::Reality(reality_cfg) => {
+                let srv = RealityServer::new(reality_cfg.clone()).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("Failed to initialize REALITY for Trojan inbound: {e}"),
+                    )
+                })?;
+                (None, Some(Arc::new(srv)))
+            }
+        };
+
+        let settings = Arc::new(settings);
+        let bind_addr = format!("{}:{}", ctx.listen_addr, ctx.port);
+        let listener = bind_tcp_listener(&bind_addr, ctx.global_config.mptcp).await?;
+        info!(
+            "Trojan inbound listening on {} (transport: {:?}, security: {:?})",
+            bind_addr,
+            settings.transport.transport_type(),
+            match &settings.security {
+                TransportSecurityConfig::None => "None",
+                TransportSecurityConfig::Tls(_) => "TLS",
+                TransportSecurityConfig::Reality(_) => "REALITY",
+            }
+        );
+
+        let users = self.users.clone();
+
+        let mut connections = tokio::task::JoinSet::new();
+        ctx.mark_ready();
+        loop {
+            tokio::select! {
+                result = connections.join_next(), if !connections.is_empty() => {
+                    if let Some(Err(e)) = result { tracing::warn!(error = %e, "Connection task failed"); }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Trojan inbound on port {} stopping", ctx.port);
+                    break;
+                }
+                accept_res = listener.accept() => {
+                    let (stream, remote_addr) = match accept_res {
+                        Ok(conn) => conn,
+                        Err(e) => {
+                            warn!("Trojan accept error: {:?}", e);
+                            continue;
+                        }
+                    };
+                    let _ = stream.set_nodelay(true);
+
+                    let ctx = ctx.clone();
+                    let users = users.clone();
+                    let settings = settings.clone();
+                    let tls_manager = tls_manager.clone();
+                    let reality_server = reality_server.clone();
+
+                    connections.spawn(async move {
+                        if let Err(e) = handle_connection(
+                            stream,
+                            remote_addr,
+                            ctx,
+                            users,
+                            settings,
+                            tls_manager.as_deref(),
+                            reality_server.as_deref(),
+                        )
+                        .await
+                        {
+                            debug!("Trojan connection ended from {}: {:?}", remote_addr, e);
+                        }
+                    });
+                }
+            }
+        }
+        drop(listener);
+        crate::protocol::common::inbound::drain_connections(&mut connections).await;
+        Ok(())
+    }
+}
+
+async fn handle_connection(
+    stream: TcpStream,
+    remote_addr: SocketAddr,
+    ctx: InboundContext,
+    users: Arc<RwLock<Arc<HashMap<String, Arc<User>>>>>,
+    settings: Arc<StreamSettings>,
+    tls_manager: Option<&TLSManager>,
+    reality_server: Option<&RealityServer>,
+) -> io::Result<()> {
+    handle_connection_inner(
+        stream,
+        remote_addr,
+        ctx,
+        users,
+        settings,
+        tls_manager,
+        reality_server,
+    )
+    .await
+}
+
+async fn handle_connection_inner(
+    stream: TcpStream,
+    mut remote_addr: SocketAddr,
+    ctx: InboundContext,
+    users: Arc<RwLock<Arc<HashMap<String, Arc<User>>>>>,
+    settings: Arc<StreamSettings>,
+    tls_manager: Option<&TLSManager>,
+    reality_server: Option<&RealityServer>,
+) -> io::Result<()> {
+    let local_ip = stream.local_addr().ok().map(|s| s.ip());
+
+    let (src_opt, stream): (Option<SocketAddr>, BoxedStream) =
+        if settings.accept_proxy_protocol || ctx.global_config.proxy_protocol {
+            let (src, ps) =
+                read_proxy_protocol(stream, ctx.global_config.get_proxy_protocol_mode()).await?;
+            (src, Box::new(ps))
+        } else {
+            (None, Box::new(stream))
+        };
+    if let Some(src) = src_opt {
+        remote_addr = src;
+    }
+
+    let client_ip = remote_addr.ip();
+    if ctx.defense.is_banned(client_ip) {
+        return Ok(());
+    }
+
+    let alpn = match &settings.transport {
+        crate::transport::TransportConfig::Grpc(_)
+        | crate::transport::TransportConfig::LegacyHttp2(_) => {
+            vec![b"h2".to_vec()]
+        }
+        crate::transport::TransportConfig::XHttp(_) => {
+            vec![b"h2".to_vec(), b"http/1.1".to_vec()]
+        }
+        _ => vec![b"http/1.1".to_vec()],
+    };
+
+    let sec_stream = match tokio::time::timeout(
+        Duration::from_secs(15),
+        apply_transport_security(
+            stream,
+            remote_addr,
+            &settings.security,
+            tls_manager,
+            reality_server,
+            alpn,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(s))) => s,
+        Ok(Ok(None)) => return Ok(()),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "Trojan transport security handshake timed out",
+            ));
+        }
+    };
+
+    let ctx_clone = ctx.clone();
+    let users_clone = users.clone();
+    let res = serve_transport(
+        sec_stream,
+        &settings.transport,
+        tls_manager,
+        move |stream| {
+            let ctx = ctx_clone.clone();
+            let users = users_clone.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+                let _ = handle_trojan_protocol(stream, remote_addr, local_ip, ctx, users, deadline)
+                    .await;
+            }
+        },
+    )
+    .await;
+
+    if let Err(e) = res {
+        warn!("Trojan transport serve error from {}: {:?}", client_ip, e);
+    }
+    Ok(())
+}
+
+async fn handle_trojan_protocol(
+    mut stream: BoxedStream,
+    remote_addr: SocketAddr,
+    local_ip: Option<IpAddr>,
+    ctx: InboundContext,
+    users: Arc<RwLock<Arc<HashMap<String, Arc<User>>>>>,
+    deadline: tokio::time::Instant,
+) -> io::Result<()> {
+    let client_ip = remote_addr.ip();
+
+    let handshake = async {
+        let mut hash_buf = [0u8; 56];
+        stream.read_exact(&mut hash_buf).await?;
+        let mut crlf = [0u8; 2];
+        stream.read_exact(&mut crlf).await?;
+        if &crlf != b"\r\n" {
+            return Ok(None);
+        }
+        let hash_str = String::from_utf8_lossy(&hash_buf).to_lowercase();
+
+        let user = {
+            let users_map = users.read().clone();
+            match users_map.get(&hash_str).cloned() {
+                Some(u) => {
+                    ctx.defense.record_success(client_ip);
+                    u
+                }
+                None => {
+                    ctx.defense.record_failure(client_ip);
+                    return Ok(None);
+                }
+            }
+        };
+
+        if !ctx
+            .device_limiter
+            .check_and_record_async(user.id, client_ip)
+            .await
+        {
+            return Ok(None);
+        }
+
+        let conn_guard = match ctx.conn_limiter.try_acquire(user.id) {
+            Some(g) => g,
+            None => return Ok(None),
+        };
+
+        let mut cmd_buf = [0u8; 1];
+        stream.read_exact(&mut cmd_buf).await?;
+
+        let mut atyp_buf = [0u8; 1];
+        stream.read_exact(&mut atyp_buf).await?;
+
+        let (target_host, target_ip) = match atyp_buf[0] {
+            0x01 => {
+                let mut ipv4 = [0u8; 4];
+                stream.read_exact(&mut ipv4).await?;
+                let ip = IpAddr::V4(Ipv4Addr::from(ipv4));
+                (ip.to_string(), Some(ip))
+            }
+            0x03 => {
+                let mut len_buf = [0u8; 1];
+                stream.read_exact(&mut len_buf).await?;
+                let mut domain_buf = vec![0u8; len_buf[0] as usize];
+                stream.read_exact(&mut domain_buf).await?;
+                let domain = String::from_utf8_lossy(&domain_buf).to_string();
+                (domain, None)
+            }
+            0x04 => {
+                let mut ipv6 = [0u8; 16];
+                stream.read_exact(&mut ipv6).await?;
+                let ip = IpAddr::V6(Ipv6Addr::from(ipv6));
+                (ip.to_string(), Some(ip))
+            }
+            _ => return Ok(None),
+        };
+
+        let mut port_buf = [0u8; 2];
+        stream.read_exact(&mut port_buf).await?;
+        let target_port = u16::from_be_bytes(port_buf);
+
+        let mut end_crlf = [0u8; 2];
+        stream.read_exact(&mut end_crlf).await?;
+        if &end_crlf != b"\r\n" {
+            return Ok(None);
+        }
+
+        Ok::<_, io::Error>(Some((
+            user,
+            conn_guard,
+            cmd_buf[0],
+            target_host,
+            target_ip,
+            target_port,
+        )))
+    };
+    let Some((user, conn_guard, command, target_host, target_ip, target_port)) =
+        tokio::time::timeout_at(deadline, handshake)
+            .await
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::TimedOut, "Trojan authentication timed out")
+            })??
+    else {
+        return Ok(());
+    };
+
+    if command == 0x03 {
+        return handle_trojan_udp(
+            stream,
+            conn_guard,
+            remote_addr,
+            local_ip,
+            user,
+            ctx,
+            target_host,
+            target_ip,
+            target_port,
+        )
+        .await;
+    }
+
+    let (sniffed, stream) =
+        crate::conn::sniff_async_stream(stream, target_ip, ctx.global_config.domain_sniff).await;
+    let match_host = sniffed.as_deref().unwrap_or(&target_host);
+    let dial_host = if ctx.global_config.sniff_redirect {
+        match_host
+    } else {
+        &target_host
+    };
+
+    if ctx.audit.should_block(match_host, target_ip, target_port) {
+        return Ok(());
+    }
+
+    let mctx = MatchContext {
+        node_id: ctx.node_id,
+        network: "tcp",
+        target_host: match_host,
+        target_ip,
+        target_port,
+        inbound_local_ip: local_ip,
+    };
+    let outbound = ctx.router.match_outbound(&mctx);
+
+    let mut out_stream = match ctx
+        .router
+        .dialer()
+        .dial(&outbound, dial_host, target_port, local_ip)
+        .await
+    {
+        Ok(s) => s,
+        Err(_e) => return Ok(()),
+    };
+
+    let mut client_conn = MonitoredStream::new(stream, user.id, remote_addr);
+    let _traffic = client_conn.traffic_guard(ctx.on_traffic.clone());
+    let start_time = Instant::now();
+
+    let _ = crate::conn::copy_bidirectional_throttled(
+        &mut client_conn,
+        &mut out_stream,
+        user.id,
+        Some(&ctx.rate_limiter),
+        ctx.global_config.tcp_timeout,
+    )
+    .await;
+
+    let duration = start_time.elapsed();
+    let (up, down) = client_conn.stats();
+
+    ctx.audit_logger.record(AuditRecord::new(
+        ctx.node_id,
+        user.id,
+        "trojan",
+        "tcp",
+        &client_ip.to_string(),
+        &target_host,
+        target_port,
+        up,
+        down,
+        duration.as_millis() as i64,
+        &outbound.tag,
+        "connected",
+    ));
+
+    Ok(())
+}
+
+const MAX_TROJAN_UDP_PAYLOAD: usize = 8192;
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_trojan_udp(
+    stream: BoxedStream,
+    _conn_guard: crate::limiter::ConnGuard,
+    remote_addr: SocketAddr,
+    local_ip: Option<IpAddr>,
+    user: Arc<User>,
+    ctx: InboundContext,
+    initial_target_host: String,
+    initial_target_ip: Option<IpAddr>,
+    initial_target_port: u16,
+) -> io::Result<()> {
+    let client_ip = remote_addr.ip();
+    let (mut client_read, mut client_write) = tokio::io::split(stream);
+    let start_time = Instant::now();
+    let user_id = user.id;
+
+    let (response_tx, mut response_rx) = mpsc::channel::<Vec<u8>>(256);
+    let cancel_token = CancellationToken::new();
+
+    let mut sessions: HashMap<(String, u16), mpsc::Sender<Vec<u8>>> = HashMap::new();
+
+    let mut total_up = 0u64;
+    let mut total_down = 0u64;
+
+    if ctx
+        .audit
+        .should_block(&initial_target_host, initial_target_ip, initial_target_port)
+    {
+        return Ok(());
+    }
+
+    let initial_mctx = MatchContext {
+        node_id: ctx.node_id,
+        network: "udp",
+        target_host: &initial_target_host,
+        target_ip: initial_target_ip,
+        target_port: initial_target_port,
+        inbound_local_ip: local_ip,
+    };
+    let initial_outbound = ctx.router.match_outbound(&initial_mctx);
+    let last_outbound_tag = Arc::new(RwLock::new(initial_outbound.tag.clone()));
+
+    let write_cancel = cancel_token.clone();
+    let write_task = async {
+        let mut down_bytes = 0u64;
+        while let Some(packet) = response_rx.recv().await {
+            if client_write.write_all(&packet).await.is_err() {
+                break;
+            }
+            down_bytes += packet.len() as u64;
+        }
+        let _ = client_write.shutdown().await;
+        write_cancel.cancel();
+        down_bytes
+    };
+
+    let read_cancel = cancel_token.clone();
+    let read_last_tag = last_outbound_tag.clone();
+    let read_task = async {
+        let mut atyp_buf = [0u8; 1];
+        let mut port_buf = [0u8; 2];
+        let mut len_buf = [0u8; 2];
+        let mut crlf_buf = [0u8; 2];
+        let mut payload = vec![0u8; MAX_TROJAN_UDP_PAYLOAD];
+        let mut up_bytes = 0u64;
+
+        loop {
+            let read_res = tokio::time::timeout(
+                Duration::from_secs(60),
+                client_read.read_exact(&mut atyp_buf),
+            )
+            .await;
+
+            match read_res {
+                Ok(Ok(_)) => {}
+                _ => break,
+            }
+
+            let (dst_host, dst_ip) = match atyp_buf[0] {
+                0x01 => {
+                    let mut ipv4 = [0u8; 4];
+                    if client_read.read_exact(&mut ipv4).await.is_err() {
+                        break;
+                    }
+                    let ip = IpAddr::V4(Ipv4Addr::from(ipv4));
+                    (ip.to_string(), Some(ip))
+                }
+                0x03 => {
+                    let mut l = [0u8; 1];
+                    if client_read.read_exact(&mut l).await.is_err() {
+                        break;
+                    }
+                    let mut domain_buf = vec![0u8; l[0] as usize];
+                    if client_read.read_exact(&mut domain_buf).await.is_err() {
+                        break;
+                    }
+                    let domain = String::from_utf8_lossy(&domain_buf).to_string();
+                    let ip = domain.parse().ok();
+                    (domain, ip)
+                }
+                0x04 => {
+                    let mut ipv6 = [0u8; 16];
+                    if client_read.read_exact(&mut ipv6).await.is_err() {
+                        break;
+                    }
+                    let ip = IpAddr::V6(Ipv6Addr::from(ipv6));
+                    (ip.to_string(), Some(ip))
+                }
+                _ => break,
+            };
+
+            if client_read.read_exact(&mut port_buf).await.is_err() {
+                break;
+            }
+            let dst_port = u16::from_be_bytes(port_buf);
+
+            if client_read.read_exact(&mut len_buf).await.is_err() {
+                break;
+            }
+            let length = u16::from_be_bytes(len_buf) as usize;
+
+            if client_read.read_exact(&mut crlf_buf).await.is_err() || &crlf_buf != b"\r\n" {
+                break;
+            }
+
+            if length > MAX_TROJAN_UDP_PAYLOAD {
+                warn!(
+                    "Trojan UDP packet length {} exceeds max allowed {} bytes, terminating",
+                    length, MAX_TROJAN_UDP_PAYLOAD
+                );
+                break;
+            }
+
+            if client_read
+                .read_exact(&mut payload[..length])
+                .await
+                .is_err()
+            {
+                break;
+            }
+
+            ctx.rate_limiter.throttle(user_id, length + 7).await;
+
+            let key = (dst_host.clone(), dst_port);
+            let session_tx = match sessions.get(&key) {
+                Some(tx) if !tx.is_closed() => tx.clone(),
+                _ => {
+                    if sessions.len() >= 1024 {
+                        sessions.retain(|_, s| !s.is_closed());
+                        if sessions.len() >= 1024 {
+                            continue;
+                        }
+                    }
+
+                    let mctx = MatchContext {
+                        node_id: ctx.node_id,
+                        network: "udp",
+                        target_host: &dst_host,
+                        target_ip: dst_ip,
+                        target_port: dst_port,
+                        inbound_local_ip: local_ip,
+                    };
+                    let outbound = ctx.router.match_outbound(&mctx);
+                    *read_last_tag.write() = outbound.tag.clone();
+
+                    let udp_outbound = match ctx
+                        .router
+                        .dialer()
+                        .dial_udp_outbound(&outbound, &dst_host, dst_port, local_ip)
+                        .await
+                    {
+                        Ok(s) => s,
+                        Err(e) => {
+                            debug!(
+                                "Trojan UDP dial outbound error for {}:{}: {:?}",
+                                dst_host, dst_port, e
+                            );
+                            continue;
+                        }
+                    };
+
+                    let (req_tx, mut req_rx) = mpsc::channel::<Vec<u8>>(128);
+                    let resp_tx = response_tx.clone();
+                    let child_cancel = read_cancel.child_token();
+                    let child_host = dst_host.clone();
+
+                    tokio::spawn(async move {
+                        let mut recv_buf = [0u8; MAX_TROJAN_UDP_PAYLOAD];
+                        let idle_timeout = Duration::from_secs(60);
+
+                        loop {
+                            tokio::select! {
+                                _ = child_cancel.cancelled() => break,
+                                req = req_rx.recv() => {
+                                    let Some(data) = req else { break; };
+                                    if udp_outbound.send(&data).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                recv_res = tokio::time::timeout(idle_timeout, udp_outbound.recv(&mut recv_buf)) => {
+                                    match recv_res {
+                                        Ok(Ok((n, src_addr))) if n > 0 => {
+
+                                            let mut out_pkt = Vec::with_capacity(32 + n);
+                                            match src_addr {
+                                                shadowsocks::relay::socks5::Address::SocketAddress(sa) => {
+                                                    match sa.ip() {
+                                                        IpAddr::V4(v4) => {
+                                                            out_pkt.push(0x01);
+                                                            out_pkt.extend_from_slice(&v4.octets());
+                                                        }
+                                                        IpAddr::V6(v6) => {
+                                                            out_pkt.push(0x04);
+                                                            out_pkt.extend_from_slice(&v6.octets());
+                                                        }
+                                                    }
+                                                    out_pkt.extend_from_slice(&sa.port().to_be_bytes());
+                                                }
+                                                shadowsocks::relay::socks5::Address::DomainNameAddress(ref d, p) => {
+                                                    out_pkt.push(0x03);
+                                                    out_pkt.push(d.len() as u8);
+                                                    out_pkt.extend_from_slice(d.as_bytes());
+                                                    out_pkt.extend_from_slice(&p.to_be_bytes());
+                                                }
+                                            }
+                                            out_pkt.extend_from_slice(&(n as u16).to_be_bytes());
+                                            out_pkt.extend_from_slice(b"\r\n");
+                                            out_pkt.extend_from_slice(&recv_buf[..n]);
+
+                                            if resp_tx.send(out_pkt).await.is_err() {
+                                                break;
+                                            }
+                                        }
+                                        _ => break,
+                                    }
+                                }
+                            }
+                        }
+                        debug!("Trojan UDP session for {}:{} closed", child_host, dst_port);
+                    });
+
+                    sessions.insert(key, req_tx.clone());
+                    req_tx
+                }
+            };
+
+            let _ = session_tx.try_send(payload[..length].to_vec());
+            up_bytes += (length + 7) as u64;
+        }
+
+        read_cancel.cancel();
+        up_bytes
+    };
+
+    tokio::select! {
+        u = read_task => {
+            total_up = u;
+        }
+        d = write_task => {
+            total_down = d;
+        }
+    }
+
+    let duration = start_time.elapsed();
+
+    if total_up > 0 || total_down > 0 {
+        (ctx.on_traffic)(user.id, total_up, total_down);
+    }
+
+    let final_tag = last_outbound_tag.read().clone();
+    ctx.audit_logger.record(AuditRecord::new(
+        ctx.node_id,
+        user.id,
+        "trojan",
+        "udp",
+        &client_ip.to_string(),
+        &initial_target_host,
+        initial_target_port,
+        total_up,
+        total_down,
+        duration.as_millis() as i64,
+        &final_tag,
+        "connected",
+    ));
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sha2::{Digest, Sha224};
+
+    fn context(on_traffic: crate::protocol::TrafficCallback) -> InboundContext {
+        let geo = Arc::new(crate::geo::GeoEngine::default());
+        let dialer = Arc::new(crate::proxy::router::OutboundDialer::new(
+            Arc::new(crate::dns::DNSResolver::default()),
+            None,
+            None,
+            false,
+        ));
+        let mut config = crate::config::GlobalConfig::default();
+        config.domain_sniff = false;
+        InboundContext {
+            ready: None,
+            node_id: 1,
+            listen_addr: "127.0.0.1".into(),
+            port: 0,
+            router: Arc::new(crate::proxy::router::Router::new(
+                Default::default(),
+                dialer,
+                geo.clone(),
+            )),
+            rate_limiter: Arc::new(crate::limiter::RateLimiter::new()),
+            conn_limiter: Arc::new(crate::limiter::ConnectionLimiter::new()),
+            device_limiter: Arc::new(crate::limiter::DeviceLimiter::new(60, 32, 128, None)),
+            audit: Arc::new(crate::security::AuditController::new("", "", geo)),
+            defense: Arc::new(crate::security::AttackDefenseManager::default()),
+            tls_manager: Arc::new(TLSManager::new(false, "localhost".into())),
+            audit_logger: Arc::new(crate::observability::AuditLogger::new(None::<&str>)),
+            clickhouse_logger: Arc::new(crate::observability::ClickHouseLogger::new(
+                false,
+                String::new(),
+                String::new(),
+                String::new(),
+                String::new(),
+                None,
+            )),
+            on_traffic,
+            global_config: Arc::new(config),
+            ip_user_cache: Arc::new(crate::limiter::IpUserCache::new(1, false, "")),
+        }
+    }
+
+    #[tokio::test]
+    async fn handshake_deadline_rejects_silent_client() {
+        let (_client, server) = tokio::io::duplex(1024);
+        let inbound = TrojanInbound::new();
+        let error = handle_trojan_protocol(
+            Box::new(server),
+            "127.0.0.1:1234".parse().unwrap(),
+            None,
+            context(Arc::new(|_, _, _| panic!("unauthenticated traffic"))),
+            inbound.users,
+            tokio::time::Instant::now() + Duration::from_millis(50),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn authenticated_session_outlives_deadline_and_reports_traffic() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (connected, ready) = tokio::sync::oneshot::channel();
+        let target = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            connected.send(()).unwrap();
+            let mut input = Vec::new();
+            stream.read_to_end(&mut input).await.unwrap();
+            assert_eq!(input, b"after deadline");
+            stream.write_all(b"response after FIN").await.unwrap();
+        });
+        let traffic = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let records = traffic.clone();
+        let ctx = context(Arc::new(move |uid, up, down| {
+            records.lock().push((uid, up, down))
+        }));
+        let inbound = TrojanInbound::new();
+        inbound.update_users(vec![User {
+            id: 42,
+            password: Some("fixture".into()),
+            ..Default::default()
+        }]);
+        let (mut client, server) = tokio::io::duplex(1024);
+        let handler = tokio::spawn(handle_trojan_protocol(
+            Box::new(server),
+            "127.0.0.1:1234".parse().unwrap(),
+            None,
+            ctx,
+            inbound.users,
+            tokio::time::Instant::now() + Duration::from_millis(100),
+        ));
+        let mut header = hex::encode(Sha224::digest(b"fixture")).into_bytes();
+        header.extend_from_slice(b"\r\n\x01\x01\x7f\0\0\x01");
+        header.extend_from_slice(&port.to_be_bytes());
+        header.extend_from_slice(b"\r\n");
+        client.write_all(&header).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), ready)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        client.write_all(b"after deadline").await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), client.read_to_end(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response, b"response after FIN");
+        handler.await.unwrap().unwrap();
+        target.await.unwrap();
+        assert_eq!(*traffic.lock(), vec![(42, 14, 18)]);
+    }
+
+    #[test]
+    fn test_trojan_password_hashing() {
+        let password = "my_secret_password";
+        let mut hasher = Sha224::new();
+        hasher.update(password.as_bytes());
+        let hash = hex::encode(hasher.finalize());
+        assert_eq!(hash.len(), 56);
+
+        let inbound = TrojanInbound::new();
+        let user = User {
+            id: 42,
+            uuid: "test-uuid".to_string(),
+            password: Some(password.to_string()),
+            ..Default::default()
+        };
+        inbound.update_users(vec![user]);
+
+        let found = inbound.users.read().get(&hash).cloned();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, 42);
+    }
+
+    #[test]
+    fn test_trojan_udp_packet_framing() {
+        let mut pkt = Vec::new();
+        pkt.push(0x01);
+        pkt.extend_from_slice(&[192, 168, 1, 1]);
+        pkt.extend_from_slice(&80u16.to_be_bytes());
+        pkt.extend_from_slice(&5u16.to_be_bytes());
+        pkt.extend_from_slice(b"\r\n");
+        pkt.extend_from_slice(b"hello");
+
+        assert_eq!(pkt.len(), 1 + 4 + 2 + 2 + 2 + 5);
+        assert_eq!(&pkt[9..11], b"\r\n");
+        assert_eq!(&pkt[11..], b"hello");
+    }
+
+    #[test]
+    fn test_trojan_udp_oversized_limit() {
+        assert_eq!(MAX_TROJAN_UDP_PAYLOAD, 8192);
+    }
+}

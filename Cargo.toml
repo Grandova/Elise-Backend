@@ -1,0 +1,96 @@
+[package]
+name = "elise"
+version = "1.0.0"
+edition = "2021"
+authors = ["Elise Core Team"]
+description = "High-Performance Multi-Protocol Node Backend for Xboard & Modern Panels"
+license = "PolyForm-Noncommercial-1.0.0"
+
+[dependencies]
+# Async Runtime
+tokio = { version = "1.38", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+bytes = "1.6"
+futures-util = "0.3"
+async-trait = "0.1"
+shadowsocks = { version = "=1.25.0", default-features = false, features = ["aead-cipher", "aead-cipher-extra", "aead-cipher-2022", "security-replay-attack-detect"] }
+base64 = "0.22"
+blake3 = { version = "1.8", features = ["traits-preview"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+h2 = "0.4"
+http = "1"
+prost = "0.14"
+anyhow = "1"
+kcp = "0.6"
+reed-solomon-erasure = "6"
+crc32fast = "1"
+crc32c = "0.6"
+snap = "1"
+socket2 = { version = "0.5", features = ["all"] }
+
+# Serialization & Configuration
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+toml = "0.8"
+chrono = { version = "0.4", features = ["serde"] }
+
+# HTTP & Panel Client
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# TLS & Cryptography
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rcgen = "0.13"
+ring = "0.17"
+x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
+rand = "0.8"
+chacha20poly1305 = "0.10"
+aes = "0.8"
+aes-gcm = "0.10"
+sha2 = "0.10"
+sha1 = "0.10"
+md-5 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+hex = "0.4"
+uuid = { version = "1.10", features = ["v4", "v5", "fast-rng"] }
+
+# Logging & Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Concurrency & Memory Utilities
+parking_lot = "0.12"
+ipnet = "2.9"
+regex = "1.10"
+sysinfo = "0.30"
+
+# Optional distributed caching (Redis)
+redis = { version = "0.26", optional = true, features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
+
+# QUIC for Hysteria2 & TUIC
+quinn = { version = "0.11", optional = true }
+instant-acme = { version = "0.8", default-features = false, features = ["hyper-rustls", "ring", "rcgen", "x509-parser"] }
+x509-parser = { version = "0.18", default-features = false }
+
+[features]
+default = ["distributed", "quic-protocols"]
+distributed = ["dep:redis"]
+quic-protocols = ["dep:quinn"]
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "unwind"
+strip = true
+
+[patch.crates-io]
+quinn-proto = { path = "vendor/quinn-proto" }
+rustls = { path = "vendor/rustls" }
+

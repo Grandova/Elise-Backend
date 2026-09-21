@@ -1,0 +1,16 @@
+[Unit]
+Description=Elise Service
+Documentation=https://github.com/Grandova/Elise-Backend
+After=network.target nss-lookup.target
+
+[Service]
+User=root
+ExecStart=/usr/local/elise/elise run -c /etc/elise/elise.conf
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=1048576
+LimitNPROC=infinity
+TasksMax=infinity
+
+[Install]
+WantedBy=multi-user.target

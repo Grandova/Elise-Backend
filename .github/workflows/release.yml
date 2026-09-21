@@ -1,0 +1,106 @@
+name: Release Elise Multi-Arch
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Verify release tag matches Cargo version
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import os, tomllib
+          with open('Cargo.toml', 'rb') as f:
+              version = tomllib.load(f)['package']['version']
+          assert os.environ['RELEASE_TAG'] == 'v' + version, 'Tag and Cargo version differ'
+          PY
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets --all-features
+      - run: cargo test --locked --all
+      - run: |
+          bash -n scripts/install.sh
+          bash -n scripts/package-release.sh
+          bash -n scripts/elise.openrc
+
+  build:
+    needs: check
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: elise-linux-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            artifact_name: elise-linux-arm64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross (for linux cross-compilation)
+        run: cargo install cross --locked --version 0.2.5
+
+      - name: Build binary with Cross
+        run: cross build --locked --release --target ${{ matrix.target }}
+
+      - name: Prepare binary artifact (Linux)
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/elise dist/${{ matrix.artifact_name }}
+          chmod +x dist/${{ matrix.artifact_name }}
+          bash scripts/package-release.sh dist/${{ matrix.artifact_name }} "${{ matrix.artifact_name == 'elise-linux-amd64' && 'amd64' || 'arm64' }}"
+
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/*
+
+  release:
+    name: Create GitHub Release
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Display downloaded artifacts
+        run: ls -R dist
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          files: |
+            dist/elise-linux-amd64/*.tar.gz
+            dist/elise-linux-amd64/*.sha256
+            dist/elise-linux-arm64/*.tar.gz
+            dist/elise-linux-arm64/*.sha256
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,86 @@
+# ==============================================================================
+# Elise Routing Rules Configuration (routes.toml)
+# Supports hot-reload: file modifications take effect immediately without restart.
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Default Outbound (when no rules match)
+# Options: direct, block
+# ------------------------------------------------------------------------------
+default_outbound = "direct"
+
+# ------------------------------------------------------------------------------
+# Outbound Definitions
+# ------------------------------------------------------------------------------
+# Direct Outbound
+[[outbounds]]
+tag = "direct"
+type = "direct"
+
+# Block Outbound (blackhole)
+[[outbounds]]
+tag = "block"
+type = "block"
+
+# Upstream SOCKS5 Proxy Outbound
+[[outbounds]]
+tag = "warp-socks5"
+type = "socks5"
+address = "127.0.0.1"
+port = 40000
+# username = ""
+# password = ""
+
+# Upstream HTTP Connect Outbound
+[[outbounds]]
+tag = "upstream-http"
+type = "http"
+address = "10.0.0.2"
+port = 8080
+
+# ------------------------------------------------------------------------------
+# Routing Rules (evaluated in sequential order, first match wins)
+# Supported match conditions:
+#   node_id     - array of node IDs (e.g. [1, 2])
+#   network     - "tcp", "udp", or "all"
+#   domain      - exact domain matches (e.g. ["google.com"])
+#   domain_suffix - suffix matches (e.g. [".cn", ".google.com"])
+#   domain_keyword - keyword matches (e.g. ["torrent", "tracker"])
+#   ip          - CIDR IP ranges (e.g. ["10.0.0.0/8", "192.168.0.0/16", "geoip:cn"])
+#   port        - port ranges (e.g. ["22", "80", "443", "1000-2000"])
+#   outbound    - target outbound tag
+# ------------------------------------------------------------------------------
+
+# Rule 1: Block BitTorrent & Peer-to-Peer Ports
+[[rules]]
+port = ["6881-6889", "6969"]
+outbound = "block"
+
+# Rule 2: Block Private LAN & Internal Infrastructure
+[[rules]]
+ip = [
+  "127.0.0.0/8",
+  "10.0.0.0/8",
+  "172.16.0.0/12",
+  "192.168.0.0/16",
+  "169.254.0.0/16",
+  "::1/128",
+  "fc00::/7",
+  "fe80::/10"
+]
+outbound = "block"
+
+# Rule 3: Forward Mainland China Domains via Direct or Internal DNS
+[[rules]]
+domain_suffix = [".cn", ".qq.com", ".baidu.com", ".aliyun.com", ".jd.com"]
+outbound = "direct"
+
+# Rule 4: Optional WARP routing. Enable only after a SOCKS5 server is running at the configured address.
+# [[rules]]
+# domain_keyword = ["netflix", "chatgpt", "openai"]
+# outbound = "warp-socks5"
+
+# Rule 5: Fallthrough to direct outbound
+[[rules]]
+network = "all"
+outbound = "direct"
