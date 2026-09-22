@@ -2,6 +2,8 @@
 <img src="./Elise%20Logo.png" alt="Elise Logo" width="160" />
 
 
+
+
 # Elise 节点后端
 
 **Rust 异步多协议代理节点后端 · 面板对接 · 套餐限速 · 路由与流量上报**
@@ -9,102 +11,13 @@
 `Rust stable` &nbsp;•&nbsp; `PolyForm Noncommercial License`
 
 <p>
-  提供 <b>XBoard</b>、<b>XiaoV2Board</b>、<b>PPanel</b>、<b>V2Board</b>、<b>SSPanel-UIM</b> 等主流面板<br/>
-  协议实现涵盖 <b>VLESS、VMess、Trojan、Shadowsocks、Shadowsocks 2022、Hysteria 1/2、TUIC V4/V5、AnyTLS、NaiveProxy、Mieru</b>
+  提供 <b>测试基于Xboard 详细支持请查看 [支持协议测试查看](https://github.com/Grandova/Elise-Backend/blob/main/Support%20protocol.md)</b><br><b><strong>以西面板支持需自行测试 <strong></strong>XiaoV2Board</b>、<b>PPanel</b>、<b>V2Board</b>、<b>SSPanel-UIM</b> 等主流面板<br/>
+  协议实现涵盖 <b>VLESS、VMess、Trojan、Shadowsocks、Shadowsocks 2022、Hysteria2、AnyTLS、Mieru</b>
 </p>
 
+
+
 </div>
-
----
-
-## 协议与面板支持矩阵
-
-下表保留各协议和传输的功能入口，区分配置能力与验收范围。代码中有实现，不代表所有面板版本、插件模式和客户端组合都已通过真实互通。具体协议配置由面板下发，未知模式应明确报错。
-
-| 协议 | 传输 / 功能入口 | TLS / 安全配置 |
-|---|---|---|
-| **VLESS** | TCP、WebSocket、gRPC、HTTPUpgrade、XHTTP；Vision、Mux/XUDP 相关路径 | TLS、REALITY、ECH 配置 |
-| **VMess** | TCP、WebSocket、gRPC、HTTPUpgrade、XHTTP；AEAD / Legacy MD5 模式 | TLS、ECH 配置 |
-| **Trojan** | TCP 及公共传输适配 | TLS |
-| **Shadowsocks / 2022** | TCP、UDP；原生插件传输入口 | AEAD、SS2022；插件独立安全配置 |
-| **ShadowsocksR** | SSR 协议与混淆入口 | 协议自身认证 / 混淆 |
-| **Hysteria 1/2** | QUIC、TCP/UDP 转发及相应混淆入口 | QUIC TLS |
-| **TUIC v4/v5** | QUIC、多流、TCP/UDP 转发 | QUIC TLS / ECH 相关路径 |
-| **AnyTLS** | 会话、填充及 TCP 转发入口 | TLS |
-| **Naive** | HTTP/2 CONNECT 与填充入口 | TLS |
-| **Mieru** | TCP 底层、会话复用、TCP 隧道内 UDP Associate、TrafficPattern | Mieru 加密 |
-| **SOCKS5** | TCP CONNECT、UDP ASSOCIATE、用户名密码认证 | 代理协议自身不提供 TLS |
-| **HTTP** | HTTP 转发、CONNECT、代理认证 | CONNECT 可承载目标 TLS |
-
-面板适配器包括 XBoard、XiaoV2Board、PPanel、V2Board、SSPanel-UIM。某面板能创建哪些协议节点，由面板版本及其 API 决定；适配器存在不等于“全部面板 × 全部协议”验收完成。
-
-ECH 属于 TLS 握手功能；uTLS 指纹主要由客户端实现，不能把服务端解析指纹字段写成自动模拟全部客户端指纹。TLS、证书和订阅协同见 3.5。
-
----
-
-## 目录
-
-- [1. 快速安装与运维](#section-1)
-  - [1.1 一键脚本安装](#section-1-1)
-  - [1.2 Elise 管理命令体系](#section-1-2)
-  - [1.3 面板对接实战示例](#section-1-3)
-  - [1.4 手动编辑配置文件](#section-1-4)
-  - [1.5 Docker 与容器化编排](#section-1-5)
-  - [1.6 pprof 性能诊断调试端口](#section-1-6)
-- [2. 三层配置优先级与节点独立配置体系](#section-2)
-  - [2.1 架构原理](#section-2-1)
-  - [2.2 主配置文件 elise.conf](#section-2-2)
-  - [2.3 节点独立配置 (/etc/elise/nodes/node_{id}.conf)](#section-2-3)
-  - [2.4 可在 USER 区配置的参数与生效范围](#section-2-4)
-  - [2.5 多节点独立配置示例](#section-2-5)
-  - [2.6 节点独立 Nginx TLS 卸载 (force_close_ssl)](#section-2-6)
-  - [2.7 节点独立证书配置示例](#section-2-7)
-  - [2.8 混合协议运行机制](#section-2-8)
-- [3. 全量配置参数详解](#section-3)
-  - [3.1 核心对接参数](#section-3-1)
-  - [3.2 网络监听与多节点策略](#section-3-2)
-  - [3.3 路由、DNS 与出站分流](#section-3-3)
-    - [3.3.1 基础路由与 DNS 参数](#section-3-3-1)
-    - [3.3.2 多路由多出口负载均衡体系 (routes.toml)](#section-3-3-2)
-  - [3.4 PROXY Protocol 真实 IP 透传](#section-3-4)
-  - [3.5 TLS、四种证书模式与 ECH / uTLS](#section-3-5)
-    - [3.5.1 四种基础证书模式](#section-3-5-1)
-    - [3.5.2 ECH (Encrypted Client Hello)](#section-3-5-2)
-    - [3.5.3 uTLS 客户端指纹与订阅协同](#section-3-5-3)
-  - [3.6 用户限速、设备限制与 Redis 增强](#section-3-6)
-    - [3.6.1 速率与并发连接限制](#section-3-6-1)
-    - [3.6.2 在线设备限制与 Redis 集群去重](#section-3-6-2)
-    - [3.6.3 在线 IP 磁盘持久化缓存](#section-3-6-3)
-  - [3.7 审计黑白名单与 Geo 路由数据库](#section-3-7)
-    - [3.7.1 审计黑名单 (blockList) 与白名单 (whiteList)](#section-3-7-1)
-    - [3.7.2 GeoIP 与 GeoSite 数据库](#section-3-7-2)
-  - [3.8 监控审计与高级网络安全](#section-3-8)
-    - [3.8.1 系统日志与结构化审计日志](#section-3-8-1)
-    - [3.8.2 高级网络安全与防扫描控制](#section-3-8-2)
-    - [3.8.3 协议专有安全防爆破机制](#section-3-8-3)
-  - [3.9 Shadowsocks 加密与原生插件传输](#section-3-9)
-    - [3.9.1 加密方式](#section-3-9-1)
-    - [3.9.2 插件功能入口](#section-3-9-2)
-  - [3.10 Mieru 用户、传输与 TrafficPattern](#section-3-10)
-    - [3.10.1 面板及客户端设置](#section-3-10-1)
-    - [3.10.2 TrafficPattern 参数](#section-3-10-2)
-  - [3.11 上报、远程规则与补充配置](#section-3-11)
-    - [3.11.1 流量与在线状态](#section-3-11-1)
-    - [3.11.2 Redis、ClickHouse 与审计补充项](#section-3-11-2)
-- [4. 生产环境性能基准参考](#section-4)
-  - [4.1 已保存的近期验证](#section-4-1)
-- [5. 常见问题与排错指南](#section-5)
-  - [Q1: 大并发场景下出现 Too many open files？](#q1)
-  - [Q2: 高并发或小内存服务器如何检查网络参数？](#q2)
-  - [Q3: 端口被占用导致启动失败？](#q3)
-  - [Q4: Mieru 延迟正常，但网页或 TUN 无法使用？](#q4)
-  - [Q5: 修改参数后为什么没生效？](#q5)
-  - [Q6: target 和 vendor 可以删除吗？](#q6)
-- [6. 源码构建、原生命令与项目目录](#section-6)
-  - [6.1 构建](#section-6-1)
-  - [6.2 原生二进制命令](#section-6-2)
-  - [6.3 修改后的检查](#section-6-3)
-  - [6.4 目录说明](#section-6-4)
 
 ---
 
@@ -143,17 +56,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Grandova/Elise-Backend/main/
 
 #### 基础管理
 
-| 命令            | 作用                | 示例 / 说明                             |
-| --------------- | ------------------- | --------------------------------------- |
-| `elise start`   | 启动 Elise 代理服务 | 后台守护运行                            |
-| `elise stop`    | 停止 Elise 代理服务 | 优雅终止连接                            |
-| `elise restart` | 优雅重启服务        | 停止旧进程并启动新进程；停止阶段尝试最终流量上报     |
-| `elise status`  | 查看运行状态        | 显示主进程 PID、常驻内存、运行时间      |
-| `elise log`     | 查看服务日志        | 跟踪日志输出 (`journalctl -u elise -f`) |
-| `elise enable`  | 设置开机自启        | 注册 systemd 开机服务                   |
-| `elise disable` | 取消开机自启        | 关闭自动启动                            |
-| `elise version` | 查看版本信息        | 打印核心与管理脚本版本                  |
-| `elise help`    | 查看命令帮助        | 输出 CLI 参数用法                       |
+| 命令            | 作用                | 示例 / 说明                                      |
+| --------------- | ------------------- | ------------------------------------------------ |
+| `elise start`   | 启动 Elise 代理服务 | 后台守护运行                                     |
+| `elise stop`    | 停止 Elise 代理服务 | 优雅终止连接                                     |
+| `elise restart` | 优雅重启服务        | 停止旧进程并启动新进程；停止阶段尝试最终流量上报 |
+| `elise status`  | 查看运行状态        | 显示主进程 PID、常驻内存、运行时间               |
+| `elise log`     | 查看服务日志        | 跟踪日志输出 (`journalctl -u elise -f`)          |
+| `elise enable`  | 设置开机自启        | 注册 systemd 开机服务                            |
+| `elise disable` | 取消开机自启        | 关闭自动启动                                     |
+| `elise version` | 查看版本信息        | 打印核心与管理脚本版本                           |
+| `elise help`    | 查看命令帮助        | 输出 CLI 参数用法                                |
 
 管理脚本还提供 `elise update stable`、`elise update --beta`、`elise update <版本>` 和交互确认的 `elise uninstall`。更新前保留配置和上一份二进制。
 
@@ -187,12 +100,10 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Grandova/Elise-Backend/main/
 
 #### 证书与 Reality 密钥工具
 
-| 命令                                  | 作用                      | 说明                                  |
-| ------------------------------------- | ------------------------- | ------------------------------------- |
-| `elise reality` / `elise reality gen` | 生成全新 Reality 密钥对   | 自动生成 x25519 私钥、公钥与 Short ID |
-| `elise reality show`                  | 查看当前节点 Reality 密钥 | 打印公私钥及 Short ID                 |
-| `elise x25519`                        | 生成标准 x25519 密钥对    | 输出匹配的私钥与公钥                  |
-| `elise cert`                          | 证书工具                  | 帮助；`cert status` 查看，`cert gen` 生成自签证书                  |
+| 命令       | 作用                                              |
+| ---------- | ------------------------------------------------- |
+| `elise 11` | Reality 密钥管理 (X25519)                         |
+| `elise 12` | VLESS Encryption 密钥管理 (decryption/encryption) |
 
 ---
 
@@ -250,56 +161,7 @@ pprof_addr = 127.0.0.1:6060
 
 <a id="section-1-5"></a>
 
-### 1.5 Docker 与容器化编排
-
-配置加载顺序为：先读取配置文件，再用同名环境变量覆盖，最后应用支持的 CLI 路径参数。环境变量不免除配置文件必须存在的要求。
-
-仓库提供 [Dockerfile](Dockerfile)，但当前固定 `rust:1.80-alpine`，与现有依赖锁文件的兼容性及跨架构工具链尚未完成验证。不要把模板存在当成已发布可用的多架构镜像。以下示例使用**你已构建并验证的镜像** `elise:local`；不依赖未核实的公共镜像标签。
-
-#### 单容器运行
-
-~~~bash
-docker run -d \
-  --name elise \
-  --restart unless-stopped \
-  --network host \
-  -v /etc/elise:/etc/elise \
-  -v /var/log/elise:/var/log/elise \
-  -e type=xboard \
-  -e node_id=1 \
-  -e panel_url=https://panel.example.com \
-  -e panel_key=your_secret_token \
-  elise:local
-~~~
-
-#### Docker Compose
-
-~~~yaml
-services:
-  elise:
-    image: elise:local
-    container_name: elise
-    restart: unless-stopped
-    network_mode: host
-    environment:
-      type: xboard
-      node_id: "1,2"
-      panel_url: https://panel.example.com
-      panel_key: your_secret_token
-      dns_strategy: prefer_ipv4
-      pprof_addr: "127.0.0.1:6060"
-    volumes:
-      - /etc/elise:/etc/elise
-      - /var/log/elise:/var/log/elise
-~~~
-
-以上使用 Linux host 网络；挂载前准备好主配置。容器内不使用宿主的 `elise start` 管理脚本，而是由容器入口运行原生前台进程。
-
----
-
-<a id="section-1-6"></a>
-
-### 1.6 pprof 性能诊断调试端口
+### 1.5 pprof 性能诊断调试端口
 
 默认监听 `127.0.0.1:6060`。显式设置空值、`off`、`false` 或 `0` 可关闭；指定地址绑定失败时尝试回环随机端口，以日志显示的实际地址为准。
 
@@ -313,12 +175,12 @@ pprof_addr = 127.0.0.1:6060
 pprof_addr = off
 ~~~
 
-| 路径 | 当前返回内容 |
-|---|---|
-| `/debug/pprof/` | 诊断首页 |
-| `/debug/pprof/cmdline` | 当前进程启动参数 |
-| `/debug/stats`、`/metrics` | JSON：版本、平台、PID、运行时长、诊断请求数 |
-| `/debug/pprof/heap`、`allocs` | 文本诊断信息；不是实际分配栈采样 |
+| 路径                                                         | 当前返回内容                                           |
+| ------------------------------------------------------------ | ------------------------------------------------------ |
+| `/debug/pprof/`                                              | 诊断首页                                               |
+| `/debug/pprof/cmdline`                                       | 当前进程启动参数                                       |
+| `/debug/stats`、`/metrics`                                   | JSON：版本、平台、PID、运行时长、诊断请求数            |
+| `/debug/pprof/heap`、`allocs`                                | 文本诊断信息；不是实际分配栈采样                       |
 | `/debug/pprof/goroutine`、`tasks`、`threadcreate`、`profile` | 当前为静态说明，不能用于判断任务数、CPU profile 或泄漏 |
 
 名称沿用 pprof，但目前不是完整 Go pprof 采样服务，`/metrics` 也不是 Prometheus 文本指标。不要据此推断节点流量、真实在线连接或内存热点。
@@ -337,7 +199,7 @@ Reality 优先使用面板私钥并校验公钥是否匹配。没有下发任何
 
 **自动生成不等于自动下发到客户端。** 现有节点 API 未提供写回公钥的接口；后端生成的新 Reality 公钥或 ECH config 会出现在节点 `[AUTO]` 的 `tls_settings` 中，需要一次性填回面板。面板已有公钥但没有对应私钥时会明确报错，不能用另一套随机密钥替代。面板已提供完整密钥时无需这个步骤。
 
-VLESS、VMess、Trojan、HTTP、AnyTLS、Naive 的 TLS 从面板 `tls_settings.allow_insecure` 读取客户端信任策略。只有 `auto_tls=true` 且面板明确 `allow_insecure=true`、又未提供证书时，后端才自动自签；默认/false 时必须提供证书。无效证书不会回退到全局自签证书。此开关不会禁用 TLS，也不会改变已下发客户端的实际校验行为。
+VLESS、VMess、Trojan、HTTP、AnyTLS的 TLS 从面板 `tls_settings.allow_insecure` 读取客户端信任策略。只有 `auto_tls=true` 且面板明确 `allow_insecure=true`、又未提供证书时，后端才自动自签；默认/false 时必须提供证书。无效证书不会回退到全局自签证书。此开关不会禁用 TLS，也不会改变已下发客户端的实际校验行为。
 
 普通 TLS 仍需要可信证书，或客户端明确配置的证书信任方式。当前 `auto_tls` 生成的是自签名证书，并非 ACME 公共证书；不能承诺任意面板、域名和 TLS 配置都仅填三项即可通过客户端证书校验。面板不提供的协议功能和密钥回写接口也不能由后端凭空补全。
 
@@ -359,14 +221,13 @@ flowchart TD
     Router --> Outbound["Direct / Redirect / SOCKS5 / HTTP / Block"]
 ~~~
 
-| 字段 | 当前选择顺序 |
-|---|---|
-| 面板 API 凭据、接管节点列表 | 环境变量覆盖主配置 |
-| 节点协议、面板端口、用户凭据与套餐速度 | 面板下发；监听端口可加节点 `port_offset` |
-| 监听 IP | 节点 `listen_addr` → 面板 `listen_ip` → 主配置 |
-| 同步/上报周期 | 节点 `check_interval/submit_interval` → 主配置 |
-| Mieru TrafficPattern | 非空节点覆盖 → 非空主配置覆盖 → 面板 |
-| 证书、Reality/ECH 等 | 按具体传输适配路径读取，不能把任意 `[USER]` 键当成已生效 |
+| 字段                                   | 当前选择顺序                                             |
+| -------------------------------------- | -------------------------------------------------------- |
+| 面板 API 凭据、接管节点列表            | 环境变量覆盖主配置                                       |
+| 节点协议、面板端口、用户凭据与套餐速度 | 面板下发；监听端口可加节点 `port_offset`                 |
+| 监听 IP                                | 节点 `listen_addr` → 面板 `listen_ip` → 主配置           |
+| 同步/上报周期                          | 节点 `check_interval/submit_interval` → 主配置           |
+| 证书、Reality/ECH 等                   | 按具体传输适配路径读取，不能把任意 `[USER]` 键当成已生效 |
 
 本地配置修改后重启对应实例；面板轮询更新、路由文件定时重载与本地配置重启加载是不同机制。
 
@@ -396,25 +257,23 @@ flowchart TD
 
 ### 2.4 可在 [USER] 区配置的参数与生效范围
 
-| 参数 | 默认 / 未填写行为 | 当前说明 |
-|---|---|---|
-| `listen_addr` / `listen` | 使用面板或全局地址 | 节点监听地址；填写一个本机 IP |
-| `port_offset` | `0` | 实际监听端口 = 面板端口 + 偏移，结果必须为 1–65535 |
-| `proxy_protocol` | 沿用全局 | 节点 TCP PROXY Protocol 开关；可信代理策略仍来自全局 |
-| `udp_proxy_protocol` | 沿用全局 | 接入公共 UDP 路径的协议使用；不代表 Mieru 底层 UDP 已实现 |
-| `mptcp` | 沿用全局 | 接入公共 TCP listener 的路径使用 |
-| `check_interval` | 全局 `60` 秒 | 节点用户同步周期 |
-| `submit_interval` | 全局 `60` 秒 | 节点流量上报周期 |
-| `mieru_traffic_pattern` | 空 | 非空值覆盖主配置/面板；空值继续使用上一级 |
-| `force_close_ssl` / `disable_tls` | `false` | 当前仅关闭此节点的自动自签开关，**不保证关闭面板 TLS** |
-| `cert_file`、`key_file`、`cert_domain` | 无 | 可以解析保存；尚未接入此节点的 TLS 配置覆盖 |
-| `cert_mode`、`cert_key_length`、`acme_server`、`dns_provider` | 无 | 自定义字段会保存；未接通内置 ACME 工作流 |
-| `reality_private_key` | 无 | 此处保存不等于覆盖面板 Reality 私钥 |
-| `tuic_ech_server_keys` | 无 | 此处保存不等于注入 TUIC 服务端 ECH keyset |
-| `force_proxy_protocol` | 全局 `false` | 请在主配置设置，未接通节点独立覆盖 |
-| `domain_audit_enable`、`domain_audit_domains`、`domain_audit_log_dir` | 无 | 未接通此处的独立审计覆盖 |
-| `tuic_initial_stream_window`、`tuic_max_stream_window` | 历史文档参考 `2/6` MB | 没有确认节点覆盖消费路径，不能视为运行时默认 |
-| `tuic_initial_conn_window`、`tuic_max_conn_window` | 历史文档参考 `3/15` MB | 同上，不能据此调整 QUIC 内存预算 |
+| 参数                                                         | 默认 / 未填写行为  | 当前说明                                                  |
+| ------------------------------------------------------------ | ------------------ | --------------------------------------------------------- |
+| `listen_addr` / `listen`                                     | 使用面板或全局地址 | 节点监听地址；填写一个本机 IP                             |
+| `port_offset`                                                | `0`                | 实际监听端口 = 面板端口 + 偏移，结果必须为 1–65535        |
+| `proxy_protocol`                                             | 沿用全局           | 节点 TCP PROXY Protocol 开关；可信代理策略仍来自全局      |
+| `udp_proxy_protocol`                                         | 沿用全局           | 接入公共 UDP 路径的协议使用；不代表 Mieru 底层 UDP 已实现 |
+| `mptcp`                                                      | 沿用全局           | 接入公共 TCP listener 的路径使用                          |
+| `check_interval`                                             | 全局 `60` 秒       | 节点用户同步周期                                          |
+| `submit_interval`                                            | 全局 `60` 秒       | 节点流量上报周期                                          |
+| `mieru_traffic_pattern`                                      | 空                 | 非空值覆盖主配置/面板；空值继续使用上一级                 |
+| `force_close_ssl` / `disable_tls`                            | `false`            | 当前仅关闭此节点的自动自签开关，**不保证关闭面板 TLS**    |
+| `cert_file`、`key_file`、`cert_domain`                       | 无                 | 可以解析保存；尚未接入此节点的 TLS 配置覆盖               |
+| `cert_mode`、`cert_key_length`、`acme_server`、`dns_provider` | 无                 | 自定义字段会保存；未接通内置 ACME 工作流                  |
+| `reality_private_key`                                        | 无                 | 此处保存不等于覆盖面板 Reality 私钥                       |
+| `tuic_ech_server_keys`                                       | 无                 | 此处保存不等于注入 TUIC 服务端 ECH keyset                 |
+| `force_proxy_protocol`                                       | 全局 `false`       | 请在主配置设置，未接通节点独立覆盖                        |
+| `domain_audit_enable`、`domain_audit_domains`、`domain_audit_log_dir` | 无                 | 未接通此处的独立审计覆盖                                  |
 
 保留这些字段的说明是为了避免“配置能保存所以已生效”的误解；未接通的键不是推荐部署配置。证书和 ECH 优先通过实际面板字段传入。
 
@@ -530,13 +389,13 @@ cert_mode = none
 
 ### 3.2 网络监听与多节点策略
 
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `listen_addr` / `listen` | `0.0.0.0` | 一个监听 IP；IPv6 使用对应地址，不要写逗号分隔多 IP |
-| `listen_strategy` / `multi_node_listen_strategy` | `auto` | 配置保留字段；尚无公共运行时分配器落实 `auto/shared/split` 三种策略 |
-| `tcp_timeout` | `300` | 公共 TCP 空闲超时，秒；不等同于连接总寿命 |
-| `udp_timeout` | `300` | 公共 UDP 会话空闲超时，秒 |
-| `mptcp` | `false` | 公共 listener 的 Linux MPTCP 开关；平台/内核不支持时会报错 |
+| 参数                                             | 默认值    | 说明                                                         |
+| ------------------------------------------------ | --------- | ------------------------------------------------------------ |
+| `listen_addr` / `listen`                         | `0.0.0.0` | 一个监听 IP；IPv6 使用对应地址，不要写逗号分隔多 IP          |
+| `listen_strategy` / `multi_node_listen_strategy` | `auto`    | 配置保留字段；尚无公共运行时分配器落实 `auto/shared/split` 三种策略 |
+| `tcp_timeout`                                    | `300`     | 公共 TCP 空闲超时，秒；不等同于连接总寿命                    |
+| `udp_timeout`                                    | `300`     | 公共 UDP 会话空闲超时，秒                                    |
+| `mptcp`                                          | `false`   | 公共 listener 的 Linux MPTCP 开关；平台/内核不支持时会报错   |
 
 多节点共享同一 IP 时应使用不同监听端口；多 IP 部署用节点 `listen_addr` 分别绑定。MPTCP 仅影响使用相应 listener 的 TCP 路径，不改变 UDP/QUIC。
 
@@ -554,10 +413,10 @@ cert_mode = none
 
 | 参数名           | 默认值                   | 说明                                                         |
 | ---------------- | ------------------------ | ------------------------------------------------------------ |
-| `routes_file`    | `/etc/elise/routes.toml` | 路由文件；本地模式约每 10 秒检查修改           |
+| `routes_file`    | `/etc/elise/routes.toml` | 路由文件；本地模式约每 10 秒检查修改                         |
 | `dns_file`       | `/etc/elise/dns.yml`     | 独立 DNS 解析器分流规则文件路径                              |
 | `default_dns`    | 无                       | 上游默认 DNS 解析器地址（支持 `udp://8.8.8.8:53`、`tcp://`、`https://dns.google/dns-query`） |
-| `dns_strategy`   | `ipv4_first`            | 出站解析偏好策略：`prefer_ipv4`（推荐）/ `prefer_ipv6` / `ipv4_only` / `ipv6_only` |
+| `dns_strategy`   | `ipv4_first`             | 出站解析偏好策略：`prefer_ipv4`（推荐）/ `prefer_ipv6` / `ipv4_only` / `ipv6_only` |
 | `dns_cache_time` | `10`                     | 本地 DNS 结果缓存时长（分钟）                                |
 | `out_ip_ipv4`    | 无                       | 指定直连出站的源 IPv4 地址（留空由 OS 自动选择路由）         |
 | `out_ip_ipv6`    | 无                       | 指定直连出站的源 IPv6 地址                                   |
@@ -742,12 +601,12 @@ type = "direct"
 
 保留四类部署方式，但区分 Elise 实际加载证书与外部工具签发证书：
 
-| 方式 | 当前实现 / 使用条件 |
-|---|---|
-| 自定义文件证书 | TLS 配置接收证书/私钥路径或 PEM；文件需对 Elise 进程可读 |
-| HTTP ACME | 未实现内置申请和续期；使用外部 ACME 工具签发后交给文件证书加载路径 |
-| DNS ACME | 同上；填写 `dns_provider` / `DNS_*` 不能自动完成签发 |
-| 自动自签 | `auto_tls=true` 且面板 `allow_insecure=true` 时，无证书的 TLS 入口可自动自签；不具备公共 CA 信任 |
+| 方式           | 当前实现 / 使用条件                                          |
+| -------------- | ------------------------------------------------------------ |
+| 自定义文件证书 | TLS 配置接收证书/私钥路径或 PEM；文件需对 Elise 进程可读     |
+| HTTP ACME      | 未实现内置申请和续期；使用外部 ACME 工具签发后交给文件证书加载路径 |
+| DNS ACME       | 同上；填写 `dns_provider` / `DNS_*` 不能自动完成签发         |
+| 自动自签       | `auto_tls=true` 且面板 `allow_insecure=true` 时，无证书的 TLS 入口可自动自签；不具备公共 CA 信任 |
 
 例如面板下发的证书配置对象可包含：
 
@@ -764,17 +623,17 @@ type = "direct"
 
 其他证书相关字段及当前消费情况：
 
-| 字段 | 说明 |
-|---|---|
-| `cert_file`、`key_file` | TLS 证书对象中的文件路径；本地主配置同名文本不等于已注入 |
-| `cert_domain` | 保留的申请域名字段；未接通内置 ACME |
-| `cert_mode` | 兼容字段参考 `http/dns/self/none`；不能以此推断自动签发或 TLS 开关 |
-| `cert_key_length` | 兼容字段参考 `ec-256/ec-384`；内置 ACME 未消费此参数 |
-| `acme_server` | 兼容字段参考 `letsencrypt/zerossl`；交由外部签发工具设置 |
-| `dns_provider` | 原文如 `dns_cf`；交由外部签发工具设置 |
-| `DNS_CF_Email`、`DNS_CF_Key` | 保留 DNS 环境变量，但 Elise 当前不会因此执行 DNS 验证 |
-| `auto_tls` | 默认 `true`；自动自签能力，与 ACME 无关 |
-| `fake_sni` | 默认 `www.microsoft.com`；部分 TLS 路径使用的默认名称，不赋予域名所有权或可信证书 |
+| 字段                         | 说明                                                         |
+| ---------------------------- | ------------------------------------------------------------ |
+| `cert_file`、`key_file`      | TLS 证书对象中的文件路径；本地主配置同名文本不等于已注入     |
+| `cert_domain`                | 保留的申请域名字段；未接通内置 ACME                          |
+| `cert_mode`                  | 兼容字段参考 `http/dns/self/none`；不能以此推断自动签发或 TLS 开关 |
+| `cert_key_length`            | 兼容字段参考 `ec-256/ec-384`；内置 ACME 未消费此参数         |
+| `acme_server`                | 兼容字段参考 `letsencrypt/zerossl`；交由外部签发工具设置     |
+| `dns_provider`               | 原文如 `dns_cf`；交由外部签发工具设置                        |
+| `DNS_CF_Email`、`DNS_CF_Key` | 保留 DNS 环境变量，但 Elise 当前不会因此执行 DNS 验证        |
+| `auto_tls`                   | 默认 `true`；自动自签能力，与 ACME 无关                      |
+| `fake_sni`                   | 默认 `www.microsoft.com`；部分 TLS 路径使用的默认名称，不赋予域名所有权或可信证书 |
 
 ~~~ini
 auto_tls = true
@@ -789,12 +648,12 @@ fake_sni = node.example.com
 
 TLS 实现中存在 ECH 服务端解密及密钥验证路径，并使用本地修改的 rustls 依赖。面板常见字段：
 
-| 字段 | 用途 |
-|---|---|
-| `enabled` | 启用 ECH |
-| `server_keys` / `key` | 服务端密钥材料；格式必须符合当前解析器 |
-| `config` / `config_list` | 客户端 ECHConfigList |
-| `query_server_name` | 面板订阅中的客户端查询配置 |
+| 字段                     | 用途                                   |
+| ------------------------ | -------------------------------------- |
+| `enabled`                | 启用 ECH                               |
+| `server_keys` / `key`    | 服务端密钥材料；格式必须符合当前解析器 |
+| `config` / `config_list` | 客户端 ECHConfigList                   |
+| `query_server_name`      | 面板订阅中的客户端查询配置             |
 
 服务端启用 ECH 但没有有效密钥会报错，不能用客户端公开配置替代服务端私钥。ECH 的协议版本、密钥格式与客户端支持须独立互通验证，不能承诺“所有 TLS 协议自动支持”。
 
@@ -823,9 +682,9 @@ Elise 解析客户端 TLS profile 不等于服务端模拟浏览器指纹，也�
 | 参数名             | 默认值 | 说明                                                         |
 | ------------------ | ------ | ------------------------------------------------------------ |
 | `user_speed_limit` | `0`    | 兼容保留字段，当前忽略本地值并记录告警；实际速度只来自面板用户套餐 |
-| `node_speed_limit` | `0`    | 兼容保留字段，当前忽略本地值；不启用额外动态/节点总限速                         |
+| `node_speed_limit` | `0`    | 兼容保留字段，当前忽略本地值；不启用额外动态/节点总限速      |
 | `user_tcp_limit`   | `0`    | 单用户最大允许并发 TCP 流数（0 表示不限）                    |
-| `user_conn_limit`  | `0`    | 用户设备数上限，与面板 device_limit 的非零较小值组合；不是 TCP 连接数                          |
+| `user_conn_limit`  | `0`    | 用户设备数上限，与面板 device_limit 的非零较小值组合；不是 TCP 连接数 |
 
 <a id="section-3-6-2"></a>
 
@@ -1011,15 +870,15 @@ audit_log_file = /var/log/elise/audit.log
 
 #### 3.9.1 加密方式
 
-| 方法名 | 类别 | 配置要求 |
-|---|---|---|
-| `aes-128-gcm` | AEAD | 使用面板下发的密码 |
-| `aes-192-gcm` | AEAD | 同上 |
-| `aes-256-gcm` | AEAD | 同上 |
-| `chacha20-ietf-poly1305` | AEAD | 同上 |
-| `2022-blake3-aes-128-gcm` | SS2022 | 使用符合该方法的密钥格式 |
-| `2022-blake3-aes-256-gcm` | SS2022 | 同上 |
-| `2022-blake3-chacha20-poly1305` | SS2022 | 同上 |
+| 方法名                          | 类别   | 配置要求                 |
+| ------------------------------- | ------ | ------------------------ |
+| `aes-128-gcm`                   | AEAD   | 使用面板下发的密码       |
+| `aes-192-gcm`                   | AEAD   | 同上                     |
+| `aes-256-gcm`                   | AEAD   | 同上                     |
+| `chacha20-ietf-poly1305`        | AEAD   | 同上                     |
+| `2022-blake3-aes-128-gcm`       | SS2022 | 使用符合该方法的密钥格式 |
+| `2022-blake3-aes-256-gcm`       | SS2022 | 同上                     |
+| `2022-blake3-chacha20-poly1305` | SS2022 | 同上                     |
 
 服务端从面板读取加密方法、用户凭据及插件参数。SS2022 的密钥不是任意普通密码；客户端和面板生成方式必须一致。TCP 与 UDP 应分开验证认证、并发、计费及重放处理。
 
@@ -1029,17 +888,25 @@ audit_log_file = /var/log/elise/audit.log
 
 插件传输在 Elise 进程内实现，不要求启动 SIP003 外部插件进程。下面列出当前选项入口；不是对上游所有模式和选项的兼容声明。
 
-| 插件 | 配置名称 | 模式 / 主要选项 |
-|---|---|---|
-| None | 空或 `none` | 无插件，选项应为空 |
-| Simple Obfs | `simple-obfs` / `obfs-server` | `obfs=http/tls`；`host` |
-| V2Ray Plugin | `v2ray-plugin` | `mode=websocket/quic`；`tls/host/path/cert/key/mux` |
-| Gost Plugin | `gost-plugin` | `tls/mtls/ws/mws/wss/mwss/h2/grpc/gun/quic`；具体模式使用对应选项 |
-| Shadow TLS | `shadow-tls` / `shadowtls` | `version/v3`、`host`、`password/passwd`、`strict` |
-| ResTLS | `restls` | `host`、`password/passwd`、`script`、`min-record-len` 等 |
-| KCPTun | `kcptun` | `key/crypt/mode/mtu/sndwnd/rcvwnd/datashard/parityshard` 及相关流控参数 |
+| 插件         | 配置名称                      | 模式 / 主要选项                                              |
+| ------------ | ----------------------------- | ------------------------------------------------------------ |
+| None         | 空或 `none`                   | 无插件，选项应为空                                           |
+| Simple Obfs  | `simple-obfs` / `obfs-server` | `obfs=http/tls`；`host`                                      |
+| V2Ray Plugin | `v2ray-plugin`                | `mode=websocket/quic`；`tls/host/path/cert/key/mux`          |
+| Gost Plugin  | `gost-plugin`                 | `tls/mtls/ws/mws/wss/mwss/h2/grpc/gun/quic`；具体模式使用对应选项 |
+| Shadow TLS   | `shadow-tls` / `shadowtls`    | `version/v3`、`host`、`password/passwd`、`strict`            |
+| ResTLS       | `restls`                      | `host`、`password/passwd`、`script`、`min-record-len` 等     |
+| KCPTun       | `kcptun`                      | `key/crypt/mode/mtu/sndwnd/rcvwnd/datashard/parityshard` 及相关流控参数 |
 
-QUIC 模式依赖 `quic-protocols` 构建特性。KCPTun 当前允许的 `crypt` 为 `aes/aes-128/aes-192/none/null`，其他值报 Unsupported。未知插件、模式或额外选项不会当成直连继续启动。
+##### kcptun需第三方实现 安装kcptun
+
+```shell
+ARCH=$(uname -m | sed -e 's/x86_64/amd64/' -e 's/aarch64/arm64/') && \
+sudo curl -fSL "https://github.com/dumbybumby/kcptun-archive/releases/download/20260411/kcptun-server-linux-${ARCH}" -o /usr/local/bin/kcptun-server && \
+sudo chmod +x /usr/local/bin/kcptun-server && \
+sudo mkdir -p /etc/elise && \
+sudo cp -f /usr/local/bin/kcptun-server /etc/elise/kcptun-server
+```
 
 面板 `plugin_opts` 可下发分号分隔字符串或对象。例如 WebSocket 模式的字段示意：
 
@@ -1061,18 +928,16 @@ QUIC 模式依赖 `quic-protocols` 构建特性。KCPTun 当前允许的 `crypt`
 
 ### 3.10 Mieru 用户、传输与 TrafficPattern
 
-<a id="section-3-10-1"></a>
-
 #### 3.10.1 面板及客户端设置
 
-| 项目 | 当前行为 |
-|---|---|
-| 面板节点 transport | 选择 **TCP** |
-| 用户名、密码 | XBoard 当前接入使用同一个面板用户凭据：非空 `password` 优先，否则使用 `uuid` |
-| 会话复用 | TCP 上支持多个逻辑会话；已有 Mihomo 默认复用互通记录 |
-| UDP Associate | 经 TCP 隧道转发 UDP；客户端仍需开启 UDP |
-| 原生 UDP 底层 | Unsupported，不要把面板 transport 改成 UDP |
-| 用户更新 | 由面板用户同步更新；客户端凭据须与当前订阅保持一致 |
+| 项目               | 当前行为                                                     |
+| ------------------ | ------------------------------------------------------------ |
+| 面板节点 transport | 选择 **TCP**                                                 |
+| 用户名、密码       | XBoard 当前接入使用同一个面板用户凭据：非空 `password` 优先，否则使用 `uuid` |
+| 会话复用           | TCP 上支持多个逻辑会话；已有 Mihomo 默认复用互通记录         |
+| UDP Associate      | 经 TCP 隧道转发 UDP；客户端仍需开启 UDP                      |
+| 原生 UDP 底层      | Unsupported，不要把面板 transport 改成 UDP                   |
+| 用户更新           | 由面板用户同步更新；客户端凭据须与当前订阅保持一致           |
 
 Mihomo 配置中 `udp: true` 是允许代理 UDP 数据，不是切换底层 transport。延迟测试通过只能证明短连接的一部分路径，不能替代网页、长连接、复用和 UDP DNS 验收。
 
@@ -1080,10 +945,10 @@ Mihomo 配置中 `udp: true` 是允许代理 UDP 数据，不是切换底层 tra
 
 #### 3.10.2 TrafficPattern 参数
 
-| 参数 | 默认 | 含义 |
-|---|---|---|
-| `mieru_traffic_pattern` | 空 | 本地覆盖的 Base64 Mieru TrafficPattern protobuf |
-| 面板 `traffic_pattern` | 面板下发 | 没有非空本地覆盖时自动使用 |
+| 参数                    | 默认     | 含义                                            |
+| ----------------------- | -------- | ----------------------------------------------- |
+| `mieru_traffic_pattern` | 空       | 本地覆盖的 Base64 Mieru TrafficPattern protobuf |
+| 面板 `traffic_pattern`  | 面板下发 | 没有非空本地覆盖时自动使用                      |
 
 主配置默认留空：
 
@@ -1110,14 +975,14 @@ mieru_traffic_pattern=
 
 #### 3.11.1 流量与在线状态
 
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `submit_traffic_min_traffic` | `0` | 流量批量上报阈值，KB；未达到阈值保留累计 |
-| `submit_alive_ip_min_traffic` | `0` | 在线 IP 上报的流量阈值，KB |
-| `ip_user_cache_save_dir` | 主配置所在目录 | IP 缓存目录，也用于 pending 流量快照的 `traffic/` 子目录 |
-| `routes_url` | 空 | 远程路由文件来源 |
-| `block_list_url` | 空 | 远程黑名单来源 |
-| `white_list_url` | 空 | 远程白名单来源 |
+| 参数                          | 默认           | 说明                                                     |
+| ----------------------------- | -------------- | -------------------------------------------------------- |
+| `submit_traffic_min_traffic`  | `0`            | 流量批量上报阈值，KB；未达到阈值保留累计                 |
+| `submit_alive_ip_min_traffic` | `0`            | 在线 IP 上报的流量阈值，KB                               |
+| `ip_user_cache_save_dir`      | 主配置所在目录 | IP 缓存目录，也用于 pending 流量快照的 `traffic/` 子目录 |
+| `routes_url`                  | 空             | 远程路由文件来源                                         |
+| `block_list_url`              | 空             | 远程黑名单来源                                           |
+| `white_list_url`              | 空             | 远程白名单来源                                           |
 
 上报时失败数据仍留在 pending，成功确认后清除已报部分；停机阶段尝试最终上报并保存未确认数据。面板“已接收但响应丢失”的场景依然需要面板端幂等支持，不能保证恰好一次计费。
 
@@ -1127,21 +992,21 @@ mieru_traffic_pattern=
 
 #### 3.11.2 Redis、ClickHouse 与审计补充项
 
-| 参数 | 默认值 | 说明 |
-|---|---|---|
-| `redis_url` | 空 | 完整 Redis 连接 URL；与拆分字段配合规则见配置实现 |
-| `redis_tls` | `false` | 使用 TLS Redis 连接 |
-| `clickhouse_enabled` | `false` | 启用 ClickHouse 日志出口 |
-| `clickhouse_addr` | `http://127.0.0.1:8123` | HTTP 接口地址 |
-| `clickhouse_db` | `elise` | 数据库名 |
-| `clickhouse_table` | `access_log` | 表名 |
-| `clickhouse_user` | `default` | 用户 |
-| `clickhouse_password` | 空 | 密码 |
-| `domain_audit_enable` | `false` | 可解析，独立审计管线尚未接通 |
-| `domain_audit_domains` | 空 | 同上，不要视为实际拦截规则 |
-| `domain_audit_log_dir` | 空 | 同上 |
-| `domain_audit_retention_days` | `7` | 同上，尚不保证自动清理 |
-| `outbound_proxy_protocol` | 空 | 出站 PROXY Protocol 模式；需与接收方配套配置 |
+| 参数                          | 默认值                  | 说明                                              |
+| ----------------------------- | ----------------------- | ------------------------------------------------- |
+| `redis_url`                   | 空                      | 完整 Redis 连接 URL；与拆分字段配合规则见配置实现 |
+| `redis_tls`                   | `false`                 | 使用 TLS Redis 连接                               |
+| `clickhouse_enabled`          | `false`                 | 启用 ClickHouse 日志出口                          |
+| `clickhouse_addr`             | `http://127.0.0.1:8123` | HTTP 接口地址                                     |
+| `clickhouse_db`               | `elise`                 | 数据库名                                          |
+| `clickhouse_table`            | `access_log`            | 表名                                              |
+| `clickhouse_user`             | `default`               | 用户                                              |
+| `clickhouse_password`         | 空                      | 密码                                              |
+| `domain_audit_enable`         | `false`                 | 可解析，独立审计管线尚未接通                      |
+| `domain_audit_domains`        | 空                      | 同上，不要视为实际拦截规则                        |
+| `domain_audit_log_dir`        | 空                      | 同上                                              |
+| `domain_audit_retention_days` | `7`                     | 同上，尚不保证自动清理                            |
+| `outbound_proxy_protocol`     | 空                      | 出站 PROXY Protocol 模式；需与接收方配套配置      |
 
 ClickHouse 出口与本地 audit 日志不是同一条存储管线；网络不可用时的完整投递保证需独立测试。默认构建启用 `distributed`，若关闭该特性，不应配置依赖 Redis 的功能。
 
@@ -1153,15 +1018,15 @@ ClickHouse 出口与本地 audit 日志不是同一条存储管线；网络不�
 
 以下描述环境为 2 vCPU、Debian 13 / Linux 6.12。**尚未为这组数值绑定可复现的构建版本、完整脚本和原始报告，因此对当前版本均为 NOT TESTED，不作为容量或性能承诺。**
 
-| 压测指标                               | 500 人在册用户 / 10,000 TCP 并发 | 1,000 人在册用户 / 10,000 TCP 并发 | 备注                                                 |
-| -------------------------------------- | -------------------------------- | ---------------------------------- | ---------------------------------------------------- |
-| **空载基线物理内存 (RSS)**             | **8.75 MB**                      | **10.95 MB**                       | 极小初始内存开销                                     |
-| **10,000 并发长连接常驻内存 (RSS)**    | **119.82 MB**                    | **109.33 MB**                      | **单连接净物理开销仅 ~10~11 KB**                     |
-| **峰值最高水位内存 (VmHWM)**           | 246.43 MB                        | 264.68 MB                          | 包含瞬时缓冲区峰值                                   |
-| **静默保活 CPU 占用 (Keep-Alive)**     | **0.0% ~ 0.3%**                  | **0.0% ~ 0.3%**                    | 历史记录，当前版本待复测                  |
-| **活跃全量数据中继 CPU 占用 (Active)** | 4.6% (峰值 8.3%~10.7%)           | 4.6% (峰值 8.3%~10.7%)             | 历史记录，不能据此认定零拷贝                               |
+| 压测指标                               | 500 人在册用户 / 10,000 TCP 并发 | 1,000 人在册用户 / 10,000 TCP 并发 | 备注                                                         |
+| -------------------------------------- | -------------------------------- | ---------------------------------- | ------------------------------------------------------------ |
+| **空载基线物理内存 (RSS)**             | **8.75 MB**                      | **10.95 MB**                       | 极小初始内存开销                                             |
+| **10,000 并发长连接常驻内存 (RSS)**    | **119.82 MB**                    | **109.33 MB**                      | **单连接净物理开销仅 ~10~11 KB**                             |
+| **峰值最高水位内存 (VmHWM)**           | 246.43 MB                        | 264.68 MB                          | 包含瞬时缓冲区峰值                                           |
+| **静默保活 CPU 占用 (Keep-Alive)**     | **0.0% ~ 0.3%**                  | **0.0% ~ 0.3%**                    | 历史记录，当前版本待复测                                     |
+| **活跃全量数据中继 CPU 占用 (Active)** | 4.6% (峰值 8.3%~10.7%)           | 4.6% (峰值 8.3%~10.7%)             | 历史记录，不能据此认定零拷贝                                 |
 | **打开系统句柄 (FDs)**                 | 20,124                           | 20,124                             | 1w 入站 + 1w 出站 + 124 系统基础句柄，单次观测不能证明无泄漏 |
-| **100MB 真实通量大文件传输**           | SHA-256 全量精确匹配             | SHA-256 全量精确匹配               | PCAP 抓包零二进制明文泄露                            |
+| **100MB 真实通量大文件传输**           | SHA-256 全量精确匹配             | SHA-256 全量精确匹配               | PCAP 抓包零二进制明文泄露                                    |
 
 
 
@@ -1280,18 +1145,18 @@ README 文档更新不自动触发新一轮全协议验收，也不把历史测�
 
 ### 6.4 目录说明
 
-| 路径 | 内容 |
-|---|---|
-| `src/panel/` | 面板 API 适配 |
-| `src/protocol/` | 协议认证、编解码与会话 |
-| `src/proxy/` | 节点生命周期、路由与出站 |
-| `src/limiter/`、`src/stats/` | 用户限制及统计 |
-| `src/security/`、`src/observability/` | 安全、审计和诊断 |
-| `example/` | 配置模板 |
-| `scripts/` | 安装、服务、管理和打包 |
-| `vendor/` | 构建必需的本地依赖补丁 |
-| `target/` | 可重新生成的构建文件 |
-| `dist/hardening/` | 本地历史验收记录和交付包，Git 忽略 |
+| 路径                                  | 内容                               |
+| ------------------------------------- | ---------------------------------- |
+| `src/panel/`                          | 面板 API 适配                      |
+| `src/protocol/`                       | 协议认证、编解码与会话             |
+| `src/proxy/`                          | 节点生命周期、路由与出站           |
+| `src/limiter/`、`src/stats/`          | 用户限制及统计                     |
+| `src/security/`、`src/observability/` | 安全、审计和诊断                   |
+| `example/`                            | 配置模板                           |
+| `scripts/`                            | 安装、服务、管理和打包             |
+| `vendor/`                             | 构建必需的本地依赖补丁             |
+| `target/`                             | 可重新生成的构建文件               |
+| `dist/hardening/`                     | 本地历史验收记录和交付包，Git 忽略 |
 
 ---
 
